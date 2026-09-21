@@ -543,6 +543,12 @@ async fn match_is_open(pool: &SqlitePool, id: &str) -> MatchOpen {
     }
 }
 
+/// Last round is done only after `finish_open_match` or a known close.
+/// A busy mark must retry so a won fight cannot sit `in_progress` until expiry.
+fn last_round_done(marked: bool, open: MatchOpen) -> bool {
+    marked || open == MatchOpen::Closed
+}
+
 async fn stored_round_has_winner(pool: &SqlitePool, id: &str, round: u32) -> bool {
     db::list_hunks(pool, id)
         .await
@@ -593,20 +599,23 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
     let hash_s = format!("{hi:08x}{lo:08x}");
-    if match_over
-        && db::finish_open_match(a.pool, a.id, &hash_s)
-            .await
-            .unwrap_or(false)
-    {
-        if let Some(ctx) = a.result.as_ref() {
-            ctx.spawn_publish(a.id.to_string());
-        }
-    }
-    let msg = encode(&end_msg(a.sim, result, *a.round, match_over));
-    broadcast(a.conns, &msg);
     if match_over {
+        let marked = db::finish_open_match(a.pool, a.id, &hash_s)
+            .await
+            .unwrap_or(false);
+        if marked {
+            if let Some(ctx) = a.result.as_ref() {
+                ctx.spawn_publish(a.id.to_string());
+            }
+        } else if !last_round_done(false, match_is_open(a.pool, a.id).await) {
+            return false;
+        }
+        let msg = encode(&end_msg(a.sim, result, *a.round, true));
+        broadcast(a.conns, &msg);
         return true;
     }
+    let msg = encode(&end_msg(a.sim, result, *a.round, false));
+    broadcast(a.conns, &msg);
     match match_is_open(a.pool, a.id).await {
         MatchOpen::Closed => {
             expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
@@ -1133,6 +1142,16 @@ mod tests {
             finish_after_write(false, MatchOpen::Unknown, true),
             FinishAfterWrite::Proceed { record: false },
             "write-once already set: do not expire on a busy status read"
+        );
+        assert!(last_round_done(true, MatchOpen::Open));
+        assert!(last_round_done(false, MatchOpen::Closed));
+        assert!(
+            !last_round_done(false, MatchOpen::Open),
+            "still in_progress: retry finish_open_match"
+        );
+        assert!(
+            !last_round_done(false, MatchOpen::Unknown),
+            "busy mark must not leave a won fight without a room"
         );
     }
 }
