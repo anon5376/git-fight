@@ -238,7 +238,9 @@ pub async fn start_challenge(
     match open_match_for_pr_retry(&ctx.pool, &owner, &repo, number).await {
         Ok(Some(existing)) => return Ok(already_open_note(ctx, &existing.id)),
         Ok(None) => {}
-        Err(_) => return Ok(note("a fight is already open")),
+        // Busy is not proof of an open fight. Do not insert and do not
+        // claim already-open; retry `/fight` or the expirer can look again.
+        Err(_) => return Ok(silent()),
     }
 
     let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, &owner, &repo, number, 3600)
@@ -858,8 +860,8 @@ mod tests {
         assert_eq!(pre_insert_open_followup(Ok(None)), "insert");
         assert_eq!(
             pre_insert_open_followup(Err(())),
-            "note",
-            "busy open_match_for_pr must not fall through to insert"
+            "silent",
+            "busy open_match_for_pr must not insert or claim already-open"
         );
     }
 
@@ -867,7 +869,7 @@ mod tests {
         match lookup {
             Ok(Some(_)) => "link",
             Ok(None) => "insert",
-            Err(()) => "note",
+            Err(()) => "silent",
         }
     }
 

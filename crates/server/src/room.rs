@@ -1335,6 +1335,10 @@ async fn expire_now(
         message: "expired".into(),
     });
     broadcast_or_spawn(conns, &msg);
+    let row = match row {
+        Some(r) => Some(r),
+        None => db::get_match(pool, id).await.ok().flatten(),
+    };
     if let (Some(ctx), Some(row)) = (result, row.as_ref()) {
         let ctx = ctx.clone();
         let row = row.clone();
@@ -1343,6 +1347,9 @@ async fn expire_now(
                 ctx.queue_expired(&row.id);
             }
         });
+    } else if let Some(ctx) = result {
+        // expire_pending will not return this id again.
+        ctx.queue_expired(id);
     }
 }
 
@@ -1741,6 +1748,31 @@ mod tests {
             "comment"
         } else {
             "hold"
+        }
+    }
+
+    #[test]
+    fn expire_comment_reloads_when_the_first_row_read_misses() {
+        assert_eq!(expire_comment_row_followup(Ok(Some(())), false), "hold");
+        assert_eq!(expire_comment_row_followup(Ok(Some(())), true), "comment");
+        assert_eq!(
+            expire_comment_row_followup(Err(()), true),
+            "reload_or_queue",
+            "a busy get_match before expire must not drop the expiry PATCH"
+        );
+        assert_eq!(
+            expire_comment_row_followup(Ok(None), true),
+            "reload_or_queue"
+        );
+    }
+
+    fn expire_comment_row_followup(first: Result<Option<()>, ()>, expired: bool) -> &'static str {
+        if !expired {
+            return "hold";
+        }
+        match first {
+            Ok(Some(())) => "comment",
+            Ok(None) | Err(()) => "reload_or_queue",
         }
     }
 

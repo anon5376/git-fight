@@ -270,19 +270,21 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
     if head.eq_ignore_ascii_case(&row.pr_head_sha) && base.eq_ignore_ascii_case(&row.pr_base_sha) {
         return;
     }
+    // Drift is known. Stop lockstep before abort SQL or rematch comment.
+    state.mark_closing(&row.id);
+    state.close_room(&row.id).await;
     match db::abort_open_retry(&state.pool, &row.id, "outdated").await {
-        Ok(true) => {}
-        Ok(false) => return,
+        Ok(true) => {
+            state.unmark_closing(&row.id);
+            close_and_comment_outdated(state, row).await;
+        }
+        Ok(false) => {
+            state.unmark_closing(&row.id);
+        }
         Err(_) => {
-            // Drift is known. Stop lockstep now; keep retrying abort so
-            // rematch `/fight` is not stuck on a leftover open row.
-            state.mark_closing(&row.id);
-            state.close_room(&row.id).await;
             schedule_outdated_abort(state.clone(), row.clone());
-            return;
         }
     }
-    close_and_comment_outdated(state, row).await;
 }
 
 fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
@@ -648,8 +650,12 @@ mod tests {
 
     #[test]
     fn drift_known_closes_room_while_abort_retries() {
-        assert_eq!(drift_abort_followup(Ok(true)), "close_and_comment");
-        assert_eq!(drift_abort_followup(Ok(false)), "stop");
+        assert_eq!(drift_abort_followup(Ok(true)), "close_then_comment");
+        assert_eq!(
+            drift_abort_followup(Ok(false)),
+            "close_then_stop",
+            "already-closed abort still stops leftover lockstep"
+        );
         assert_eq!(
             drift_abort_followup(Err(())),
             "close_room_and_retry",
@@ -659,8 +665,8 @@ mod tests {
 
     fn drift_abort_followup(result: Result<bool, ()>) -> &'static str {
         match result {
-            Ok(true) => "close_and_comment",
-            Ok(false) => "stop",
+            Ok(true) => "close_then_comment",
+            Ok(false) => "close_then_stop",
             Err(()) => "close_room_and_retry",
         }
     }
