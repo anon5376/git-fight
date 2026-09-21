@@ -419,7 +419,7 @@ pub async fn insert_input(
     theirs: u8,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT OR REPLACE INTO match_inputs (match_id, round_index, tick, ours, theirs)
+        "INSERT OR IGNORE INTO match_inputs (match_id, round_index, tick, ours, theirs)
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
@@ -769,6 +769,15 @@ pub async fn record_delivery(
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
+}
+
+pub async fn prune_deliveries(pool: &SqlitePool, max_age_secs: i64) -> Result<u64, sqlx::Error> {
+    let cutoff = (Utc::now() - Duration::seconds(max_age_secs)).to_rfc3339();
+    let res = sqlx::query("DELETE FROM webhook_deliveries WHERE received_at <= ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 pub async fn insert_session(
@@ -1184,6 +1193,12 @@ mod tests {
         insert_input(&pool, "abc", 1, 0, 5, 6).await.unwrap();
         assert_eq!(load_inputs(&pool, "abc", 0).await.unwrap().len(), 2);
         assert_eq!(load_inputs(&pool, "abc", 1).await.unwrap().len(), 1);
+        insert_input(&pool, "abc", 0, 0, 9, 9).await.unwrap();
+        assert_eq!(
+            load_inputs(&pool, "abc", 0).await.unwrap()[0],
+            (0, 1, 2),
+            "confirmed ticks are append-only"
+        );
         assert_eq!(load_all_inputs(&pool, "abc").await.unwrap().len(), 3);
         clear_inputs(&pool, "abc").await.unwrap();
         assert!(load_all_inputs(&pool, "abc").await.unwrap().is_empty());
@@ -1413,5 +1428,11 @@ mod tests {
         assert!(!record_delivery(&pool, "d2", "hash-a").await.unwrap());
         assert!(record_delivery(&pool, "d2", "hash-b").await.unwrap());
         assert!(!record_delivery(&pool, "d3", "hash-b").await.unwrap());
+        sqlx::query("UPDATE webhook_deliveries SET received_at = '2000-01-01T00:00:00+00:00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(prune_deliveries(&pool, 24 * 60 * 60).await.unwrap(), 2);
+        assert!(record_delivery(&pool, "d1", "hash-a").await.unwrap());
     }
 }

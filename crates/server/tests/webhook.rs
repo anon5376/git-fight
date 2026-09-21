@@ -452,6 +452,22 @@ fn fight_comment(id: u64) -> Vec<u8> {
 }
 
 fn comment_body(comment_id: u64, action: &str, on_pr: bool, text: &str) -> Vec<u8> {
+    comment_body_at(
+        comment_id,
+        action,
+        on_pr,
+        text,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+}
+
+fn comment_body_at(
+    comment_id: u64,
+    action: &str,
+    on_pr: bool,
+    text: &str,
+    updated_at: &str,
+) -> Vec<u8> {
     let issue = if on_pr {
         json!({ "number": 1, "pull_request": {} })
     } else {
@@ -466,7 +482,12 @@ fn comment_body(comment_id: u64, action: &str, on_pr: bool, text: &str) -> Vec<u
             "default_branch": "main"
         },
         "issue": issue,
-        "comment": { "id": comment_id, "body": text, "user": { "login": "carol", "type": "User" } },
+        "comment": {
+            "id": comment_id,
+            "body": text,
+            "updated_at": updated_at,
+            "user": { "login": "carol", "type": "User" }
+        },
         "sender": { "login": "carol", "type": "User" }
     }))
     .unwrap()
@@ -487,6 +508,7 @@ fn pr_event_body(action: &str, head: &str, base: &str) -> Vec<u8> {
         },
         "pull_request": {
             "number": 1,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
             "head": { "sha": head },
             "base": { "sha": base }
         }
@@ -917,6 +939,23 @@ async fn missing_or_junk_delivery_is_400() {
     )
     .await;
     assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn stale_fight_comment_is_ignored() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    let body = comment_body_at(9, "created", true, "/fight\n", "2000-01-01T00:00:00Z");
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-stale", &body).await,
+        200
+    );
+    let comments = settle_posted(&mock).await;
+    assert!(
+        comments.is_empty(),
+        "stale /fight started a match: {comments:?}"
+    );
 }
 
 #[tokio::test]

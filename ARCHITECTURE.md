@@ -112,7 +112,7 @@ comment /fight
 
 Read the raw body. Compute `HMAC-SHA256(webhook_secret, body)`. Constant-time compare to `X-Hub-Signature-256` (`sha256=` + hex). Missing or mismatch: `401`, do not parse. Then parse JSON.
 
-Dedup on `X-GitHub-Delivery` (required after the signature check) and the SHA-256 of the raw body. Ignore bots, issue comments that are not on a PR, and comments that are not `/fight`.
+Dedup on `X-GitHub-Delivery` (required after the signature check) and the SHA-256 of the raw body. GitHub HMAC has no timestamp: ignore `issue_comment` / `pull_request` events whose `updated_at` (or `created_at`) is missing, unparseable, or older than 24 hours, and prune delivery rows after that. Ignore bots, issue comments that are not on a PR, and comments that are not `/fight`.
 
 `pull_request` events are used for `auto_challenge` (off unless `.github/git-fight.yml` contains `auto_challenge: true`) and to notice that a PR head or base moved during an open match.
 
@@ -284,7 +284,7 @@ Replay log and lockstep resume.
 | `ours` | `INTEGER` | Packed buttons. |
 | `theirs` | `INTEGER` | Packed buttons. |
 
-Primary key `(match_id, round_index, tick)`. Append-only.
+Primary key `(match_id, round_index, tick)`. Append-only (`INSERT OR IGNORE`; the first confirmed tick wins).
 
 ### `sessions`
 
@@ -341,7 +341,7 @@ Absent or `false`: only `/fight` starts a match.
 
 Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like a `/fight` on a victim PR. If we trusted it, we would clone, comment, and eventually push `git-fight/*` with an installation token.
 
-**Mitigation:** `X-Hub-Signature-256` is required. HMAC-SHA256 over the **raw** body, constant-time compare, **then** parse. No signature or mismatch → `401` and no JSON. The webhook secret never logs. Delivery IDs are required and recorded, and the body hash is unique, so a captured body replayed later is ignored even if the delivery header is swapped. Clone URLs come from the authenticated installation + `owner/repo` on the payload after signature check, not from an arbitrary URL field. Live App HTTP is only `https://api.github.com` and `https://github.com`.
+**Mitigation:** `X-Hub-Signature-256` is required. HMAC-SHA256 over the **raw** body, constant-time compare, **then** parse. No signature or mismatch → `401` and no JSON. The webhook secret never logs. Delivery IDs are required and recorded, and the body hash is unique, so a captured payload replayed later is ignored even if the delivery header is swapped. Events whose GitHub timestamps are older than 24 hours are ignored, and delivery rows older than that are pruned. Clone URLs come from the authenticated installation + `owner/repo` on the payload after signature check, not from an arbitrary URL field. Live App HTTP is only `https://api.github.com` and `https://github.com`.
 
 ### A non-fighter trying to play
 

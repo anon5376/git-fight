@@ -38,6 +38,7 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tokio-tungstenite = "0.26"
 wiremock = "0.6"
 tempfile = "3"

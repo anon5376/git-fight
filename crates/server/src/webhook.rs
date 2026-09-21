@@ -2,10 +2,12 @@
 
 use crate::challenge::{self, ChallengeCtx};
 use crate::db;
+use crate::limits::WEBHOOK_MAX_AGE_SECS;
 use crate::sig;
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::StatusCode as HttpStatus;
+use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -17,6 +19,18 @@ fn is_delivery_id(s: &str) -> bool {
 
 fn payload_hash(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
+}
+
+/// GitHub HMAC has no timestamp. Events older than a match (or unparseable) are ignored.
+fn timestamp_is_fresh(ts: Option<&str>) -> bool {
+    let Some(raw) = ts.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) else {
+        return false;
+    };
+    let age = Utc::now().timestamp() - dt.timestamp();
+    (-300..=WEBHOOK_MAX_AGE_SECS).contains(&age)
 }
 
 pub async fn github_webhook(State(state): State<crate::app::AppState>, req: Request) -> HttpStatus {
@@ -76,6 +90,14 @@ async fn handle_comment(state: &crate::app::AppState, hook: Hook) -> HttpStatus 
     let Some(comment) = &hook.comment else {
         return HttpStatus::OK;
     };
+    if !timestamp_is_fresh(
+        comment
+            .updated_at
+            .as_deref()
+            .or(comment.created_at.as_deref()),
+    ) {
+        return HttpStatus::OK;
+    }
     if !challenge::is_fight_comment(&comment.body) {
         return HttpStatus::OK;
     }
@@ -104,6 +126,9 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     let Some(pr) = &hook.pull_request else {
         return HttpStatus::OK;
     };
+    if !timestamp_is_fresh(pr.updated_at.as_deref()) {
+        return HttpStatus::OK;
+    }
     let Some(repo) = &hook.repository else {
         return HttpStatus::OK;
     };
@@ -278,6 +303,10 @@ struct Issue {
 struct Comment {
     body: String,
     user: User,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -287,9 +316,25 @@ struct Pr {
     head: Option<Sha>,
     #[serde(default)]
     base: Option<Sha>,
+    #[serde(default)]
+    updated_at: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Sha {
     sha: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webhook_timestamps_must_be_fresh() {
+        assert!(timestamp_is_fresh(Some(&Utc::now().to_rfc3339())));
+        assert!(!timestamp_is_fresh(None));
+        assert!(!timestamp_is_fresh(Some("")));
+        assert!(!timestamp_is_fresh(Some("not-a-date")));
+        assert!(!timestamp_is_fresh(Some("2000-01-01T00:00:00Z")));
+    }
 }

@@ -21,6 +21,8 @@ pub const MAX_MATCHES_PER_PR_HOUR: i64 = 5;
 pub const MAX_CONCURRENT_GIT: usize = 2;
 /// `.github/git-fight.yml` is one key. Bigger is not a config file.
 pub const MAX_FIGHT_YML_BYTES: usize = 4096;
+/// Drop webhook deliveries (and reject GitHub event timestamps) older than a match.
+pub const WEBHOOK_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 pub fn git_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -43,5 +45,7 @@ mod tests {
         assert_eq!(MAX_MATCHES_PER_PR_HOUR, 5);
         assert_eq!(MAX_MATCHES_PER_INSTALL_HOUR, 20);
         assert_eq!(MAX_FIGHT_YML_BYTES, 4096);
+        assert_eq!(WEBHOOK_MAX_AGE_SECS, 24 * 60 * 60);
+        assert_eq!(WEBHOOK_MAX_AGE_SECS, crate::protocol::EXPIRE_SECS);
     }
 }
