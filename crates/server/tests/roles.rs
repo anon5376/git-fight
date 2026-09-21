@@ -222,6 +222,32 @@ async fn cpu_side_cannot_be_claimed() {
 }
 
 #[tokio::test]
+async fn spectator_input_does_not_block_fighter() {
+    let (addr, pool) = spawn().await;
+    github_match(&pool).await;
+    starter_hunk(&pool).await;
+    let carol = session(&pool, "carol").await;
+    let alice = session(&pool, "alice").await;
+    let url = format!("ws://{addr}/ws?match=match1");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cookie", format!("git_fight_sid={carol}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let (mut sink, _stream) = ws.split();
+    for i in 0..600u32 {
+        let body = format!(r#"{{"type":"input","tick":{i},"buttons":1}}"#);
+        sink.send(Message::Text(body.into())).await.unwrap();
+    }
+    let role = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        hello_role(addr, Some(&alice), None),
+    )
+    .await
+    .expect("fighter hello stalled behind spectator Input");
+    assert_eq!(role, "ours");
+}
+
+#[tokio::test]
 async fn github_mirror_match_gives_both_to_that_login() {
     let (addr, pool) = spawn().await;
     git_fight_server::db::insert_full_match(

@@ -71,6 +71,31 @@ pub fn role_for(
     }
 }
 
+/// Whether this socket may put `Input` on the room queue.
+/// GitHub: session login is ours, match theirs, or any hunk theirs (later rounds).
+/// Local: a non-empty share token that owns a slot. Spectators never enqueue.
+pub fn can_enqueue_input(
+    github: bool,
+    ours_login: Option<&str>,
+    match_theirs_login: Option<&str>,
+    hunk_theirs_logins: &[&str],
+    login: Option<&str>,
+    token: Option<&str>,
+    ours_token: Option<&str>,
+    theirs_token: Option<&str>,
+) -> bool {
+    if github {
+        let Some(login) = login.filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if ours_login == Some(login) || match_theirs_login == Some(login) {
+            return true;
+        }
+        return hunk_theirs_logins.iter().any(|h| *h == login);
+    }
+    role_for(false, None, None, login, token, ours_token, theirs_token) != Role::Spectator
+}
+
 /// `GET /ws` Error body for a match that is not a room.
 pub fn closed_ws_message<'a>(status: &'a str, abort_reason: Option<&str>) -> Option<&'a str> {
     match status {
@@ -156,6 +181,72 @@ mod tests {
             ),
             Role::Ours
         );
+        assert!(
+            can_enqueue_input(
+                true,
+                Some("alice"),
+                Some("bob"),
+                &[],
+                Some("alice"),
+                None,
+                None,
+                None
+            ),
+            "ours login may enqueue"
+        );
+        assert!(
+            can_enqueue_input(
+                true,
+                Some("alice"),
+                Some("bob"),
+                &["carol"],
+                Some("carol"),
+                None,
+                None,
+                None
+            ),
+            "later-round theirs may enqueue"
+        );
+        assert!(
+            !can_enqueue_input(
+                true,
+                Some("alice"),
+                Some("bob"),
+                &["carol"],
+                Some("dave"),
+                Some("ours-token"),
+                Some("o"),
+                Some("t")
+            ),
+            "GitHub spectator Input never reaches the room queue"
+        );
+        assert!(
+            !can_enqueue_input(
+                true,
+                Some("alice"),
+                Some("bob"),
+                &[],
+                None,
+                None,
+                None,
+                None
+            ),
+            "anonymous GitHub socket cannot enqueue"
+        );
+        assert!(
+            !can_enqueue_input(false, None, None, &[], None, Some(""), Some(""), Some("")),
+            "empty local token cannot enqueue"
+        );
+        assert!(can_enqueue_input(
+            false,
+            None,
+            None,
+            &[],
+            None,
+            Some("ours-token"),
+            Some("ours-token"),
+            Some("theirs-token")
+        ));
         assert_eq!(round_seed(7, 0), 7);
         assert_eq!(round_seed(7, 1), 14);
     }

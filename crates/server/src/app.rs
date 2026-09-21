@@ -2,8 +2,8 @@ use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
 use crate::protocol::{
-    closed_ws_message, is_match_id, round_seed, split_seed, ClientMsg, ServerMsg, DISCONNECT_SECS,
-    EXPIRE_SECS, INPUT_DELAY,
+    can_enqueue_input, closed_ws_message, is_match_id, round_seed, split_seed, ClientMsg,
+    ServerMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY,
 };
 use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
@@ -508,15 +508,28 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         reject_socket(socket, message).await;
         return;
     }
-    if row.pr_number > 0 {
-        let hunks = db::list_hunks(&state.pool, &row.id)
-            .await
-            .unwrap_or_default();
-        if hunks.is_empty() {
-            reject_socket(socket, "preparing").await;
-            return;
-        }
+    let hunks = db::list_hunks(&state.pool, &row.id)
+        .await
+        .unwrap_or_default();
+    if row.pr_number > 0 && hunks.is_empty() {
+        reject_socket(socket, "preparing").await;
+        return;
     }
+    let github = db::github_identity(&row, &hunks);
+    let hunk_theirs: Vec<&str> = hunks
+        .iter()
+        .filter_map(|h| h.theirs_login.as_deref())
+        .collect();
+    let enqueue_input = can_enqueue_input(
+        github,
+        row.ours_login.as_deref(),
+        row.theirs_login.as_deref(),
+        &hunk_theirs,
+        login.as_deref(),
+        q.token.as_deref(),
+        row.ours_token.as_deref(),
+        row.theirs_token.as_deref(),
+    );
     let conn_id = uuid::Uuid::new_v4().as_u128() as u64;
     let (out_tx, mut out_rx) = mpsc::channel::<String>(512);
     let mut join = Some(RoomEvent::Join {
@@ -581,15 +594,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
             else {
                 continue;
             };
-            let _ = tx
-                .send(RoomEvent::Input {
-                    conn_id,
-                    tick,
-                    buttons,
-                    theirs_buttons: theirs,
-                    round,
-                })
-                .await;
+            if !enqueue_input {
+                continue;
+            }
+            let _ = tx.try_send(RoomEvent::Input {
+                conn_id,
+                tick,
+                buttons,
+                theirs_buttons: theirs,
+                round,
+            });
         }
         let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
     });

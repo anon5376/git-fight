@@ -209,7 +209,7 @@ The server accepts an input only if:
 - `tick` is in `(confirmed_tick, confirmed_tick + window]`,
 - that tick has not already been confirmed.
 
-Anything else is dropped. Spectators' `Input` messages are dropped.
+Anything else is dropped. Spectators' `Input` messages are dropped before the room queue.
 
 ### Confirm
 
@@ -350,7 +350,7 @@ Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like 
 
 A spectator (or a stranger who found the match URL) sends `Input` for a fighter slot, or spoofs a query param `role=ours`.
 
-**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped. CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
+**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped **before** they enter the room event queue, so a spectator flood cannot fill the 512-slot channel and stall fighter confirm or Leave. Fighter `Input` is `try_send` (late = idle). CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
 
 ### Hostile repos
 
