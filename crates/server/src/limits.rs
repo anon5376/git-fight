@@ -12,6 +12,7 @@ pub const MAX_MATCHES_PER_INSTALL_HOUR: i64 = 20;
 /// New `/fight` (and auto-challenge) starts per pull request per hour.
 pub const MAX_MATCHES_PER_PR_HOUR: i64 = 5;
 /// Clone / merge-tree / push jobs at once (webhook returns 200 before git work).
+/// HTTP (mergeable poll, comments) must not take a slot.
 pub const MAX_CONCURRENT_GIT: usize = 2;
 
 pub fn git_slots() -> &'static tokio::sync::Semaphore {

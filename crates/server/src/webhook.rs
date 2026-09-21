@@ -204,9 +204,6 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         return HttpStatus::OK;
     }
     tokio::spawn(async move {
-        let Ok(_permit) = crate::limits::git_slots().acquire().await else {
-            return;
-        };
         let start = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
             Ok(msg) => msg,
             Err(_) => challenge::ChallengeStart {

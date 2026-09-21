@@ -89,10 +89,6 @@ fn round_lines(hunks: &[HunkRow]) -> String {
 }
 
 pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
-    let _permit = crate::limits::git_slots()
-        .acquire()
-        .await
-        .map_err(|e| e.to_string())?;
     let row = db::get_match(&ctx.pool, match_id)
         .await
         .map_err(|e| e.to_string())?
@@ -162,6 +158,11 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             base_ref = pr.base.r#ref;
         }
     }
+
+    let _permit = crate::limits::git_slots()
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
 
     let branch = gitutil::result_ref(row.pr_number, &row.id).map_err(|e| e.to_string())?;
     let work = tempfile::Builder::new()
