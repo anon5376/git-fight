@@ -40,6 +40,88 @@ async fn two_clients_agree_with_server_hash() {
 }
 
 #[tokio::test]
+async fn cpu_lockstep_hashes_agree_with_client() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = std::env::temp_dir().join(format!(
+        "gf-cpu-hash-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "cpuhash00cpuhash00cpuhash00cpuha";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 9,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 0,
+            path: "a.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let server = play(addr, id, "ours-token", true).await;
+    let replay: Value = http_get(addr, &format!("/api/replays/{id}")).await.1;
+    let hash = replay["final_hash"].as_str().expect("finished replay");
+    let expected = format!("{:08x}{:08x}", server >> 32, server as u32);
+    assert_eq!(hash, expected, "server hash {hash} != client {expected}");
+}
+
+#[tokio::test]
 async fn hello_includes_stored_fighter_stats() {
     use git_fight_server::db::{NewHunk, NewMatch};
     let dir = std::env::temp_dir().join(format!(
@@ -511,6 +593,15 @@ async fn play(addr: std::net::SocketAddr, id: &str, token: &str, is_ours: bool) 
                 if n == sim.tick {
                     sim.step(Input::from_u8(ours), Input::from_u8(theirs));
                     confirmed = n as i32;
+                }
+            }
+            Some("hash") => {
+                let n = v["n"].as_u64().unwrap() as u32;
+                if n == sim.tick {
+                    let hi = v["hi"].as_u64().unwrap();
+                    let lo = v["lo"].as_u64().unwrap();
+                    let server = (hi << 32) | lo;
+                    assert_eq!(sim.state_hash(), server, "Hash desync at tick {n}");
                 }
             }
             Some("end") => {
