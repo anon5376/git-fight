@@ -286,6 +286,52 @@ fn file_directory_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String
     (tmp, bare, head, base)
 }
 
+fn gitlink_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("sub"), "mod\n").unwrap();
+    git(&work, &["add", "sub"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    let target = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["rm", "-q", "sub"]);
+    git(
+        &work,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{target},sub"),
+        ],
+    );
+    git(&work, &["commit", "-q", "-m", "pr-gitlink"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("sub"), "mod2\n").unwrap();
+    git(&work, &["add", "sub"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 fn write_hunk_fns(work: &Path, n: usize, body: i32) {
     let mut src = String::new();
     for i in 0..n {
@@ -1622,6 +1668,32 @@ async fn file_directory_conflict_is_not_fightable() {
             .unwrap()
             .is_none(),
         "file/directory conflicts must not leave a pending match"
+    );
+}
+
+#[tokio::test]
+async fn gitlink_conflict_is_not_fightable() {
+    let (_keep, bare, head, base) = gitlink_conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-gitlink", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("not the kind git fight can play")
+                || t.contains("no conflicts to fight")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "gitlink conflicts must not leave a pending match"
     );
 }
 

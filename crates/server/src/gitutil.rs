@@ -801,4 +801,20 @@ Auto-merging lib.rs\n";
         assert_eq!(tree.len(), 40);
         assert!(paths.contains("lib.rs"));
     }
+
+    #[test]
+    fn parse_merge_tree_skips_unsafe_paths() {
+        let sample = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+100644 1111111111111111111111111111111111111111 1\t.git/config\n\
+100644 2222222222222222222222222222222222222222 1\t../etc/passwd\n\
+100644 3333333333333333333333333333333333333333 1\t/abs.rs\n\
+100644 4444444444444444444444444444444444444444 1\tsrc/lib.rs\n\
+\n";
+        let (_, paths) = parse_merge_tree_output(sample).unwrap();
+        assert!(paths.contains("src/lib.rs"));
+        assert!(!paths.contains(".git/config"));
+        assert!(!paths.contains("../etc/passwd"));
+        assert!(!paths.contains("/abs.rs"));
+        assert_eq!(paths.len(), 1);
+    }
 }

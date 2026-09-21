@@ -331,3 +331,122 @@ async fn file_directory_conflict_has_no_fightable_hunks() {
         other => panic!("expected NothingToFight, got {other}"),
     }
 }
+
+fn gitlink_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("sub"), "mod\n").unwrap();
+    git(&work, &["add", "sub"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    let target = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["rm", "-q", "sub"]);
+    git(
+        &work,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{target},sub"),
+        ],
+    );
+    git(&work, &["commit", "-q", "-m", "pr-gitlink"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("sub"), "mod2\n").unwrap();
+    git(&work, &["add", "sub"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
+#[tokio::test]
+async fn gitlink_conflict_has_no_fightable_hunks() {
+    let (_keep, bare, head, base) = gitlink_conflict_bare();
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    assert_eq!(code, 1);
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+        .await
+        .unwrap_err();
+    match err {
+        gitutil::GitError::NothingToFight => {}
+        other => panic!("expected NothingToFight, got {other}"),
+    }
+}
+
+fn oversized_blob_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("blob.rs"), vec![b'x'; 64]).unwrap();
+    git(&work, &["add", "blob.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::write(work.join("blob.rs"), vec![b'a'; 1_048_577]).unwrap();
+    git(&work, &["add", "blob.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("blob.rs"), vec![b'b'; 1_048_577]).unwrap();
+    git(&work, &["add", "blob.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
+#[tokio::test]
+async fn oversized_blob_has_no_fightable_hunks() {
+    let (_keep, bare, head, base) = oversized_blob_bare();
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    assert_eq!(code, 1);
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+        .await
+        .unwrap_err();
+    match err {
+        gitutil::GitError::NothingToFight => {}
+        other => panic!("expected NothingToFight, got {other}"),
+    }
+}
