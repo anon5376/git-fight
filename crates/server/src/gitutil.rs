@@ -1083,7 +1083,7 @@ async fn rev_parse_git_fight(
         ));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["rev-parse", "--verify", "--", spec]);
+    cmd.args(["rev-parse", "--verify", spec]);
     let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
         return Err(git_err(&err));
