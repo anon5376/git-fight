@@ -491,19 +491,35 @@ async fn advance(a: Advance<'_>) -> bool {
         let ours_btn = if a.ours.kind_cpu {
             a.sim.cpu_input(Side::Ours).as_u8()
         } else {
-            a.pending_ours.remove(a.next_tick).unwrap_or(0)
+            a.pending_ours.get(a.next_tick).copied().unwrap_or(0)
         };
         let theirs_btn = if a.theirs.kind_cpu {
             a.sim.cpu_input(Side::Theirs).as_u8()
         } else {
-            a.pending_theirs.remove(a.next_tick).unwrap_or(0)
+            a.pending_theirs.get(a.next_tick).copied().unwrap_or(0)
         };
+        match db::persist_input(a.pool, a.id, *a.round, *a.next_tick, ours_btn, theirs_btn).await {
+            Ok(true) => {}
+            Ok(false) => {
+                if match_is_open(a.pool, a.id).await == MatchOpen::Closed {
+                    expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                    return true;
+                }
+                return false;
+            }
+            Err(_) => return false,
+        }
+        if !a.ours.kind_cpu {
+            a.pending_ours.remove(a.next_tick);
+        }
+        if !a.theirs.kind_cpu {
+            a.pending_theirs.remove(a.next_tick);
+        }
         a.sim
             .step(Input::from_u8(ours_btn), Input::from_u8(theirs_btn));
         let n = *a.next_tick;
         *a.next_tick = a.next_tick.saturating_add(1);
         a.log.push((n, ours_btn, theirs_btn));
-        let _ = db::insert_input(a.pool, a.id, *a.round, n, ours_btn, theirs_btn).await;
         let msg = encode(&ServerMsg::Tick {
             n,
             ours: ours_btn,

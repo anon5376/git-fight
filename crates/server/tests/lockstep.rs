@@ -1628,6 +1628,133 @@ async fn previous_round_input_does_not_steer_the_next_round() {
     );
 }
 
+#[tokio::test]
+async fn failed_input_insert_does_not_advance_confirmed_tick() {
+    let dir = std::env::temp_dir().join(format!(
+        "gf-persist-first-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    sqlx::query(
+        "CREATE TRIGGER block_match_inputs
+         BEFORE INSERT ON match_inputs
+         BEGIN
+           SELECT RAISE(ABORT, 'blocked');
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let created: Value = http_post(addr, "/api/matches", r#"{"seed":1}"#).await.1;
+    let id = created["id"].as_str().unwrap().to_string();
+    let ours_token = created["ours_token"].as_str().unwrap().to_string();
+    let theirs_token = created["theirs_token"].as_str().unwrap().to_string();
+
+    let ours_url = format!("ws://{addr}/ws?match={id}&token={ours_token}");
+    let theirs_url = format!("ws://{addr}/ws?match={id}&token={theirs_token}");
+    let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
+    let (theirs_ws, _) = tokio_tungstenite::connect_async(&theirs_url).await.unwrap();
+    let (mut ours_sink, mut ours_stream) = ours_ws.split();
+    let (mut theirs_sink, mut theirs_stream) = theirs_ws.split();
+    let ours_hello = wait_type(&mut ours_stream, "hello").await;
+    let _ = wait_type(&mut theirs_stream, "hello").await;
+    assert_eq!(ours_hello["confirmed_tick"].as_i64(), Some(-1));
+
+    for tick in 0..8u32 {
+        let msg = format!(r#"{{"type":"input","tick":{tick},"buttons":0}}"#);
+        ours_sink
+            .send(Message::Text(msg.clone().into()))
+            .await
+            .unwrap();
+        theirs_sink.send(Message::Text(msg.into())).await.unwrap();
+    }
+
+    let stalled = tokio::time::timeout(Duration::from_millis(400), async {
+        loop {
+            let msg = ours_stream.next().await.unwrap().unwrap();
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&text).unwrap();
+            match v["type"].as_str() {
+                Some("tick") => return Some(v),
+                Some("end") => panic!("must not End while match_inputs is blocked {v}"),
+                Some("error") => panic!("server error {}", v["message"]),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        stalled.is_err(),
+        "a failed match_inputs write must not broadcast Tick: {:?}",
+        stalled.ok().flatten()
+    );
+    assert!(
+        git_fight_server::db::load_inputs(&pool, &id, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "blocked insert must leave the log empty"
+    );
+
+    sqlx::query("DROP TRIGGER block_match_inputs")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let tick = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = ours_stream.next().await.unwrap().unwrap();
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&text).unwrap();
+            match v["type"].as_str() {
+                Some("tick") => return v,
+                Some("error") => panic!("server error {}", v["message"]),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("after DROP TRIGGER the room should confirm the peeked inputs");
+    assert_eq!(tick["n"].as_i64(), Some(0));
+    assert!(
+        !git_fight_server::db::load_inputs(&pool, &id, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the recovered tick must be durable"
+    );
+}
+
 async fn connect_cookie(
     addr: std::net::SocketAddr,
     match_id: &str,

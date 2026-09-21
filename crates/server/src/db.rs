@@ -538,20 +538,23 @@ pub async fn clear_inputs(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error
     Ok(())
 }
 
-pub async fn insert_input(
+/// Persist a confirmed tick. `true` means the row is durable (just written
+/// or already present). Out-of-range ticks are treated as durable so the
+/// room cannot stall. `false` means the match is not open and no row exists.
+pub async fn persist_input(
     pool: &SqlitePool,
     id: &str,
     round: u32,
     tick: u32,
     ours: u8,
     theirs: u8,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     if round >= crate::limits::MAX_HUNKS as u32
         || tick > git_fight_core::ROUND_TICKS + crate::protocol::INPUT_WINDOW
     {
-        return Ok(());
+        return Ok(true);
     }
-    sqlx::query(
+    let res = sqlx::query(
         "INSERT OR IGNORE INTO match_inputs (match_id, round_index, tick, ours, theirs)
          SELECT ?, ?, ?, ?, ?
          FROM matches
@@ -565,7 +568,32 @@ pub async fn insert_input(
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    if res.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM match_inputs
+         WHERE match_id = ? AND round_index = ? AND tick = ?",
+    )
+    .bind(id)
+    .bind(i64::from(round))
+    .bind(i64::from(tick))
+    .fetch_optional(pool)
+    .await?;
+    Ok(exists.is_some())
+}
+
+pub async fn insert_input(
+    pool: &SqlitePool,
+    id: &str,
+    round: u32,
+    tick: u32,
+    ours: u8,
+    theirs: u8,
+) -> Result<(), sqlx::Error> {
+    persist_input(pool, id, round, tick, ours, theirs)
+        .await
+        .map(|_| ())
 }
 
 pub async fn set_status(
@@ -2702,5 +2730,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn persist_input_is_false_when_the_match_is_aborted() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(abort_open_match(&pool, "m1", "outdated").await.unwrap());
+        assert!(
+            !persist_input(&pool, "m1", 0, 0, 1, 2).await.unwrap(),
+            "a closed match must not store a tick"
+        );
+        assert!(load_inputs(&pool, "m1", 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_input_treats_an_existing_row_as_durable() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(persist_input(&pool, "m1", 0, 0, 1, 2).await.unwrap());
+        assert!(
+            persist_input(&pool, "m1", 0, 0, 9, 9).await.unwrap(),
+            "already-present tick is durable; first buttons win"
+        );
+        assert_eq!(load_inputs(&pool, "m1", 0).await.unwrap(), vec![(0, 1, 2)]);
+        assert!(
+            persist_input(&pool, "m1", crate::limits::MAX_HUNKS as u32, 0, 1, 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(load_inputs(&pool, "m1", 0).await.unwrap().len(), 1);
     }
 }
