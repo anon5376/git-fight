@@ -279,7 +279,7 @@ async fn seed_match(
     .await
     .unwrap();
     if let Some(w) = winner {
-        git_fight_server::db::set_hunk_winner(pool, MATCH_ID, 0, w)
+        git_fight_server::db::set_hunk_winner(pool, MATCH_ID, 0, w, false)
             .await
             .unwrap();
     }
@@ -465,7 +465,7 @@ async fn two_hunks_in_one_file_push_each_pick() {
         .await
         .unwrap();
         let winner = if round == 0 { "ours" } else { "theirs" };
-        git_fight_server::db::set_hunk_winner(&pool, ID, round as i64, winner)
+        git_fight_server::db::set_hunk_winner(&pool, ID, round as i64, winner, false)
             .await
             .unwrap();
     }
@@ -567,7 +567,7 @@ async fn two_files_push_each_pick() {
         .await
         .unwrap();
         let winner = if h.path == "a.rs" { "ours" } else { "theirs" };
-        git_fight_server::db::set_hunk_winner(&pool, ID, round as i64, winner)
+        git_fight_server::db::set_hunk_winner(&pool, ID, round as i64, winner, false)
             .await
             .unwrap();
     }
@@ -692,7 +692,7 @@ async fn forfeit_skips_push_even_when_another_round_was_won() {
     )
     .await
     .unwrap();
-    git_fight_server::db::set_hunk_winner(&pool, MATCH_ID, 1, "forfeit_theirs")
+    git_fight_server::db::set_hunk_winner(&pool, MATCH_ID, 1, "forfeit_theirs", false)
         .await
         .unwrap();
     let ctx = ctx(pool.clone(), &mock, bare.clone());

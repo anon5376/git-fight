@@ -24,10 +24,7 @@ pub async fn record_round(
     if row.owner.is_empty() || row.repo.is_empty() {
         return Ok(());
     }
-    if !matches!(row.status.as_str(), "pending" | "in_progress") {
-        return Ok(());
-    }
-    if !db::claim_round_stats(pool, match_id, round).await? {
+    if !matches!(row.status.as_str(), "pending" | "in_progress" | "finished") {
         return Ok(());
     }
     let hunks = db::list_hunks(pool, match_id).await?;
@@ -37,6 +34,11 @@ pub async fn record_round(
         .and_then(|h| h.theirs_login.clone())
         .or(row.theirs_login);
     let ours_login = row.ours_login;
+    let stored_ko = hunks
+        .iter()
+        .find(|h| h.round_index == round)
+        .is_some_and(|h| h.is_ko);
+    let ko = ko || stored_ko;
 
     let ours_win = matches!(winner, "ours" | "forfeit_theirs");
     let theirs_win = matches!(winner, "theirs" | "forfeit_ours");
@@ -65,12 +67,16 @@ pub async fn record_round(
     }
     bump(&mut delta, theirs_login.as_deref(), [0, 0, 0, 1]);
 
+    let mut tx = pool.begin().await?;
+    if !db::claim_round_stats(&mut *tx, match_id, round).await? {
+        return Ok(());
+    }
     for (login, [wins, losses, kos, caused]) in delta {
         if wins == 0 && losses == 0 && kos == 0 && caused == 0 {
             continue;
         }
         db::add_player_stats(
-            pool,
+            &mut *tx,
             &row.owner,
             &row.repo,
             &PlayerStat {
@@ -83,6 +89,7 @@ pub async fn record_round(
         )
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -93,7 +100,7 @@ pub async fn record_stored_winners(pool: &SqlitePool, match_id: &str, hunks: &[d
         let Some(winner) = h.winner.as_deref() else {
             continue;
         };
-        let _ = record_round(pool, match_id, h.round_index, winner, false).await;
+        let _ = record_round(pool, match_id, h.round_index, winner, h.is_ko).await;
     }
 }
 

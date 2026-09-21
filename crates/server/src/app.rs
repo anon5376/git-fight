@@ -155,7 +155,18 @@ impl AppState {
         }
     }
 
+    async fn record_missing_stats(&self) {
+        let Ok(ids) = db::list_unrecorded_stat_matches(&self.pool).await else {
+            return;
+        };
+        for id in ids {
+            let hunks = db::list_hunks(&self.pool, &id).await.unwrap_or_default();
+            crate::stats::record_stored_winners(&self.pool, &id, &hunks).await;
+        }
+    }
+
     async fn finish_scored_open(&self) {
+        self.record_missing_stats().await;
         let Ok(ids) = db::list_scored_open_matches(&self.pool).await else {
             return;
         };

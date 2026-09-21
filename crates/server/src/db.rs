@@ -120,6 +120,7 @@ async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
             theirs_armor INTEGER NOT NULL DEFAULT 0,
             theirs_special INTEGER NOT NULL DEFAULT 0,
             stats_recorded INTEGER NOT NULL DEFAULT 0,
+            is_ko INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (match_id, round_index),
             FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
@@ -134,18 +135,23 @@ async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
         ("theirs_armor", "INTEGER NOT NULL DEFAULT 0"),
         ("theirs_special", "INTEGER NOT NULL DEFAULT 0"),
         ("stats_recorded", "INTEGER NOT NULL DEFAULT 0"),
+        ("is_ko", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let q = format!("ALTER TABLE match_hunks ADD COLUMN {col} {ty}");
-        let _ = sqlx::query(&q).execute(&mut *conn).await;
+        let added = sqlx::query(&q).execute(&mut *conn).await.is_ok();
+        // One-shot: rows scored before this column existed were already
+        // counted in-process. Do not repeat on later boots — that would
+        // consume the claim and drop a crash between winner write and
+        // player_stats.
+        if added && col == "stats_recorded" {
+            let _ = sqlx::query(
+                "UPDATE match_hunks SET stats_recorded = 1
+                 WHERE winner IS NOT NULL AND stats_recorded = 0",
+            )
+            .execute(&mut *conn)
+            .await;
+        }
     }
-    // Already-scored rows from before this column were recorded in-process.
-    // Mark them so a resume cannot double-count. New winners stay 0 until claim.
-    let _ = sqlx::query(
-        "UPDATE match_hunks SET stats_recorded = 1
-         WHERE winner IS NOT NULL AND stats_recorded = 0",
-    )
-    .execute(&mut *conn)
-    .await;
     ensure_match_hunks_fk(conn).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -403,6 +409,7 @@ async fn ensure_match_hunks_fk(conn: &mut SqliteConnection) -> Result<(), sqlx::
             theirs_armor INTEGER NOT NULL DEFAULT 0,
             theirs_special INTEGER NOT NULL DEFAULT 0,
             stats_recorded INTEGER NOT NULL DEFAULT 0,
+            is_ko INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (match_id, round_index),
             FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
@@ -414,12 +421,12 @@ async fn ensure_match_hunks_fk(conn: &mut SqliteConnection) -> Result<(), sqlx::
             match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
             theirs_login, theirs_name, winner,
             ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special,
-            stats_recorded
+            stats_recorded, is_ko
          )
          SELECT match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
             theirs_login, theirs_name, winner,
             ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special,
-            stats_recorded
+            stats_recorded, is_ko
          FROM match_hunks",
     )
     .execute(&mut *conn)
@@ -1016,12 +1023,14 @@ pub async fn set_hunk_winner(
     match_id: &str,
     round: i64,
     winner: &str,
+    ko: bool,
 ) -> Result<bool, sqlx::Error> {
     if !is_hunk_winner(winner) {
         return Ok(false);
     }
+    let is_ko = i64::from(ko && matches!(winner, "ours" | "theirs"));
     let res = sqlx::query(
-        "UPDATE match_hunks SET winner = ?
+        "UPDATE match_hunks SET winner = ?, is_ko = ?
          WHERE match_id = ? AND round_index = ? AND winner IS NULL
            AND EXISTS (
              SELECT 1 FROM matches
@@ -1030,6 +1039,7 @@ pub async fn set_hunk_winner(
            )",
     )
     .bind(winner)
+    .bind(is_ko)
     .bind(match_id)
     .bind(round)
     .execute(pool)
@@ -1037,12 +1047,17 @@ pub async fn set_hunk_winner(
     Ok(res.rows_affected() > 0)
 }
 
-/// Write-once: true if this open round still needed a leaderboard write.
-pub async fn claim_round_stats(
-    pool: &SqlitePool,
+/// Write-once: true if this scored round still needed a leaderboard write.
+/// Allowed on `finished` so a crash after `finish_open_match` can still
+/// record. Never after abort or expiry.
+pub async fn claim_round_stats<'e, E>(
+    executor: E,
     match_id: &str,
     round: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
     let res = sqlx::query(
         "UPDATE match_hunks SET stats_recorded = 1
          WHERE match_id = ? AND round_index = ? AND winner IS NOT NULL
@@ -1050,12 +1065,12 @@ pub async fn claim_round_stats(
            AND EXISTS (
              SELECT 1 FROM matches
              WHERE id = match_hunks.match_id
-               AND status IN ('pending', 'in_progress')
+               AND status IN ('pending', 'in_progress', 'finished')
            )",
     )
     .bind(match_id)
     .bind(round)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
 }
@@ -1073,6 +1088,7 @@ pub struct HunkRow {
     pub theirs_hp: i32,
     pub theirs_armor: bool,
     pub theirs_special: bool,
+    pub is_ko: bool,
 }
 
 impl HunkRow {
@@ -1160,7 +1176,8 @@ pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
 pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
     sqlx::query_as::<_, HunkRow>(
         "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login,
-                ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
+                ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special,
+                is_ko
          FROM match_hunks WHERE match_id = ? ORDER BY round_index",
     )
     .bind(match_id)
@@ -1177,12 +1194,15 @@ pub struct PlayerStat {
     pub conflicts_caused: i64,
 }
 
-pub async fn add_player_stats(
-    pool: &SqlitePool,
+pub async fn add_player_stats<'e, E>(
+    executor: E,
     owner: &str,
     repo: &str,
     stat: &PlayerStat,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
     let Some(login) = crate::gh::normalize_github_login(&stat.github_login) else {
         return Ok(());
     };
@@ -1204,7 +1224,7 @@ pub async fn add_player_stats(
     .bind(stat.losses)
     .bind(stat.kos)
     .bind(stat.conflicts_caused)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -1324,6 +1344,22 @@ pub async fn set_result_branch(
     Ok(res.rows_affected() > 0)
 }
 
+/// Scored hunks whose leaderboard write never committed. Includes
+/// `finished` so a crash after `finish_open_match` can still record.
+pub async fn list_unrecorded_stat_matches(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT DISTINCT m.id FROM matches m
+         INNER JOIN match_hunks h ON h.match_id = m.id
+         WHERE m.status IN ('pending', 'in_progress', 'finished')
+           AND h.winner IS NOT NULL
+           AND h.stats_recorded = 0
+         ORDER BY m.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Open fights whose every hunk already has a winner. The expirer marks
 /// these finished and publishes; `expire_pending` must not bury them.
 pub async fn list_scored_open_matches(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
@@ -1375,6 +1411,7 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for HunkRow {
             theirs_hp: row.try_get::<i64, _>("theirs_hp")? as i32,
             theirs_armor: flag("theirs_armor")?,
             theirs_special: flag("theirs_special")?,
+            is_ko: flag("is_ko")?,
         })
     }
 }
@@ -1477,7 +1514,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(set_hunk_winner(&pool, "won1", 0, "ours").await.unwrap());
+        assert!(set_hunk_winner(&pool, "won1", 0, "ours", false)
+            .await
+            .unwrap());
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         assert_eq!(
             list_scored_open_matches(&pool).await.unwrap(),
@@ -1542,11 +1581,204 @@ mod tests {
         .await
         .unwrap();
         assert!(!claim_round_stats(&pool, "st1", 0).await.unwrap());
-        assert!(set_hunk_winner(&pool, "st1", 0, "ours").await.unwrap());
+        assert!(set_hunk_winner(&pool, "st1", 0, "ours", true)
+            .await
+            .unwrap());
         assert!(claim_round_stats(&pool, "st1", 0).await.unwrap());
         assert!(!claim_round_stats(&pool, "st1", 0).await.unwrap());
         assert!(finish_open_match(&pool, "st1", "deadbeef").await.unwrap());
         assert!(!claim_round_stats(&pool, "st1", 0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn finished_match_can_claim_an_unrecorded_round() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "st-fin".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "st-fin",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(set_hunk_winner(&pool, "st-fin", 0, "ours", true)
+            .await
+            .unwrap());
+        assert_eq!(
+            list_unrecorded_stat_matches(&pool).await.unwrap(),
+            vec!["st-fin".to_string()]
+        );
+        assert!(finish_open_match(&pool, "st-fin", "deadbeef")
+            .await
+            .unwrap());
+        assert_eq!(
+            list_unrecorded_stat_matches(&pool).await.unwrap(),
+            vec!["st-fin".to_string()]
+        );
+        assert!(claim_round_stats(&pool, "st-fin", 0).await.unwrap());
+        assert!(list_unrecorded_stat_matches(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborted_match_is_not_an_unrecorded_stat_row() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "st-ab".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "st-ab",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(set_hunk_winner(&pool, "st-ab", 0, "ours", true)
+            .await
+            .unwrap());
+        assert!(abort_open_match(&pool, "st-ab", "outdated").await.unwrap());
+        assert!(list_unrecorded_stat_matches(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!claim_round_stats(&pool, "st-ab", 0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn remigrate_does_not_consume_an_unrecorded_winner() {
+        let dir = crate::test_tmp_dir("gf-stat-mig");
+        let url = format!("sqlite://{}/m.db", dir.display());
+        {
+            let pool = connect(&url).await.unwrap();
+            insert_full_match(
+                &pool,
+                &NewMatch {
+                    id: "mig1".into(),
+                    seed: 1,
+                    delay: 3,
+                    ours_name: "a".into(),
+                    theirs_name: "b".into(),
+                    ours_kind: "github".into(),
+                    theirs_kind: "cpu".into(),
+                    ours_login: None,
+                    theirs_login: None,
+                    ours_token: "o".into(),
+                    theirs_token: "t".into(),
+                    expire_secs: 3600,
+                    installation_id: Some(1),
+                    owner: "acme".into(),
+                    repo: "box".into(),
+                    pr_number: 1,
+                    pr_head_sha: "h".into(),
+                    pr_base_sha: "b".into(),
+                },
+            )
+            .await
+            .unwrap();
+            insert_hunk(
+                &pool,
+                &NewHunk {
+                    match_id: "mig1",
+                    round: 0,
+                    path: "lib.rs",
+                    hunk_index: 0,
+                    ours: b"a",
+                    theirs: b"b",
+                    base: b"c",
+                    theirs_login: None,
+                    theirs_name: None,
+                    ours_stats: git_fight_core::FighterStats::default(),
+                    theirs_stats: git_fight_core::FighterStats::default(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(set_hunk_winner(&pool, "mig1", 0, "ours", true)
+                .await
+                .unwrap());
+            pool.close().await;
+        }
+        let pool = connect(&url).await.unwrap();
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT stats_recorded FROM match_hunks WHERE match_id = 'mig1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 0, "boot migrate must not consume the claim");
+        assert_eq!(
+            list_unrecorded_stat_matches(&pool).await.unwrap(),
+            vec!["mig1".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1990,13 +2222,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!set_hunk_winner(&pool, "m1", 0, "[x](https://evil)")
+        assert!(!set_hunk_winner(&pool, "m1", 0, "[x](https://evil)", true)
             .await
             .unwrap());
-        assert!(set_hunk_winner(&pool, "m1", 0, "ours").await.unwrap());
-        assert!(!set_hunk_winner(&pool, "m1", 0, "theirs").await.unwrap());
+        assert!(set_hunk_winner(&pool, "m1", 0, "ours", true).await.unwrap());
+        assert!(!set_hunk_winner(&pool, "m1", 0, "theirs", false)
+            .await
+            .unwrap());
         let hunks = list_hunks(&pool, "m1").await.unwrap();
         assert_eq!(hunks[0].winner.as_deref(), Some("ours"));
+        assert!(hunks[0].is_ko, "first write stores the KO");
         let blob_len: i64 =
             sqlx::query_scalar("SELECT length(ours_bytes) FROM match_hunks WHERE match_id = 'm1'")
                 .fetch_one(&pool)
@@ -2030,7 +2265,9 @@ mod tests {
         .await
         .unwrap();
         assert!(abort_open_match(&pool, "m-ab", "outdated").await.unwrap());
-        assert!(!set_hunk_winner(&pool, "m-ab", 0, "ours").await.unwrap());
+        assert!(!set_hunk_winner(&pool, "m-ab", 0, "ours", true)
+            .await
+            .unwrap());
         insert_input(&pool, "m-ab", 0, 0, 1, 2).await.unwrap();
         let hunks = list_hunks(&pool, "m-ab").await.unwrap();
         assert!(hunks[0].winner.is_none());

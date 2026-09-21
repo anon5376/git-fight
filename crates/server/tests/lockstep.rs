@@ -350,7 +350,7 @@ async fn scored_rounds_resume_finishes_without_replaying() {
         )
         .await
         .unwrap();
-        git_fight_server::db::set_hunk_winner(&pool, id, round, "ours")
+        git_fight_server::db::set_hunk_winner(&pool, id, round, "ours", false)
             .await
             .unwrap();
     }
@@ -781,7 +781,7 @@ async fn reconnect_resumes_later_round_from_stored_inputs() {
         .await
         .unwrap();
     }
-    git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours")
+    git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours", false)
         .await
         .unwrap();
     git_fight_server::db::insert_input(&pool, id, 1, 0, 1, 0)

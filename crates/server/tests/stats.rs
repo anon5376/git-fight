@@ -70,16 +70,22 @@ async fn seed(
 }
 
 async fn score(pool: &sqlx::SqlitePool, id: &str, winner: &str) {
-    assert!(git_fight_server::db::set_hunk_winner(pool, id, 0, winner)
-        .await
-        .unwrap());
+    score_ko(pool, id, winner, false).await;
+}
+
+async fn score_ko(pool: &sqlx::SqlitePool, id: &str, winner: &str, ko: bool) {
+    assert!(
+        git_fight_server::db::set_hunk_winner(pool, id, 0, winner, ko)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
 async fn ko_win_updates_wins_losses_kos_and_conflicts_caused() {
     let pool = pool().await;
     seed(&pool, "m1", Some("alice"), Some("bob"), "acme", "box").await;
-    score(&pool, "m1", "ours").await;
+    score_ko(&pool, "m1", "ours", true).await;
     git_fight_server::record_round(&pool, "m1", 0, "ours", true)
         .await
         .unwrap();
@@ -111,7 +117,7 @@ async fn ko_win_updates_wins_losses_kos_and_conflicts_caused() {
 async fn record_round_is_write_once() {
     let pool = pool().await;
     seed(&pool, "m-once", Some("alice"), Some("bob"), "acme", "box").await;
-    score(&pool, "m-once", "ours").await;
+    score_ko(&pool, "m-once", "ours", true).await;
     git_fight_server::record_round(&pool, "m-once", 0, "ours", true)
         .await
         .unwrap();
@@ -129,7 +135,7 @@ async fn record_round_is_write_once() {
 async fn login_case_does_not_split_the_leaderboard() {
     let pool = pool().await;
     seed(&pool, "m-case", Some("Alice"), Some("BOB"), "acme", "box").await;
-    score(&pool, "m-case", "ours").await;
+    score_ko(&pool, "m-case", "ours", true).await;
     git_fight_server::record_round(&pool, "m-case", 0, "ours", true)
         .await
         .unwrap();
@@ -300,7 +306,7 @@ async fn local_match_without_repo_does_not_record() {
 async fn cpu_side_without_login_is_skipped() {
     let pool = pool().await;
     seed(&pool, "m6", Some("alice"), None, "acme", "box").await;
-    score(&pool, "m6", "ours").await;
+    score_ko(&pool, "m6", "ours", true).await;
     git_fight_server::record_round(&pool, "m6", 0, "ours", true)
         .await
         .unwrap();
@@ -311,6 +317,75 @@ async fn cpu_side_without_login_is_skipped() {
     assert_eq!(board[0].github_login, "alice");
     assert_eq!(board[0].wins, 1);
     assert_eq!(board[0].conflicts_caused, 0);
+}
+
+#[tokio::test]
+async fn record_round_rolls_back_claim_when_stats_write_fails() {
+    let pool = pool().await;
+    seed(&pool, "m-tx", Some("alice"), Some("bob"), "acme", "box").await;
+    score_ko(&pool, "m-tx", "ours", true).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_stats BEFORE INSERT ON player_stats
+         BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        git_fight_server::record_round(&pool, "m-tx", 0, "ours", true)
+            .await
+            .is_err()
+    );
+    sqlx::query("DROP TRIGGER fail_stats")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT stats_recorded FROM match_hunks WHERE match_id = 'm-tx'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(recorded, 0, "failed write must not consume the claim");
+    let board = git_fight_server::db::list_player_stats(&pool, "acme", "box")
+        .await
+        .unwrap();
+    assert!(board.is_empty(), "{board:?}");
+    git_fight_server::record_round(&pool, "m-tx", 0, "ours", true)
+        .await
+        .unwrap();
+    let alice = git_fight_server::db::get_player_stats(&pool, "acme", "box", "alice")
+        .await
+        .unwrap();
+    assert_eq!(alice.wins, 1);
+    assert_eq!(alice.kos, 1);
+}
+
+#[tokio::test]
+async fn finished_match_records_a_stored_ko_once() {
+    let pool = pool().await;
+    seed(&pool, "m-fin", Some("alice"), Some("bob"), "acme", "box").await;
+    score_ko(&pool, "m-fin", "ours", true).await;
+    assert!(
+        git_fight_server::db::finish_open_match(&pool, "m-fin", "deadbeef")
+            .await
+            .unwrap()
+    );
+    git_fight_server::record_round(&pool, "m-fin", 0, "ours", false)
+        .await
+        .unwrap();
+    let alice = git_fight_server::db::get_player_stats(&pool, "acme", "box", "alice")
+        .await
+        .unwrap();
+    assert_eq!(alice.wins, 1);
+    assert_eq!(alice.kos, 1, "stored is_ko must survive finish");
+    git_fight_server::record_round(&pool, "m-fin", 0, "ours", true)
+        .await
+        .unwrap();
+    let alice = git_fight_server::db::get_player_stats(&pool, "acme", "box", "alice")
+        .await
+        .unwrap();
+    assert_eq!(alice.wins, 1);
+    assert_eq!(alice.kos, 1);
 }
 
 #[tokio::test]

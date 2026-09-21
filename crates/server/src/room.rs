@@ -602,7 +602,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     let tag = result::winner_tag(result, forfeit);
     let ko =
         !forfeit && result != RoundResult::Draw && (a.sim.ours.hp <= 0 || a.sim.theirs.hp <= 0);
-    let tagged = db::set_hunk_winner(a.pool, a.id, i64::from(*a.round), tag)
+    let tagged = db::set_hunk_winner(a.pool, a.id, i64::from(*a.round), tag, ko)
         .await
         .unwrap_or(false);
     let open = match_is_open(a.pool, a.id).await;
@@ -1090,6 +1090,7 @@ mod tests {
                 theirs_hp: 100,
                 theirs_armor: false,
                 theirs_special: false,
+                is_ko: false,
             },
             db::HunkRow {
                 round_index: 1,
@@ -1104,6 +1105,7 @@ mod tests {
                 theirs_hp: 100,
                 theirs_armor: false,
                 theirs_special: false,
+                is_ko: false,
             },
         ];
         let mut ours = Slot {

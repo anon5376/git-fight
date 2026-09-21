@@ -644,6 +644,7 @@ mod tests {
             theirs_hp: 100,
             theirs_armor: false,
             theirs_special: false,
+            is_ko: false,
         };
         let lines = round_lines(&[row(
             "[click](https://evil.example/phish).rs",
@@ -686,6 +687,7 @@ mod tests {
             theirs_hp: 100,
             theirs_armor: false,
             theirs_special: false,
+            is_ko: false,
         };
         assert!(grouped_picks(&[row(i64::MAX), row(-1)]).is_empty());
         let picks = grouped_picks(&[row(0)]);
