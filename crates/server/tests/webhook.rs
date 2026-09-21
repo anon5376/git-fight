@@ -1,3 +1,4 @@
+use futures_util::{SinkExt, StreamExt};
 use git_fight_server::sig;
 use git_fight_server::{gh::GitHub, Auth, Config};
 use serde_json::{json, Value};
@@ -6,11 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SECRET: &[u8] = b"webhook-secret-for-tests";
 const APP_PEM: &str = include_str!("fixtures/app_key.txt");
+const SESSION_KEY: &[u8] = b"session-key-session-key-session!";
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -24,6 +28,26 @@ fn git(cwd: &Path, args: &[&str]) -> String {
         .expect("git");
     if !out.status.success() {
         panic!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn git_dir(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .arg("--git-dir")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git");
+    if !out.status.success() {
+        panic!(
+            "git --git-dir {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -405,7 +429,7 @@ fn cfg_for(mock: &MockServer, bare: PathBuf) -> Config {
             "csec".into(),
         )),
         auth: Auth {
-            session_key: b"session-key-session-key-session!".to_vec(),
+            session_key: SESSION_KEY.to_vec(),
             public_url: "http://fight.test".into(),
         },
         test_repos,
@@ -899,5 +923,109 @@ async fn failed_clone_aborts_open_match() {
             .unwrap()
             .is_none(),
         "failed clone must not leave a pending match"
+    );
+}
+
+#[tokio::test]
+async fn fight_comment_plays_and_pushes_create_only_branch() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let mut cfg = cfg_for(&mock, bare.clone());
+    cfg.instant = true;
+    let (addr, pool) = spawn_with_pool(cfg).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-e2e", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    let id = match_id_from(&comments);
+    assert_eq!(wait_challenge_comment_id(&pool, &id).await, Some(99));
+
+    git_fight_server::db::insert_session(&pool, "sid-alice", 1, "alice")
+        .await
+        .unwrap();
+    let cookie = git_fight_server::sign_session(SESSION_KEY, "sid-alice");
+    let url = format!("ws://{addr}/ws?match={id}");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cookie", format!("git_fight_sid={cookie}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let (mut sink, mut stream) = ws.split();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut next_send = 0u32;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timeout waiting for match")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("hello") => {
+                assert_eq!(v["your_role"].as_str(), Some("ours"), "{v}");
+                while next_send < 16 {
+                    let punch = if next_send.is_multiple_of(8) { 1 } else { 0 };
+                    let body =
+                        format!(r#"{{"type":"input","tick":{next_send},"buttons":{punch}}}"#);
+                    sink.send(Message::Text(body.into())).await.unwrap();
+                    next_send += 1;
+                }
+            }
+            Some("tick") => {
+                let n = v["n"].as_u64().unwrap() as u32;
+                while next_send <= n + 8 {
+                    let punch = if next_send.is_multiple_of(8) { 1 } else { 0 };
+                    let body =
+                        format!(r#"{{"type":"input","tick":{next_send},"buttons":{punch}}}"#);
+                    sink.send(Message::Text(body.into())).await.unwrap();
+                    next_send += 1;
+                }
+            }
+            Some("end") => {
+                assert_eq!(v["match_over"].as_bool(), Some(true), "{v}");
+                break;
+            }
+            Some("error") => panic!("{}", v["message"]),
+            _ => {}
+        }
+    }
+
+    let mut branch = None;
+    for _ in 0..50 {
+        let row = git_fight_server::db::get_match(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.result_branch.is_some() || row.abort_reason.is_some() {
+            assert!(row.abort_reason.is_none(), "unexpected abort {row:?}");
+            branch = row.result_branch;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let branch = branch.expect("result branch after last round");
+    assert!(branch.starts_with("git-fight/pr-1-"), "{branch}");
+    assert!(
+        git_dir(&bare, &["show-ref", "--heads"])
+            .lines()
+            .any(|l| l.ends_with(&format!("refs/heads/{branch}"))),
+        "missing {branch} in {}",
+        git_dir(&bare, &["show-ref", "--heads"])
+    );
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
+
+    let patched = wait_patched(&mock, 1).await;
+    assert!(
+        patched.iter().any(|c| {
+            c.contains("git fight finished")
+                && c.contains("compare:")
+                && c.contains(&branch)
+                && c.contains(&format!("/replay/{id}"))
+        }),
+        "{patched:?}"
     );
 }

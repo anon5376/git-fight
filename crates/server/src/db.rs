@@ -254,7 +254,11 @@ pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, 
 
 pub async fn list_live_matches(pool: &SqlitePool) -> Result<Vec<MatchRow>, sqlx::Error> {
     sqlx::query_as::<_, MatchRow>(&format!(
-        "SELECT {MATCH_COLS} FROM matches WHERE status IN ('pending', 'in_progress')"
+        "SELECT {MATCH_COLS} FROM matches
+         WHERE status IN ('pending', 'in_progress')
+         AND (pr_number = 0 OR EXISTS (
+             SELECT 1 FROM match_hunks WHERE match_hunks.match_id = matches.id
+         ))"
     ))
     .fetch_all(pool)
     .await
@@ -1001,5 +1005,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(open.id, "open2");
+    }
+
+    #[tokio::test]
+    async fn live_rooms_skip_pr_matches_until_hunks_exist() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "nohunks".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(list_live_matches(&pool).await.unwrap().is_empty());
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "nohunks",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let live = list_live_matches(&pool).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "nohunks");
     }
 }

@@ -375,8 +375,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     let Ok(Some(row)) = db::get_match(&state.pool, &q.match_id).await else {
         return;
     };
-    if row.status == "expired" {
+    if matches!(row.status.as_str(), "expired" | "aborted") {
         return;
+    }
+    if row.pr_number > 0 {
+        let hunks = db::list_hunks(&state.pool, &row.id)
+            .await
+            .unwrap_or_default();
+        if hunks.is_empty() {
+            return;
+        }
     }
     let conn_id = uuid::Uuid::new_v4().as_u128() as u64;
     let tx = state.room_tx(&row).await;
