@@ -434,3 +434,27 @@ async fn auto_challenge_starts_when_yaml_set() {
         "{comments:?}"
     );
 }
+
+#[tokio::test]
+async fn blame_email_maps_through_commits_api() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "author": { "login": "bob" },
+            "commit": { "author": { "email": "bob@example.com" } }
+        }])))
+        .mount(&mock)
+        .await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    let status = post_signed(addr, "issue_comment", "deliv-email", &fight_body()).await;
+    assert_eq!(status, 200);
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("alice vs bob") && !t.contains("CPU")),
+        "{comments:?}"
+    );
+}
