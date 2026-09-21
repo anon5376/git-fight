@@ -262,9 +262,11 @@ impl AppState {
 
     async fn retry_pending_comment_ids(&self) {
         for (id, comment_id) in self.comments.pending_snapshot() {
-            match db::set_challenge_comment_id(&self.pool, &id, comment_id).await {
-                Ok(_) => self.comments.dequeue_id(&id),
-                Err(_) => {}
+            if db::set_challenge_comment_id(&self.pool, &id, comment_id)
+                .await
+                .is_ok()
+            {
+                self.comments.dequeue_id(&id);
             }
         }
     }
