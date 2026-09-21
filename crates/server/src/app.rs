@@ -76,6 +76,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(auth::me))
         .route("/match/{id}", get(spa))
         .route("/replay/{id}", get(spa))
+        .route("/{owner}/{repo}/leaderboard", get(leaderboard))
+        .route("/badge/{owner}/{repo}/{user}", get(badge))
         .with_state(state.clone());
 
     if let Some(dir) = &state.config.static_dir {
@@ -129,6 +131,21 @@ struct CreateOut {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn leaderboard(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    crate::stats::leaderboard_response(&state.pool, &owner, &repo, &headers).await
+}
+
+async fn badge(
+    State(state): State<AppState>,
+    Path((owner, repo, user)): Path<(String, String, String)>,
+) -> Response {
+    crate::stats::badge_response(&state.pool, &owner, &repo, &user).await
 }
 
 async fn spa(State(state): State<AppState>) -> Response {

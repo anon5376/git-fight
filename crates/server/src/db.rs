@@ -122,6 +122,20 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS player_stats (
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            github_login TEXT NOT NULL,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            kos INTEGER NOT NULL DEFAULT 0,
+            conflicts_caused INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner, repo, github_login)
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -426,11 +440,22 @@ pub struct HunkRow {
     pub hunk_index: i64,
     pub winner: Option<String>,
     pub theirs_name: Option<String>,
+    pub theirs_login: Option<String>,
 }
 
 pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (i64, String, i64, Option<String>, Option<String>)>(
-        "SELECT round_index, path, hunk_index, winner, theirs_name
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login
          FROM match_hunks WHERE match_id = ? ORDER BY round_index",
     )
     .bind(match_id)
@@ -439,15 +464,116 @@ pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow
     Ok(rows
         .into_iter()
         .map(
-            |(round_index, path, hunk_index, winner, theirs_name)| HunkRow {
+            |(round_index, path, hunk_index, winner, theirs_name, theirs_login)| HunkRow {
                 round_index,
                 path,
                 hunk_index,
                 winner,
                 theirs_name,
+                theirs_login,
             },
         )
         .collect())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerStat {
+    pub github_login: String,
+    pub wins: i64,
+    pub losses: i64,
+    pub kos: i64,
+    pub conflicts_caused: i64,
+}
+
+pub async fn add_player_stats(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    stat: &PlayerStat,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO player_stats (owner, repo, github_login, wins, losses, kos, conflicts_caused)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner, repo, github_login) DO UPDATE SET
+            wins = wins + excluded.wins,
+            losses = losses + excluded.losses,
+            kos = kos + excluded.kos,
+            conflicts_caused = conflicts_caused + excluded.conflicts_caused",
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(&stat.github_login)
+    .bind(stat.wins)
+    .bind(stat.losses)
+    .bind(stat.kos)
+    .bind(stat.conflicts_caused)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_player_stats(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<PlayerStat>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT github_login, wins, losses, kos, conflicts_caused
+         FROM player_stats
+         WHERE owner = ? AND repo = ?
+         ORDER BY wins DESC, kos DESC, conflicts_caused DESC, github_login COLLATE NOCASE ASC",
+    )
+    .bind(owner)
+    .bind(repo)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(github_login, wins, losses, kos, conflicts_caused)| PlayerStat {
+                github_login,
+                wins,
+                losses,
+                kos,
+                conflicts_caused,
+            },
+        )
+        .collect())
+}
+
+pub async fn get_player_stats(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    login: &str,
+) -> Result<PlayerStat, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT github_login, wins, losses, kos, conflicts_caused
+         FROM player_stats
+         WHERE owner = ? AND repo = ? AND github_login = ? COLLATE NOCASE",
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(login)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(
+            |(github_login, wins, losses, kos, conflicts_caused)| PlayerStat {
+                github_login,
+                wins,
+                losses,
+                kos,
+                conflicts_caused,
+            },
+        )
+        .unwrap_or(PlayerStat {
+            github_login: login.to_string(),
+            wins: 0,
+            losses: 0,
+            kos: 0,
+            conflicts_caused: 0,
+        }))
 }
 
 pub async fn set_result_branch(

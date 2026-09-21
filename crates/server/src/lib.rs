@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod result;
 mod room;
 pub mod sig;
+mod stats;
 mod webhook;
 
 pub use app::{router, serve, AppState, Config};
@@ -18,3 +19,4 @@ pub use gh::GitHub;
 pub use protocol::EXPIRE_SECS as protocol_expire_secs;
 pub use protocol::INPUT_DELAY;
 pub use result::{publish as publish_result, ResultCtx};
+pub use stats::record_round;

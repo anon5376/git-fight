@@ -412,7 +412,10 @@ async fn advance(a: Advance<'_>) -> bool {
 
 async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     let tag = result::winner_tag(result, forfeit);
+    let ko =
+        !forfeit && result != RoundResult::Draw && (a.sim.ours.hp <= 0 || a.sim.theirs.hp <= 0);
     let _ = db::set_hunk_winner(a.pool, a.id, i64::from(*a.round), tag).await;
+    let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
     let hash_s = format!("{hi:08x}{lo:08x}");

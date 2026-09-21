@@ -37,6 +37,26 @@ git fight       # git fight finds the conflicted files itself
 
 You pick a mode at the start: fight the CPU, or play 2 players on one keyboard.
 
+## Online
+
+Comment `/fight` on a GitHub pull request that has merge conflicts. The GitHub App challenges the two colliding authors to a live match in the browser. Teammates can watch. Each round decides one conflict. After the last round the bot pushes the resolution to a **new** `git-fight/pr-<number>-<match-id>` branch for humans to review. It never force-pushes, never writes an existing branch, and never merges the PR. A draw (or any unresolved conflict) skips the whole push.
+
+Install and configure the App: [SETUP.md](SETUP.md).
+
+Play locally in the browser (demo, vs CPU, 2 players, or a hosted lockstep match) from the same `web/` client the server serves.
+
+**Leaderboard** for a repo:
+
+`https://<your-host>/<owner>/<repo>/leaderboard`
+
+**README badge** (shields-style SVG, wins for that login in that repo):
+
+```markdown
+![git fight](https://<your-host>/badge/<owner>/<repo>/<login>)
+```
+
+Replace `<your-host>` with the public URL of your `git-fight-server`. Replace owner, repo, and login with the GitHub names.
+
 ## Controls
 
 | Move | Player 1 (left) | Player 2 (right) |
