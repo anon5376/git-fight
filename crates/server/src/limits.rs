@@ -9,6 +9,9 @@ pub const MAX_HUNKS: usize = 15;
 /// Conflicted paths we will inspect. More than this is TooMany without cat-file.
 pub const MAX_CONFLICT_PATHS: usize = 32;
 pub const MAX_BLOB_BYTES: usize = 1_048_576;
+/// stdout/stderr from one git process. Merge-tree lists and clone progress stay small;
+/// a hostile blob or hook dump must not fill RAM.
+pub const MAX_GIT_STDIO: usize = 2 * 1_048_576;
 /// Wall clock while a git worker slot is held (clone already caps at 60s).
 pub const GIT_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 /// New `/fight` (and auto-challenge) starts per GitHub installation per hour.
@@ -42,6 +45,7 @@ mod tests {
         assert_eq!(MAX_HUNKS, 15);
         assert_eq!(MAX_CONFLICT_PATHS, 32);
         assert_eq!(MAX_BLOB_BYTES, 1_048_576);
+        assert_eq!(MAX_GIT_STDIO, 2 * 1_048_576);
         assert_eq!(GIT_JOB_TIMEOUT, Duration::from_secs(120));
         assert_eq!(MAX_CONCURRENT_GIT, 2);
         assert_eq!(MAX_MATCHES_PER_PR_HOUR, 5);

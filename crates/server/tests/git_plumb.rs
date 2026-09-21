@@ -542,6 +542,66 @@ async fn oversized_blob_has_no_fightable_hunks() {
     }
 }
 
+fn fightable_and_oversized_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 1 }\n").unwrap();
+    std::fs::write(work.join("blob.rs"), vec![b'x'; 64]).unwrap();
+    git(&work, &["add", "lib.rs", "blob.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 2 }\n").unwrap();
+    std::fs::write(work.join("blob.rs"), vec![b'a'; 1_048_577]).unwrap();
+    git(&work, &["add", "lib.rs", "blob.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 3 }\n").unwrap();
+    std::fs::write(work.join("blob.rs"), vec![b'b'; 1_048_577]).unwrap();
+    git(&work, &["add", "lib.rs", "blob.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
+#[tokio::test]
+async fn oversized_blob_does_not_abort_other_fightable_hunks() {
+    let (_keep, bare, head, base) = fightable_and_oversized_bare();
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
+    assert_eq!(code, 1);
+    assert!(paths.contains("lib.rs"));
+    assert!(paths.contains("blob.rs"));
+    let hunks = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
+        .await
+        .unwrap();
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(hunks[0].path, "lib.rs");
+}
+
 #[tokio::test]
 async fn git_rejects_option_injection_in_revs() {
     let dir = tempfile::tempdir().unwrap();

@@ -360,7 +360,7 @@ A repo can be huge, contain symlink farms, `.git` path tricks, enormous blobs, o
 
 - Skip when GitHub `size` > 1 GiB; clone timeout 60 seconds; `--filter=blob:none`; bare repo; no checkout of a worktree used as a cwd for user code.
 - `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`. Git is invoked with argument lists, never a shell string built from paths.
-- Paths from merge-tree (`-z`) must be relative, with no `..` or `.git` component. Only regular-file modes. Do not follow symlinks. Cap blob bytes. Cap 15 hunks.
+- Paths from merge-tree (`-z`) must be relative, with no `..` or `.git` component. Only regular-file modes. Do not follow symlinks. Cap blob bytes (skip that path; other fightable files still start a match). Cap git stdout/stderr so a huge blob or merge-tree list cannot fill RAM. Cap 15 hunks.
 - Never `cargo test`, never a repo `Dockerfile`, never `git submodule update`, never a post-checkout hook.
 
 ### Comment spam

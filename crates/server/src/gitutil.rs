@@ -1,13 +1,13 @@
 //! Git plumbing with hooks disabled. Never a shell, never user-repo code.
 
-use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_CONFLICT_PATHS, MAX_HUNKS};
+use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_CONFLICT_PATHS, MAX_GIT_STDIO, MAX_HUNKS};
 use git_fight_core::{ConflictFile, FighterStats};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -29,6 +29,7 @@ pub enum GitError {
     Command(String),
     TooMany(usize),
     NothingToFight,
+    OutputTooLarge,
     Io(std::io::Error),
 }
 
@@ -39,6 +40,7 @@ impl std::fmt::Display for GitError {
             GitError::Command(s) => write!(f, "{s}"),
             GitError::TooMany(n) => write!(f, "too many conflicts ({n})"),
             GitError::NothingToFight => write!(f, "no fightable hunks"),
+            GitError::OutputTooLarge => write!(f, "git output too large"),
             GitError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -125,15 +127,62 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut r: R,
+    max: usize,
+) -> Result<Vec<u8>, GitError> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = r.read(&mut tmp).await.map_err(GitError::Io)?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        if buf.len().saturating_add(n) > max {
+            return Err(GitError::OutputTooLarge);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
 async fn wait_child(
     child: tokio::process::Child,
     limit: Duration,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
+    wait_child_capped(child, limit, MAX_GIT_STDIO, MAX_GIT_STDIO).await
+}
+
+async fn wait_child_capped(
+    mut child: tokio::process::Child,
+    limit: Duration,
+    max_out: usize,
+    max_err: usize,
+) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
     let pid = child.id();
-    match timeout(limit, child.wait_with_output()).await {
-        Ok(out) => {
-            let out = out.map_err(GitError::Io)?;
-            Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let collect = async {
+        let out_fut = async {
+            match stdout {
+                Some(s) => read_capped(s, max_out).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        let err_fut = async {
+            match stderr {
+                Some(s) => read_capped(s, max_err).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        let (out, err) = tokio::try_join!(out_fut, err_fut)?;
+        let status = child.wait().await.map_err(GitError::Io)?;
+        Ok((status.code().unwrap_or(-1), out, err))
+    };
+    match timeout(limit, collect).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            kill_process_group(pid);
+            Err(e)
         }
         Err(_) => {
             kill_process_group(pid);
@@ -142,12 +191,20 @@ async fn wait_child(
     }
 }
 
-async fn run(mut cmd: Command, limit: Duration) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
+async fn run(cmd: Command, limit: Duration) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
+    run_capped(cmd, limit, MAX_GIT_STDIO).await
+}
+
+async fn run_capped(
+    mut cmd: Command,
+    limit: Duration,
+    max_out: usize,
+) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     prepare_child(&mut cmd);
     let child = cmd.spawn().map_err(GitError::Io)?;
-    wait_child(child, limit).await
+    wait_child_capped(child, limit, max_out, MAX_GIT_STDIO).await
 }
 
 async fn run_stdin(
@@ -457,7 +514,12 @@ pub async fn merge_tree(
     }
     let mut cmd = git_dir(dir, bearer);
     cmd.args(["merge-tree", "--write-tree", "-z", base, head]);
-    let (code, out, err) = run(cmd, CLONE_TIMEOUT).await?;
+    let (code, out, err) = match run(cmd, CLONE_TIMEOUT).await {
+        Err(GitError::OutputTooLarge) => {
+            return Err(GitError::TooMany(MAX_CONFLICT_PATHS.saturating_add(1)));
+        }
+        other => other?,
+    };
     if code != 0 && code != 1 {
         return Err(git_err(&err));
     }
@@ -494,7 +556,7 @@ async fn cat_file(dir: &Path, spec: &str, bearer: Option<&str>) -> Result<Vec<u8
     }
     let mut cmd = git_dir(dir, bearer);
     cmd.args(["cat-file", "blob", spec]);
-    let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
+    let (code, out, err) = run_capped(cmd, Duration::from_secs(15), MAX_BLOB_BYTES).await?;
     if code != 0 {
         return Err(git_err(&err));
     }
@@ -519,13 +581,15 @@ pub async fn collect_hunks(
         if !is_safe_path(path) {
             continue;
         }
-        let Some(mode) = ls_tree_mode(dir, tree, path, bearer).await? else {
+        let Ok(Some(mode)) = ls_tree_mode(dir, tree, path, bearer).await else {
             continue;
         };
         if mode != "100644" && mode != "100755" {
             continue;
         }
-        let blob = cat_file(dir, &format!("{tree}:{path}"), bearer).await?;
+        let Ok(blob) = cat_file(dir, &format!("{tree}:{path}"), bearer).await else {
+            continue;
+        };
         if blob.len() > MAX_BLOB_BYTES {
             continue;
         }
@@ -1283,6 +1347,20 @@ Auto-merging lib.rs\n";
             "{err}"
         );
         assert!(!clone.exists());
+    }
+
+    #[tokio::test]
+    async fn stdout_over_the_cap_is_output_too_large() {
+        let mut cmd = Command::new("yes");
+        cmd.kill_on_drop(true);
+        cmd.stdin(Stdio::null());
+        let started = std::time::Instant::now();
+        let err = run(cmd, Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(err, GitError::OutputTooLarge), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "capped stdout must not drain the child"
+        );
     }
 
     #[tokio::test]
