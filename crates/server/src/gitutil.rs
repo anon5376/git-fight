@@ -3,7 +3,6 @@
 use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_CONFLICT_PATHS, MAX_GIT_STDIO, MAX_HUNKS};
 use git_fight_core::{ConflictFile, FighterStats};
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -47,7 +46,12 @@ impl std::fmt::Display for GitError {
 }
 
 pub fn is_safe_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') || path.starts_with('\\') || path.contains('\0') {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.starts_with('-')
+        || path.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
         return false;
     }
     let p = Path::new(path);
@@ -57,7 +61,10 @@ pub fn is_safe_path(path: &str) -> bool {
     for c in p.components() {
         match c {
             Component::Normal(s) => {
-                if s == OsStr::new(".git") || s.is_empty() {
+                let Some(t) = s.to_str() else {
+                    return false;
+                };
+                if t == ".git" || t.is_empty() || t.starts_with('-') {
                     return false;
                 }
             }
@@ -653,13 +660,31 @@ async fn blame_theirs(
     fallback_author(dir, base_sha, path, bearer).await
 }
 
+/// Locate `needle` in `haystack` for `git blame -L`. A 1 MiB hunk must not be
+/// an O(n×m) scan against the whole file while a git worker slot is held.
+const BLAME_PROBE_BYTES: usize = 512;
+const BLAME_SEARCH_BYTES: usize = 64 * 1024;
+const BLAME_MAX_LINES: usize = 400;
+
 fn line_range(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
     if needle.is_empty() || haystack.is_empty() {
         return None;
     }
-    let pos = haystack.windows(needle.len()).position(|w| w == needle)?;
+    let probe_len = needle.len().min(BLAME_PROBE_BYTES);
+    let search_len = haystack.len().min(BLAME_SEARCH_BYTES);
+    let probe = &needle[..probe_len];
+    let search = &haystack[..search_len];
+    if probe.len() > search.len() {
+        return None;
+    }
+    let pos = search.windows(probe.len()).position(|w| w == probe)?;
     let start = haystack[..pos].iter().filter(|b| **b == b'\n').count() + 1;
-    let nlines = needle.iter().filter(|b| **b == b'\n').count().max(1);
+    let nlines = needle
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+        .max(1)
+        .min(BLAME_MAX_LINES);
     Some((start, start + nlines - 1))
 }
 
@@ -1191,8 +1216,27 @@ mod tests {
         assert!(!is_safe_path(".git/config"));
         assert!(!is_safe_path("/etc/passwd"));
         assert!(!is_safe_path("foo/.git/bar"));
+        assert!(!is_safe_path("src/\nlib.rs"));
+        assert!(!is_safe_path("-dash.rs"));
+        assert!(!is_safe_path("src/-opt.rs"));
         assert!(is_safe_path("src/lib.rs"));
         assert!(is_safe_path("a/b.c"));
+    }
+
+    #[test]
+    fn blame_line_range_is_bounded() {
+        assert_eq!(line_range(b"fn a\nfn b\n", b"fn b\n"), Some((2, 2)));
+        let hay = vec![b'x'; 200_000];
+        let needle = vec![b'x'; 8_192];
+        let started = std::time::Instant::now();
+        let _ = line_range(&hay, &needle);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "1 MiB-class hunk search must not be quadratic"
+        );
+        let mut hay = Vec::from(&b"fn base()\n"[..]);
+        hay.extend(std::iter::repeat(b'z').take(80_000));
+        assert_eq!(line_range(&hay, b"fn base()\n"), Some((1, 1)));
     }
 
     #[test]
