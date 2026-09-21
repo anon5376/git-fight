@@ -247,7 +247,7 @@ async fn run_room(
                 }
             }
             _ = clock.tick() => {
-                if !done && started_at.is_none() {
+                if !done {
                     if let Some(exp) = expires_at {
                         if Utc::now() >= exp {
                             expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
@@ -508,9 +508,18 @@ async fn expire_now(
             return;
         }
     }
-    let _ = db::set_status(pool, id, "expired", false, true, None, Some("expired")).await;
-    if let (Some(ctx), Some(row)) = (result, row) {
-        result::comment_expired(ctx, &row).await;
+    if !db::expire_open_match(pool, id).await.unwrap_or(false) {
+        let row = db::get_match(pool, id).await.ok().flatten();
+        if let Some(row) = row.as_ref() {
+            let msg = encode(&ServerMsg::Error {
+                message: terminal_ws_error(row),
+            });
+            broadcast(conns, &msg).await;
+        }
+        return;
+    }
+    if let (Some(ctx), Some(row)) = (result, row.as_ref()) {
+        result::comment_expired(ctx, row).await;
     }
     let msg = encode(&ServerMsg::Error {
         message: "expired".into(),

@@ -223,7 +223,7 @@ to every client, including spectators. Everyone, server included, applies those 
 ### Disconnect, join, expiry
 
 - A fighter WebSocket drop starts a 30-second rejoin timer. Reconnect with the same login resumes the slot. If the timer fires, they lose the current round (`ours` or `theirs` KO). Later rounds can still be played if they return.
-- Status stays `pending` until both human fighters have occupied their slots at least once (CPU slots count as present). If that never happens, at `expires_at` (24 hours) the match becomes `expired`, the room closes, no result, no push.
+- Status stays `pending` until both human fighters have occupied their slots at least once (CPU slots count as present). If that never happens, at `expires_at` (24 hours) the match becomes `expired`, the room closes, no result, no push. A match that did start (`in_progress`) also expires at `expires_at` if it is still open, so an abandoned fight cannot hold the one-open-match slot or keep a room spinning.
 - Server restart: rooms rebuild from SQLite (`matches`, `match_inputs`, stored hunks). A pull-request match without hunks yet (clone still running, or clone failed and aborted) is not a room. Clients reconnect and receive `Hello` at the latest confirmed tick.
 - A pending PR match with frozen SHAs and no hunks yet sends `Error { message: "preparing" }` and closes. The canvas keeps `preparing match…` (not `waiting for opponent`) and reconnects until hunks exist; the next socket then gets `Hello`. `expired`, `aborted`, and `not found` are terminal.
 

@@ -583,6 +583,37 @@ async fn pending_match_expires_without_result() {
 }
 
 #[tokio::test]
+async fn in_progress_match_expires_without_result() {
+    let addr = spawn_server(Config {
+        instant: true,
+        expire_secs: 1,
+        ..Config::default()
+    })
+    .await;
+    let created: Value = http_post(addr, "/api/matches", r#"{"seed":9}"#).await.1;
+    let id = created["id"].as_str().unwrap().to_string();
+    let ours_token = created["ours_token"].as_str().unwrap().to_string();
+    let theirs_token = created["theirs_token"].as_str().unwrap().to_string();
+    let ours_url = format!("ws://{addr}/ws?match={id}&token={ours_token}");
+    let theirs_url = format!("ws://{addr}/ws?match={id}&token={theirs_token}");
+    let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
+    let (theirs_ws, _) = tokio_tungstenite::connect_async(&theirs_url).await.unwrap();
+    let (_, mut ours_stream) = ours_ws.split();
+    let (_, mut theirs_stream) = theirs_ws.split();
+    let _ = wait_type(&mut ours_stream, "hello").await;
+    let _ = wait_type(&mut theirs_stream, "hello").await;
+    let err = tokio::time::timeout(Duration::from_secs(5), wait_type(&mut ours_stream, "error"))
+        .await
+        .expect("in-progress match should expire");
+    assert_eq!(err["message"].as_str(), Some("expired"), "{err}");
+    let info: Value = http_get(addr, &format!("/api/matches/{id}")).await.1;
+    assert_eq!(info["status"].as_str(), Some("expired"), "{info}");
+    assert_eq!(info["abort_reason"].as_str(), Some("expired"), "{info}");
+    let (replay_status, _) = http_get(addr, &format!("/api/replays/{id}")).await;
+    assert_eq!(replay_status, 404);
+}
+
+#[tokio::test]
 async fn disconnect_after_grace_period_forfeits_round() {
     let addr = spawn_server(Config {
         instant: true,

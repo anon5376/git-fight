@@ -510,7 +510,8 @@ pub async fn finish_open_match(
 pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     let rows = sqlx::query_as::<_, (String,)>(
-        "SELECT id FROM matches WHERE status = 'pending' AND expires_at <= ?",
+        "SELECT id FROM matches
+         WHERE status IN ('pending', 'in_progress') AND expires_at <= ?",
     )
     .bind(&now)
     .fetch_all(pool)
@@ -519,7 +520,7 @@ pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Erro
     if !ids.is_empty() {
         sqlx::query(
             "UPDATE matches SET status = 'expired', abort_reason = 'expired', finished_at = ?
-             WHERE status = 'pending' AND expires_at <= ?",
+             WHERE status IN ('pending', 'in_progress') AND expires_at <= ?",
         )
         .bind(&now)
         .bind(&now)
@@ -527,6 +528,23 @@ pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Erro
         .await?;
     }
     Ok(ids)
+}
+
+/// Expire a still-open match. No-op if finished/aborted/already expired.
+pub async fn expire_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query(
+        "UPDATE matches SET status = 'expired',
+            finished_at = ?,
+            abort_reason = COALESCE(?, abort_reason)
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
+    )
+    .bind(&now)
+    .bind("expired")
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub struct NewMatch {
@@ -1055,6 +1073,104 @@ mod tests {
         assert_eq!(row.status, "expired");
         assert!(row.final_hash.is_none());
         assert_eq!(row.abort_reason.as_deref(), Some("expired"));
+    }
+
+    #[tokio::test]
+    async fn expire_pending_expires_in_progress_and_skips_finished() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "live1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 0,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        set_status(&pool, "live1", "in_progress", true, false, None, None)
+            .await
+            .unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "fin1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 2,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(finish_open_match(&pool, "fin1", "deadbeef").await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let ids = expire_pending(&pool).await.unwrap();
+        assert_eq!(ids, vec!["live1".to_string()]);
+        let live = get_match(&pool, "live1").await.unwrap().unwrap();
+        assert_eq!(live.status, "expired");
+        assert_eq!(live.abort_reason.as_deref(), Some("expired"));
+        assert!(open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none());
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "live2".into(),
+                seed: 2,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o2".into(),
+                theirs_token: "t2".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let fin = get_match(&pool, "fin1").await.unwrap().unwrap();
+        assert_eq!(fin.status, "finished");
+        assert_eq!(fin.final_hash.as_deref(), Some("deadbeef"));
+        assert!(!expire_open_match(&pool, "fin1").await.unwrap());
     }
 
     #[tokio::test]
