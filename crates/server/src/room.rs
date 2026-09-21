@@ -1026,6 +1026,7 @@ async fn persist_pending_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &
 /// Apply a match-row disconnect forfeit before `finish()`. `false` means
 /// the hunk write is still busy and the sim already has a KO — do not
 /// store that KO as a side pick.
+#[allow(clippy::too_many_arguments)]
 async fn apply_latched_forfeit(
     pool: &SqlitePool,
     id: &str,
