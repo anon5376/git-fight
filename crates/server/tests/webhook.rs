@@ -66,6 +66,10 @@ fn conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
 }
 
 async fn spawn(cfg: Config) -> std::net::SocketAddr {
+    spawn_with_pool(cfg).await.0
+}
+
+async fn spawn_with_pool(cfg: Config) -> (std::net::SocketAddr, sqlx::SqlitePool) {
     let dir = std::env::temp_dir().join(format!(
         "gf-wh-{}-{}",
         std::process::id(),
@@ -79,8 +83,11 @@ async fn spawn(cfg: Config) -> std::net::SocketAddr {
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
     tokio::spawn(async move {
-        git_fight_server::serve(listener, pool, cfg).await.unwrap();
+        git_fight_server::serve(listener, serve_pool, cfg)
+            .await
+            .unwrap();
     });
     for _ in 0..80 {
         if TcpStream::connect(addr).await.is_ok() {
@@ -88,7 +95,7 @@ async fn spawn(cfg: Config) -> std::net::SocketAddr {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    addr
+    (addr, pool)
 }
 
 async fn http(
@@ -138,15 +145,23 @@ fn fight_body() -> Vec<u8> {
 }
 
 fn pr_opened_body() -> Vec<u8> {
+    pr_event_body("opened", "abc", "def")
+}
+
+fn pr_event_body(action: &str, head: &str, base: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
-        "action": "opened",
+        "action": action,
         "installation": { "id": 1 },
         "repository": {
             "name": "box",
             "owner": { "login": "acme" },
             "default_branch": "main"
         },
-        "pull_request": { "number": 1 }
+        "pull_request": {
+            "number": 1,
+            "head": { "sha": head },
+            "base": { "sha": base }
+        }
     }))
     .unwrap()
 }
@@ -455,6 +470,127 @@ async fn blame_email_maps_through_commits_api() {
         comments
             .iter()
             .any(|t| t.contains("alice vs bob") && !t.contains("CPU")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn pr_synchronize_same_sha_does_not_comment() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-fight", &fight_body()).await,
+        200
+    );
+    let after_fight = posted_comments(&mock.received_requests().await.unwrap()).len();
+    assert_eq!(after_fight, 1, "expected one challenge comment");
+    assert_eq!(
+        post_signed(
+            addr,
+            "pull_request",
+            "deliv-sync-same",
+            &pr_event_body("synchronize", &head, &base)
+        )
+        .await,
+        200
+    );
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    assert_eq!(comments.len(), after_fight, "{comments:?}");
+}
+
+#[tokio::test]
+async fn pr_synchronize_moved_sha_comments_once() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-fight2", &fight_body()).await,
+        200
+    );
+    assert_eq!(
+        post_signed(
+            addr,
+            "pull_request",
+            "deliv-sync-move",
+            &pr_event_body(
+                "synchronize",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &base
+            )
+        )
+        .await,
+        200
+    );
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].contains("outdated") && comments[1].contains("/fight"),
+        "{comments:?}"
+    );
+    assert_eq!(
+        post_signed(
+            addr,
+            "pull_request",
+            "deliv-sync-move-2",
+            &pr_event_body(
+                "synchronize",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &base
+            )
+        )
+        .await,
+        200
+    );
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    assert_eq!(
+        comments.len(),
+        2,
+        "outdated notice must not repeat: {comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn installation_rate_limit_skips_clone() {
+    use git_fight_server::db::NewMatch;
+    use git_fight_server::MAX_MATCHES_PER_INSTALL_HOUR;
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    for i in 0..MAX_MATCHES_PER_INSTALL_HOUR {
+        git_fight_server::db::insert_full_match(
+            &pool,
+            &NewMatch {
+                id: format!("rate{i:024}"),
+                seed: i as u64,
+                delay: 3,
+                ours_name: "alice".into(),
+                theirs_name: "bob".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: Some("alice".into()),
+                theirs_login: None,
+                ours_token: format!("o{i}"),
+                theirs_token: format!("t{i}"),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "other".into(),
+                pr_number: 100 + i,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-rate", &fight_body()).await,
+        200
+    );
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    assert!(
+        comments.iter().any(|t| t.contains("too many fights")),
         "{comments:?}"
     );
 }

@@ -7,3 +7,5 @@ pub const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_REPO_KB: u64 = 1_048_576;
 pub const MAX_HUNKS: usize = 15;
 pub const MAX_BLOB_BYTES: usize = 1_048_576;
+/// New `/fight` (and auto-challenge) starts per GitHub installation per hour.
+pub const MAX_MATCHES_PER_INSTALL_HOUR: i64 = 20;

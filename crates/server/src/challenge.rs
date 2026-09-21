@@ -31,8 +31,15 @@ pub async fn start_challenge(
         return Ok(format!(
             "a fight is already open: {}/match/{}",
             ctx.public_url.trim_end_matches('/'),
-            existing
+            existing.id
         ));
+    }
+
+    let recent = db::count_recent_matches_for_install(&ctx.pool, installation_id, 3600)
+        .await
+        .map_err(|e| e.to_string())?;
+    if recent >= crate::limits::MAX_MATCHES_PER_INSTALL_HOUR {
+        return Ok("too many fights from this installation; try later".into());
     }
 
     let repo_info = ctx.gh.get_repo(installation_id, owner, repo).await?;

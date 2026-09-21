@@ -186,17 +186,24 @@ pub async fn insert_match(
     Ok(())
 }
 
-pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, sqlx::Error> {
-    sqlx::query_as::<_, MatchRow>(
-        "SELECT id, seed, status, ours_name, theirs_name, ours_kind, theirs_kind,
+const MATCH_COLS: &str = "id, seed, status, ours_name, theirs_name, ours_kind, theirs_kind,
                 ours_token, theirs_token, ours_login, theirs_login, owner, repo, pr_number,
                 pr_head_sha, pr_base_sha, installation_id,
                 input_delay_ticks, created_at, expires_at,
-                final_hash, abort_reason, result_branch
-         FROM matches WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
+                final_hash, abort_reason, result_branch";
+
+pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, sqlx::Error> {
+    sqlx::query_as::<_, MatchRow>(&format!("SELECT {MATCH_COLS} FROM matches WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn list_live_matches(pool: &SqlitePool) -> Result<Vec<MatchRow>, sqlx::Error> {
+    sqlx::query_as::<_, MatchRow>(&format!(
+        "SELECT {MATCH_COLS} FROM matches WHERE status IN ('pending', 'in_progress')"
+    ))
+    .fetch_all(pool)
     .await
 }
 
@@ -211,6 +218,14 @@ pub async fn load_inputs(pool: &SqlitePool, id: &str) -> Result<Vec<(u32, u8, u8
         .into_iter()
         .map(|(t, o, th)| (t as u32, o as u8, th as u8))
         .collect())
+}
+
+pub async fn clear_inputs(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM match_inputs WHERE match_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn insert_input(
@@ -388,17 +403,32 @@ pub async fn open_match_for_pr(
     owner: &str,
     repo: &str,
     pr: u64,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_as::<_, (String,)>(
-        "SELECT id FROM matches WHERE owner = ? AND repo = ? AND pr_number = ?
-         AND status IN ('pending', 'in_progress') LIMIT 1",
-    )
+) -> Result<Option<MatchRow>, sqlx::Error> {
+    sqlx::query_as::<_, MatchRow>(&format!(
+        "SELECT {MATCH_COLS} FROM matches WHERE owner = ? AND repo = ? AND pr_number = ?
+         AND status IN ('pending', 'in_progress') LIMIT 1"
+    ))
     .bind(owner)
     .bind(repo)
     .bind(pr as i64)
     .fetch_optional(pool)
     .await
-    .map(|r| r.map(|x| x.0))
+}
+
+pub async fn count_recent_matches_for_install(
+    pool: &SqlitePool,
+    installation_id: u64,
+    within_secs: i64,
+) -> Result<i64, sqlx::Error> {
+    let cutoff = (Utc::now() - Duration::seconds(within_secs)).to_rfc3339();
+    sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM matches WHERE installation_id = ? AND created_at >= ?",
+    )
+    .bind(installation_id as i64)
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await
+    .map(|r| r.0)
 }
 
 pub async fn record_delivery(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
@@ -692,5 +722,58 @@ mod tests {
         assert_eq!(row.status, "expired");
         assert!(row.final_hash.is_none());
         assert_eq!(row.abort_reason.as_deref(), Some("expired"));
+    }
+
+    #[tokio::test]
+    async fn clear_inputs_and_install_rate_count() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "abc", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        insert_input(&pool, "abc", 0, 1, 2).await.unwrap();
+        insert_input(&pool, "abc", 1, 3, 4).await.unwrap();
+        assert_eq!(load_inputs(&pool, "abc").await.unwrap().len(), 2);
+        clear_inputs(&pool, "abc").await.unwrap();
+        assert!(load_inputs(&pool, "abc").await.unwrap().is_empty());
+
+        let m = NewMatch {
+            id: "inst1".into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "a".into(),
+            theirs_name: "b".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "o".into(),
+            theirs_token: "t".into(),
+            expire_secs: 3600,
+            installation_id: Some(9),
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: 1,
+            pr_head_sha: "h".into(),
+            pr_base_sha: "b".into(),
+        };
+        insert_full_match(&pool, &m).await.unwrap();
+        assert_eq!(
+            count_recent_matches_for_install(&pool, 9, 3600)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            count_recent_matches_for_install(&pool, 8, 3600)
+                .await
+                .unwrap(),
+            0
+        );
+        let open = open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open.id, "inst1");
+        assert_eq!(open.pr_head_sha, "h");
     }
 }

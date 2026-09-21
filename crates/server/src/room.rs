@@ -81,14 +81,12 @@ async fn run_room(
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
     let mut next_tick = 0u32;
     let mut log: Vec<(u32, u8, u8)> = Vec::new();
-    if round == 0 {
-        if let Ok(inputs) = db::load_inputs(&pool, &row.id).await {
-            for (tick, ours, theirs) in &inputs {
-                if *tick == next_tick && sim.result.is_none() {
-                    sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
-                    log.push((*tick, *ours, *theirs));
-                    next_tick = next_tick.saturating_add(1);
-                }
+    if let Ok(inputs) = db::load_inputs(&pool, &row.id).await {
+        for (tick, ours, theirs) in &inputs {
+            if *tick == next_tick && sim.result.is_none() {
+                sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
+                log.push((*tick, *ours, *theirs));
+                next_tick = next_tick.saturating_add(1);
             }
         }
     }
@@ -423,6 +421,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     let msg = encode(&end_msg(a.sim, result, *a.round, match_over));
     broadcast(a.ours, a.theirs, a.spectators, &msg).await;
     if !match_over {
+        let _ = db::clear_inputs(a.pool, a.id).await;
         *a.round += 1;
         let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
         *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);

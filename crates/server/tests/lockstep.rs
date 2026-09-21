@@ -121,6 +121,104 @@ async fn hello_includes_stored_fighter_stats() {
 }
 
 #[tokio::test]
+async fn reconnect_resumes_later_round_from_stored_inputs() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir =
+        std::env::temp_dir().join(format!("gf-resume-{}-{}", std::process::id(), uuid_like()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: "resume0001resume0001resume0001re".into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let id = "resume0001resume0001resume0001re";
+    for round in 0..2 {
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: id,
+                round,
+                path: "lib.rs",
+                hunk_index: round,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_input(&pool, id, 0, 1, 0)
+        .await
+        .unwrap();
+    git_fight_server::db::insert_input(&pool, id, 1, 0, 1)
+        .await
+        .unwrap();
+    git_fight_server::db::insert_input(&pool, id, 2, 0, 0)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(listener, pool, Config::default())
+            .await
+            .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let hello = wait_type(&mut stream, "hello").await;
+    assert_eq!(hello["round"].as_u64(), Some(1));
+    assert_eq!(hello["total_rounds"].as_u64(), Some(2));
+    assert_eq!(hello["confirmed_tick"].as_i64(), Some(2));
+    let mut ticks = Vec::new();
+    for _ in 0..3 {
+        let tick = wait_type(&mut stream, "tick").await;
+        ticks.push((
+            tick["n"].as_u64().unwrap(),
+            tick["ours"].as_u64().unwrap(),
+            tick["theirs"].as_u64().unwrap(),
+        ));
+    }
+    assert_eq!(ticks, vec![(0, 1, 0), (1, 0, 1), (2, 0, 0)]);
+}
+
+#[tokio::test]
 async fn unfinished_match_has_no_replay() {
     let addr = spawn_server(Config::default()).await;
     let created: Value = http_post(addr, "/api/matches", r#"{"seed":2}"#).await.1;

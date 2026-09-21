@@ -87,6 +87,31 @@ pub fn router(state: AppState) -> Router {
     app
 }
 
+impl AppState {
+    async fn room_tx(&self, row: &MatchRow) -> mpsc::Sender<RoomEvent> {
+        let mut rooms = self.rooms.lock().await;
+        rooms
+            .entry(row.id.clone())
+            .or_insert_with(|| {
+                room::spawn_room(
+                    row.clone(),
+                    self.pool.clone(),
+                    RoomSettings {
+                        instant: self.config.instant,
+                        disconnect: self.config.disconnect,
+                        result: Some(ResultCtx {
+                            gh: self.github.clone(),
+                            pool: self.pool.clone(),
+                            public_url: self.auth.public_url.clone(),
+                            test_repos: self.test_repos.clone(),
+                        }),
+                    },
+                )
+            })
+            .clone()
+    }
+}
+
 pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> std::io::Result<()> {
     let state = AppState {
         pool: pool.clone(),
@@ -97,6 +122,11 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         config,
         rooms: Arc::new(Mutex::new(HashMap::new())),
     };
+    if let Ok(rows) = db::list_live_matches(&state.pool).await {
+        for row in rows {
+            let _ = state.room_tx(&row).await;
+        }
+    }
     let expirer = state.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(5));
@@ -297,28 +327,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         return;
     }
     let role = role_for(&row, q.token.as_deref(), login.as_deref());
-    let tx = {
-        let mut rooms = state.rooms.lock().await;
-        rooms
-            .entry(row.id.clone())
-            .or_insert_with(|| {
-                room::spawn_room(
-                    row.clone(),
-                    state.pool.clone(),
-                    RoomSettings {
-                        instant: state.config.instant,
-                        disconnect: state.config.disconnect,
-                        result: Some(ResultCtx {
-                            gh: state.github.clone(),
-                            pool: state.pool.clone(),
-                            public_url: state.auth.public_url.clone(),
-                            test_repos: state.test_repos.clone(),
-                        }),
-                    },
-                )
-            })
-            .clone()
-    };
+    let tx = state.room_tx(&row).await;
 
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
     let _ = tx.send(RoomEvent::Join { role, tx: out_tx }).await;

@@ -86,7 +86,7 @@ async fn handle_comment(state: &crate::app::AppState, hook: Hook) -> HttpStatus 
 
 async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     let action = hook.action.as_deref().unwrap_or("");
-    if !matches!(action, "opened" | "reopened" | "synchronize") {
+    if !matches!(action, "opened" | "reopened" | "synchronize" | "edited") {
         return HttpStatus::OK;
     }
     let Some(pr) = &hook.pull_request else {
@@ -95,6 +95,15 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     let Some(repo) = &hook.repository else {
         return HttpStatus::OK;
     };
+    if let Ok(Some(row)) =
+        db::open_match_for_pr(&state.pool, &repo.owner.login, &repo.name, pr.number).await
+    {
+        notice_if_outdated(state, &hook, &row, pr).await;
+        return HttpStatus::OK;
+    }
+    if !matches!(action, "opened" | "reopened" | "synchronize") {
+        return HttpStatus::OK;
+    }
     let Some(inst) = hook.installation.as_ref().map(|i| i.id) else {
         return HttpStatus::OK;
     };
@@ -108,6 +117,54 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
         return HttpStatus::OK;
     }
     spawn_challenge(state, &hook, pr.number).await
+}
+
+async fn notice_if_outdated(
+    state: &crate::app::AppState,
+    hook: &Hook,
+    row: &db::MatchRow,
+    pr: &Pr,
+) {
+    if row.abort_reason.as_deref() == Some("outdated") {
+        return;
+    }
+    let Some(head) = pr
+        .head
+        .as_ref()
+        .map(|s| s.sha.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(base) = pr
+        .base
+        .as_ref()
+        .map(|s| s.sha.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    if head.eq_ignore_ascii_case(&row.pr_head_sha) && base.eq_ignore_ascii_case(&row.pr_base_sha) {
+        return;
+    }
+    let _ = db::set_result_branch(&state.pool, &row.id, None, Some("outdated")).await;
+    let Some(inst) = hook.installation.as_ref().map(|i| i.id) else {
+        return;
+    };
+    let Some(gh) = &state.github else {
+        return;
+    };
+    let Some(repo) = &hook.repository else {
+        return;
+    };
+    let public = state.auth.public_url.trim_end_matches('/');
+    let body = format!(
+        "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch.\nopen match: {public}/match/{}",
+        row.id
+    );
+    let _ = gh
+        .comment(inst, &repo.owner.login, &repo.name, pr.number, &body)
+        .await;
 }
 
 async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64) -> HttpStatus {
@@ -181,4 +238,13 @@ struct Comment {
 #[derive(Deserialize)]
 struct Pr {
     number: u64,
+    #[serde(default)]
+    head: Option<Sha>,
+    #[serde(default)]
+    base: Option<Sha>,
+}
+
+#[derive(Deserialize)]
+struct Sha {
+    sha: String,
 }
