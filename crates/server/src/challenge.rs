@@ -78,9 +78,8 @@ fn schedule_abort_start(pool: SqlitePool, id: String, reason: String) {
     tokio::spawn(async move {
         for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            match db::abort_open_match(&pool, &id, &reason).await {
-                Ok(_) => return,
-                Err(_) => {}
+            if db::abort_open_match(&pool, &id, &reason).await.is_ok() {
+                return;
             }
         }
     });
