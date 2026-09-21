@@ -27,7 +27,11 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
     /// SQLite URL, e.g. sqlite://data/git-fight.db
-    #[arg(long, default_value = "sqlite://data/git-fight.db")]
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "sqlite://data/git-fight.db"
+    )]
     db: String,
     /// Directory of the Vite build (index.html + assets).
     #[arg(long)]
@@ -93,6 +97,10 @@ async fn main() {
         }),
         _ => None,
     };
+    if let Err(name) = config.require_live_github_secrets() {
+        eprintln!("{name} is required when GitHub App credentials are set");
+        std::process::exit(1);
+    }
     let listener = TcpListener::bind(args.bind).await.unwrap_or_else(|e| {
         eprintln!("bind: {e}");
         std::process::exit(1);

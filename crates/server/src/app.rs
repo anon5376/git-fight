@@ -54,6 +54,23 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// A GitHub-backed process must have a webhook HMAC secret and a
+    /// non-default session key. Local demo (no App) may keep compiled defaults.
+    pub fn require_live_github_secrets(&self) -> Result<(), &'static str> {
+        if self.github.is_none() {
+            return Ok(());
+        }
+        if self.webhook_secret.as_ref().map(|s| s.len()).unwrap_or(0) < 8 {
+            return Err("GITHUB_WEBHOOK_SECRET");
+        }
+        if self.auth.session_key.len() < 16 || self.auth.session_key.iter().all(|&b| b == 0x11) {
+            return Err("SESSION_KEY");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -458,4 +475,42 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     });
 
     let _ = tokio::join!(read, write);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gh::GitHub;
+
+    fn gh() -> GitHub {
+        GitHub::new(
+            "http://example.test".into(),
+            "http://example.test".into(),
+            1,
+            include_str!("../tests/fixtures/app_key.txt").into(),
+            "cid".into(),
+            "csec".into(),
+        )
+    }
+
+    #[test]
+    fn local_demo_needs_no_secrets() {
+        assert!(Config::default().require_live_github_secrets().is_ok());
+    }
+
+    #[test]
+    fn github_without_webhook_or_session_is_rejected() {
+        let mut cfg = Config {
+            github: Some(gh()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.require_live_github_secrets(),
+            Err("GITHUB_WEBHOOK_SECRET")
+        );
+        cfg.webhook_secret = Some(b"webhook-secret-for-tests".to_vec());
+        assert_eq!(cfg.require_live_github_secrets(), Err("SESSION_KEY"));
+        cfg.auth.session_key = b"session-key-session-key-session!".to_vec();
+        assert!(cfg.require_live_github_secrets().is_ok());
+    }
 }
