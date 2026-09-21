@@ -27,15 +27,30 @@ async function createMatch(request: APIRequestContext): Promise<string> {
   return body.id;
 }
 
+type GithubHunk = { path: string; login: string | null; name: string };
+
+function sqlStr(value: string | null): string {
+  return value === null ? "NULL" : `'${value}'`;
+}
+
 function attachGithubMatch(
   matchId: string,
   theirs: { kind: "cpu" | "github"; login: string | null },
+  hunks?: GithubHunk[],
 ): void {
-  const theirsLoginSql = theirs.login === null ? "NULL" : `'${theirs.login}'`;
-  const hunkLoginSql = theirs.login === null ? "NULL" : `'${theirs.login}'`;
+  const rounds = hunks ?? [
+    { path: "a.rs", login: theirs.login, name: "bob" },
+    { path: "b.rs", login: theirs.login, name: "bob" },
+  ];
+  const hunkValues = rounds
+    .map(
+      (h, i) =>
+        `('${matchId}', ${i}, '${h.path}', 0, X'61', X'62', X'63', ${sqlStr(h.login)}, '${h.name}', 100, 0, 0, 100, 0, 0)`,
+    )
+    .join(",\n  ");
   const sql = `
 UPDATE matches SET
-  ours_login = 'alice', theirs_login = ${theirsLoginSql},
+  ours_login = 'alice', theirs_login = ${sqlStr(theirs.login)},
   ours_name = 'alice', theirs_name = 'bob',
   ours_kind = 'github', theirs_kind = '${theirs.kind}',
   owner = 'acme', repo = 'box', pr_number = 0
@@ -46,12 +61,12 @@ INSERT INTO match_hunks (
   match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
   theirs_login, theirs_name, ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
 ) VALUES
-  ('${matchId}', 0, 'a.rs', 0, X'61', X'62', X'63', ${hunkLoginSql}, 'bob', 100, 0, 0, 100, 0, 0),
-  ('${matchId}', 1, 'b.rs', 0, X'61', X'62', X'63', ${hunkLoginSql}, 'bob', 100, 0, 0, 100, 0, 0);
-DELETE FROM sessions WHERE id IN ('sid-alice', 'sid-bob');
+  ${hunkValues};
+DELETE FROM sessions WHERE id IN ('sid-alice', 'sid-bob', 'sid-carol');
 INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at) VALUES
   ('sid-alice', 1, 'alice', '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'),
-  ('sid-bob', 2, 'bob', '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00');
+  ('sid-bob', 2, 'bob', '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'),
+  ('sid-carol', 3, 'carol', '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00');
 `;
   execFileSync("sqlite3", [DB, sql], { stdio: "pipe" });
 }
@@ -175,4 +190,87 @@ test("two GitHub sessions play two rounds in the browser", async ({ browser, req
 
   await aliceCtx.close();
   await bobCtx.close();
+});
+
+test("logged-in teammate spectates without a GitHub login prompt", async ({ browser, request }) => {
+  const matchId = await createMatch(request);
+  attachGithubMatch(matchId, { kind: "github", login: "bob" });
+
+  const aliceCtx = await browser.newContext();
+  const carolCtx = await browser.newContext();
+  await aliceCtx.addCookies([sidCookie("sid-alice")]);
+  await carolCtx.addCookies([sidCookie("sid-carol")]);
+  const alice = await aliceCtx.newPage();
+  const carol = await carolCtx.newPage();
+
+  await alice.goto(`/match/${matchId}`);
+  await carol.goto(`/match/${matchId}`);
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-role", "spectator", { timeout: 10_000 });
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-you-are", "carol");
+  await expect(carol.getByTestId("wait")).toContainText(/spectating as carol/i);
+  await expect(carol.getByTestId("github-login")).toHaveCount(0);
+  await expect(alice.getByTestId("wait")).not.toContainText(/spectating/i);
+  await expect(alice.getByTestId("stage")).toHaveAttribute("data-role", "ours");
+
+  await aliceCtx.close();
+  await carolCtx.close();
+});
+
+test("theirs slot follows the blamed author each round", async ({ browser, request }) => {
+  const matchId = await createMatch(request);
+  attachGithubMatch(matchId, { kind: "github", login: "bob" }, [
+    { path: "a.rs", login: "bob", name: "bob" },
+    { path: "b.rs", login: "carol", name: "carol" },
+  ]);
+
+  const aliceCtx = await browser.newContext();
+  const bobCtx = await browser.newContext();
+  const carolCtx = await browser.newContext();
+  await aliceCtx.addCookies([sidCookie("sid-alice")]);
+  await bobCtx.addCookies([sidCookie("sid-bob")]);
+  await carolCtx.addCookies([sidCookie("sid-carol")]);
+  const alice = await aliceCtx.newPage();
+  const bob = await bobCtx.newPage();
+  const carol = await carolCtx.newPage();
+
+  await alice.goto(`/match/${matchId}`);
+  await carol.goto(`/match/${matchId}`);
+  await expect(carol.getByTestId("wait")).toContainText(/spectating as carol/i, { timeout: 10_000 });
+  await expect(carol.getByTestId("github-login")).toHaveCount(0);
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-role", "spectator");
+  await expect(alice.getByTestId("stage")).toHaveAttribute("data-path", "a.rs");
+  await expect(alice.getByTestId("stage")).toHaveAttribute("data-theirs-name", "bob");
+
+  await bob.goto(`/match/${matchId}`);
+  await expect(bob.getByTestId("stage")).toHaveAttribute("data-role", "theirs", { timeout: 10_000 });
+  await expect(bob.getByTestId("stage")).toHaveAttribute("data-you-are", "bob");
+  await expect(bob.getByTestId("github-login")).toHaveCount(0);
+
+  await alice.getByTestId("stage").click();
+  await bob.getByTestId("stage").click();
+  await carol.getByTestId("stage").click();
+  await mashUntil(
+    [alice, bob, carol],
+    async () => (await carol.getByTestId("stage").getAttribute("data-role")) === "theirs",
+    25_000,
+  );
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-role", "theirs");
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-you-are", "carol");
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-path", "b.rs");
+  await expect(carol.getByTestId("stage")).toHaveAttribute("data-theirs-name", "carol");
+  await expect(bob.getByTestId("stage")).toHaveAttribute("data-role", "spectator");
+  await expect(alice.getByTestId("stage")).toHaveAttribute("data-role", "ours");
+  await expect(carol.getByTestId("github-login")).toHaveCount(0);
+
+  const resolved = alice.getByTestId("resolved");
+  await mashUntil(
+    [alice, bob, carol],
+    async () => ((await resolved.textContent()) ?? "").includes("/replay/"),
+    20_000,
+  );
+  await expect(resolved).toContainText(`/replay/${matchId}`);
+
+  await aliceCtx.close();
+  await bobCtx.close();
+  await carolCtx.close();
 });

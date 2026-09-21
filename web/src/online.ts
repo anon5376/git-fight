@@ -144,6 +144,8 @@ export function paintFight(
   stage.dataset.round = String(roundLabel);
   stage.dataset.role = youSide ?? "";
   stage.dataset.youAre = youAre ?? "";
+  stage.dataset.oursName = oursName;
+  stage.dataset.theirsName = theirsName;
   if (path) {
     stage.dataset.path = path;
   }
@@ -335,8 +337,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       if (role === "spectator") {
         ui.wait.classList.remove("hidden");
         if (!ui.wait.querySelector("[data-testid=\"github-login\"]")) {
-          ui.wait.textContent = "spectating";
-          void offerGithubLogin(matchId, ui);
+          ui.wait.textContent = youAre ? `spectating as ${youAre}` : "spectating";
+          if (!youAre) {
+            void offerGithubLogin(matchId, ui);
+          }
         }
       } else {
         const who = hello.you_are ? hello.you_are : hello.your_role;
