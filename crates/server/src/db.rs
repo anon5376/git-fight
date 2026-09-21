@@ -35,7 +35,8 @@ pub struct MatchRow {
 pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(opts)

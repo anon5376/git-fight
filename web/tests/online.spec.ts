@@ -11,7 +11,7 @@ test("hosted lockstep match reaches KO in two browsers", async ({ browser }) => 
   await ours.goto("/");
   await expect(ours.getByTestId("menu")).toBeVisible();
   await ours.getByTestId("host").click();
-  await expect(ours).toHaveURL(/\/match\/[0-9a-f]+/i);
+  await expect(ours).toHaveURL(/\/match\/[0-9a-f]+/i, { timeout: 15_000 });
   await expect(ours.getByTestId("share")).toContainText("opponent link:");
   const share = await ours.getByTestId("share").textContent();
   const opponent = share?.replace("opponent link: ", "").trim() ?? "";

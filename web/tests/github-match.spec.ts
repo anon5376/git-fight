@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,29 +12,23 @@ function signSid(id: string): string {
   return `${id}.${mac}`;
 }
 
-function seedGithubCpuMatch(matchId: string): void {
+function attachGithubCpuSides(matchId: string): void {
   const sql = `
+UPDATE matches SET
+  ours_login = 'alice', theirs_login = NULL,
+  ours_name = 'alice', theirs_name = 'bob',
+  ours_kind = 'github', theirs_kind = 'cpu',
+  owner = 'acme', repo = 'box', pr_number = 0
+WHERE id = '${matchId}';
 DELETE FROM match_inputs WHERE match_id = '${matchId}';
 DELETE FROM match_hunks WHERE match_id = '${matchId}';
-DELETE FROM matches WHERE id = '${matchId}';
-DELETE FROM sessions WHERE id = 'sid-alice';
-INSERT INTO matches (
-  id, installation_id, owner, repo, pr_number, pr_head_sha, pr_base_sha,
-  seed, status, ours_login, theirs_login, ours_name, theirs_name,
-  ours_kind, theirs_kind, ours_token, theirs_token, input_delay_ticks,
-  created_at, expires_at
-) VALUES (
-  '${matchId}', 1, 'acme', 'box', 0, '', '',
-  '9', 'pending', 'alice', NULL, 'alice', 'bob',
-  'github', 'cpu', 'o', 't', 3,
-  '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'
-);
 INSERT INTO match_hunks (
   match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
   theirs_login, theirs_name, ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
 ) VALUES
   ('${matchId}', 0, 'a.rs', 0, X'61', X'62', X'63', NULL, 'bob', 100, 0, 0, 100, 0, 0),
   ('${matchId}', 1, 'b.rs', 0, X'61', X'62', X'63', NULL, 'bob', 100, 0, 0, 100, 0, 0);
+DELETE FROM sessions WHERE id = 'sid-alice';
 INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at)
 VALUES ('sid-alice', 1, 'alice', '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00');
 `;
@@ -49,9 +43,12 @@ async function mashUntil(page: Page, pred: () => Promise<boolean>, ms: number): 
   }
 }
 
-test("github session match plays two CPU rounds in the browser", async ({ context, page }) => {
-  const matchId = randomUUID().replace(/-/g, "");
-  seedGithubCpuMatch(matchId);
+test("github session match plays two CPU rounds in the browser", async ({ context, page, request }) => {
+  const created = await request.post("/api/matches", { data: { seed: 9 } });
+  expect(created.ok(), await created.text()).toBeTruthy();
+  const body = (await created.json()) as { id: string };
+  const matchId = body.id;
+  attachGithubCpuSides(matchId);
   await context.addCookies([
     {
       name: "git_fight_sid",
@@ -85,6 +82,6 @@ test("github session match plays two CPU rounds in the browser", async ({ contex
 
   const replay = await page.request.get(`/api/replays/${matchId}`);
   expect(replay.ok()).toBeTruthy();
-  const body = (await replay.json()) as { rounds?: unknown[] };
-  expect(body.rounds).toHaveLength(2);
+  const replayBody = (await replay.json()) as { rounds?: unknown[] };
+  expect(replayBody.rounds).toHaveLength(2);
 });
