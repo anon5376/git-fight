@@ -1813,6 +1813,32 @@ async fn bot_fight_is_ignored() {
 }
 
 #[tokio::test]
+async fn slash_in_owner_does_not_clone() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    let body = serde_json::to_vec(&json!({
+        "action": "created",
+        "installation": { "id": 1 },
+        "repository": {
+            "name": "box",
+            "owner": { "login": "acme/other" },
+            "default_branch": "main"
+        },
+        "issue": { "number": 1, "pull_request": {} },
+        "comment": { "body": "/fight\n", "user": { "login": "carol", "type": "User" } },
+        "sender": { "login": "carol", "type": "User" }
+    }))
+    .unwrap();
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-bad-owner", &body).await,
+        200
+    );
+    let comments = settle_posted(&mock).await;
+    assert!(comments.is_empty(), "{comments:?}");
+}
+
+#[tokio::test]
 async fn edited_fight_comment_starts_challenge() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;

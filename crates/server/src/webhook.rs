@@ -191,6 +191,9 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
     };
     let owner = repo.owner.login.clone();
     let name = repo.name.clone();
+    if !crate::gh::is_safe_github_name(&owner) || !crate::gh::is_safe_github_name(&name) {
+        return HttpStatus::OK;
+    }
     tokio::spawn(async move {
         let Ok(_permit) = crate::limits::git_slots().acquire().await else {
             return;

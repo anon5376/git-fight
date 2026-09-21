@@ -295,11 +295,17 @@ impl GitHub {
         repo: &str,
         r#ref: &str,
     ) -> bool {
+        if !is_safe_github_name(owner) || !is_safe_github_name(repo) {
+            return false;
+        }
         let res = self
             .authed(
                 installation_id,
                 reqwest::Method::GET,
-                &format!("/repos/{owner}/{repo}/contents/.github/git-fight.yml?ref={ref}"),
+                &format!(
+                    "/repos/{owner}/{repo}/contents/.github/git-fight.yml?ref={}",
+                    urlencoding(r#ref)
+                ),
             )
             .await;
         let Ok(builder) = res else {
@@ -487,6 +493,15 @@ impl GitHub {
             urlencoding(code_challenge),
         )
     }
+}
+
+/// GitHub owner or repo name. Used in clone URLs and API paths — never a slash or host.
+pub fn is_safe_github_name(s: &str) -> bool {
+    let n = s.len();
+    (1..=100).contains(&n)
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 fn urlencoding(s: &str) -> String {

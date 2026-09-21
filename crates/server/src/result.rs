@@ -152,6 +152,20 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     let (url, bearer) = if let Some(local) = ctx.test_repos.get(&key) {
         (format!("file://{}", local.display()), None)
     } else {
+        if !crate::gh::is_safe_github_name(&row.owner) || !crate::gh::is_safe_github_name(&row.repo)
+        {
+            return skip_push(
+                ctx,
+                &row,
+                match_id,
+                "clone",
+                format!(
+                    "git fight: nothing pushed — invalid repository name. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                    ctx.public_url.trim_end_matches('/')
+                ),
+            )
+            .await;
+        }
         let inst = row
             .installation_id
             .ok_or_else(|| "missing installation".to_string())? as u64;
@@ -161,13 +175,26 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             .ok_or_else(|| "missing github".to_string())?;
         let token = gh.installation_token(inst).await?;
         (
-            format!("https://github.com/{}/{}", row.owner, row.repo) + ".git",
+            format!("https://github.com/{}/{}.git", row.owner, row.repo),
             Some(token),
         )
     };
-    gitutil::clone_bare(&url, &dest, bearer.as_deref())
+    if gitutil::clone_bare(&url, &dest, bearer.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
+        .is_err()
+    {
+        return skip_push(
+            ctx,
+            &row,
+            match_id,
+            "clone",
+            format!(
+                "git fight: nothing pushed — could not clone to write the result branch. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                ctx.public_url.trim_end_matches('/')
+            ),
+        )
+        .await;
+    }
     let _ = gitutil::fetch_shas(
         &dest,
         &[&row.pr_head_sha, &row.pr_base_sha],
@@ -179,7 +206,17 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     if code == 0 {
-        return Err("merge became clean before push".into());
+        return skip_push(
+            ctx,
+            &row,
+            match_id,
+            "no_conflicts",
+            format!(
+                "git fight: nothing pushed — the pull request became mergeable. Comment `/fight` if conflicts return.\nreplay: {}/replay/{match_id}",
+                ctx.public_url.trim_end_matches('/')
+            ),
+        )
+        .await;
     }
 
     let picks_by_path = grouped_picks(&hunks);
@@ -210,9 +247,28 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     )
     .await
     .map_err(|e| e.to_string())?;
-    gitutil::push_create_only(&dest, &url, &commit, &branch, bearer.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) =
+        gitutil::push_create_only(&dest, &url, &commit, &branch, bearer.as_deref()).await
+    {
+        let exists = e.to_string().contains("already exists");
+        let reason = if exists { "exists" } else { "push" };
+        let why = if exists {
+            format!("`{branch}` already exists. The bot never overwrites a branch.")
+        } else {
+            format!("could not create `{branch}`.")
+        };
+        return skip_push(
+            ctx,
+            &row,
+            match_id,
+            reason,
+            format!(
+                "git fight: nothing pushed — {why} Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                ctx.public_url.trim_end_matches('/')
+            ),
+        )
+        .await;
+    }
 
     let _ = db::set_result_branch(&ctx.pool, match_id, Some(&branch), None).await;
     let public = ctx.public_url.trim_end_matches('/');
@@ -225,6 +281,18 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         round_lines(&hunks)
     );
     comment(ctx, &row, &body).await;
+    Ok(())
+}
+
+async fn skip_push(
+    ctx: &ResultCtx,
+    row: &MatchRow,
+    match_id: &str,
+    reason: &str,
+    body: String,
+) -> Result<(), String> {
+    comment(ctx, row, &body).await;
+    let _ = db::set_result_branch(&ctx.pool, match_id, None, Some(reason)).await;
     Ok(())
 }
 
@@ -260,6 +328,9 @@ async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) {
         return;
     };
     if row.pr_number <= 0 || row.owner.is_empty() {
+        return;
+    }
+    if !crate::gh::is_safe_github_name(&row.owner) || !crate::gh::is_safe_github_name(&row.repo) {
         return;
     }
     let _ = gh

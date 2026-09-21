@@ -63,6 +63,9 @@ pub async fn start_challenge(
     repo: &str,
     number: u64,
 ) -> Result<ChallengeStart, String> {
+    if !crate::gh::is_safe_github_name(owner) || !crate::gh::is_safe_github_name(repo) {
+        return Ok(note("git fight could not start: invalid repository"));
+    }
     if let Some(existing) = db::open_match_for_pr(&ctx.pool, owner, repo, number)
         .await
         .map_err(|e| e.to_string())?

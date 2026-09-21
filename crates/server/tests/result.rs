@@ -854,12 +854,26 @@ async fn create_only_does_not_overwrite_existing_ref() {
     let pool = pool().await;
     seed_match(&pool, &head, &base, Some("ours")).await;
     let ctx = ctx(pool, &mock, bare.clone());
-    let err = git_fight_server::publish_result(&ctx, MATCH_ID)
+    git_fight_server::publish_result(&ctx, MATCH_ID)
         .await
-        .unwrap_err();
-    assert!(err.contains("already exists"), "{err}");
+        .unwrap();
+    let patched = patched_comments(&mock).await;
+    let posted = posted_comments(&mock).await;
+    assert!(
+        patched
+            .iter()
+            .chain(posted.iter())
+            .any(|c| c.contains("already exists") && c.contains("nothing pushed")),
+        "expected a PR comment, patched={patched:?} posted={posted:?}"
+    );
     let after = git_dir(&bare, &["rev-parse", &branch]);
     assert_eq!(before, after);
+    let row = git_fight_server::db::get_match(&ctx.pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none(), "{row:?}");
+    assert_eq!(row.abort_reason.as_deref(), Some("exists"));
 }
 
 #[tokio::test]

@@ -95,3 +95,17 @@ fn debug_omits_secrets() {
     assert!(!shown.contains("BEGIN"), "{shown}");
     assert!(!shown.contains("PRIVATE KEY"), "{shown}");
 }
+
+#[test]
+fn github_names_reject_host_tricks() {
+    use git_fight_server::gh::is_safe_github_name;
+    assert!(is_safe_github_name("acme"));
+    assert!(is_safe_github_name("git-fight"));
+    assert!(is_safe_github_name(".github"));
+    assert!(!is_safe_github_name(""));
+    assert!(!is_safe_github_name("acme/other"));
+    assert!(!is_safe_github_name("acme.git@evil"));
+    assert!(!is_safe_github_name("../acme"));
+    assert!(!is_safe_github_name("acme/../x"));
+    assert!(!is_safe_github_name("https://github.com"));
+}
