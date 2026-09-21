@@ -290,6 +290,7 @@ test("theirs slot follows the blamed author each round", async ({ browser, reque
 });
 
 test("mirror GitHub session plays both slots with 2P keys", async ({ context, page, request }) => {
+  test.setTimeout(60_000);
   const matchId = await createMatch(request);
   attachGithubMatch(matchId, { kind: "mirror", login: "alice" }, [
     { path: "a.rs", login: "alice", name: "alice" },
@@ -310,10 +311,21 @@ test("mirror GitHub session plays both slots with 2P keys", async ({ context, pa
   const resolved = page.getByTestId("resolved");
   await mashUntil(
     [page],
-    async () => ((await resolved.textContent()) ?? "").includes("/replay/"),
+    async () => {
+      const text = (await resolved.textContent()) ?? "";
+      return text.includes("1/2") || text.includes("/replay/");
+    },
     25_000,
     ["a", "j"],
   );
+  if ((await resolved.textContent())?.includes("/replay/") !== true) {
+    await mashUntil(
+      [page],
+      async () => ((await resolved.textContent()) ?? "").includes("/replay/"),
+      20_000,
+      ["a", "j"],
+    );
+  }
   await expect(resolved).toContainText(`/replay/${matchId}`);
 
   const replay = await page.request.get(`/api/replays/${matchId}`);

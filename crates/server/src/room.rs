@@ -693,7 +693,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
             db::stats_for_round(a.hunks, *a.round),
             a.hunks,
         );
-        let _ = conn.tx.try_send(encode(&hello));
+        try_send_or_spawn(&conn.tx, encode(&hello));
     }
     false
 }
@@ -878,6 +878,23 @@ fn snapshot_msg(
 fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
     for conn in conns.values() {
         let _ = conn.tx.try_send(msg.to_string());
+    }
+}
+
+/// Next-round Hello must not vanish when the outbound channel is full.
+/// Ticks can be skipped (Snapshot on reconnect); a dropped Hello leaves
+/// `--instant` waiting forever for Input tagged with the new round.
+fn try_send_or_spawn(tx: &mpsc::Sender<String>, msg: String) {
+    if let Err(err) = tx.try_send(msg) {
+        match err {
+            mpsc::error::TrySendError::Full(msg) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(msg).await;
+                });
+            }
+            mpsc::error::TrySendError::Closed(_) => {}
+        }
     }
 }
 

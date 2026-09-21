@@ -409,6 +409,12 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       } else {
         held = 0;
         heldTheirs = 0;
+        // Next-round Hello is try_send. If it is late or dropped, Input
+        // tagged with the finished Hello `round` is ignored and --instant
+        // never idles — the canvas stays on "round 1/2".
+        round = (end.round ?? round) + 1;
+        confirmed = -1;
+        nextSend = 0;
       }
       if (fight && end.tick === fight.tick() && !hashesMatch(fight, end.hash_hi, end.hash_lo)) {
         ui.resolved.textContent = "desync — server result stands";
