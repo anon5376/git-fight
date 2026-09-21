@@ -155,7 +155,7 @@ Insert the match (status `pending`, `expires_at` = now + 24 hours, random seed, 
 
 ### 7. Play
 
-Players log in with GitHub. Only the two fighter logins can take a slot; everyone else spectates. Seed, stats, and hunk metadata go to every client. Lockstep runs as in [Netcode](#netcode). Each round's winner is `ours`, `theirs`, or `draw`. A fighter who disconnects has 30 seconds to rejoin, then loses the **current** round. If a fighter never shows up, the match expires at 24 hours with no result and no push.
+Players log in with GitHub. Only the two fighter logins can take a slot; everyone else spectates. Seed, stats, and hunk metadata go to every client. Lockstep runs as in [Netcode](#netcode). Each round's winner is `ours`, `theirs`, or `draw`. A fighter who disconnects has 30 seconds to rejoin, then loses the **current** round. If a fighter never shows up, the match expires at 24 hours with no result and no push. An aborted or expired row stops confirming ticks on the next sim step, even if Shutdown is still queued.
 
 ### 8. Result
 

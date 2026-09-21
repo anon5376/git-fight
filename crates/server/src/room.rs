@@ -396,6 +396,10 @@ struct Advance<'a> {
 }
 
 async fn advance(a: Advance<'_>) -> bool {
+    if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
+        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+        return true;
+    }
     if let Some(result) = a.sim.result {
         return finish(a, result, false).await;
     }

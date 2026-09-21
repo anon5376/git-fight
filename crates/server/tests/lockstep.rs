@@ -57,11 +57,113 @@ async fn reconnect_after_finish_is_not_a_room() {
         play(addr, &id, &theirs_token, false),
     );
 
-    let url = format!("ws://{addr}/ws?match={id}&token={ours_token}");
-    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-    let (_, mut stream) = ws.split();
     let err = wait_type(&mut stream, "error").await;
     assert_eq!(err["message"].as_str(), Some("finished"), "{err}");
+}
+
+#[tokio::test]
+async fn abort_stops_lockstep_before_the_round_ends() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = std::env::temp_dir().join(format!(
+        "gf-abort-stop-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "abortstopabortstopabortstopabortst";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 3,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let ours_url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let theirs_url = format!("ws://{addr}/ws?match={id}&token=theirs-token");
+    let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
+    let (theirs_ws, _) = tokio_tungstenite::connect_async(&theirs_url).await.unwrap();
+    let (_, mut ours_stream) = ours_ws.split();
+    let (_, mut theirs_stream) = theirs_ws.split();
+    let _ = wait_type(&mut ours_stream, "hello").await;
+    let _ = wait_type(&mut theirs_stream, "hello").await;
+
+    assert!(
+        git_fight_server::db::abort_open_match(&pool, id, "outdated")
+            .await
+            .unwrap()
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(2), wait_type(&mut ours_stream, "error"))
+        .await
+        .expect("aborted match should stop the room without waiting for the round timer");
+    assert_eq!(err["message"].as_str(), Some("outdated"), "{err}");
+    let row = git_fight_server::db::get_match(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "aborted");
+    let hunks = git_fight_server::db::list_hunks(&pool, id).await.unwrap();
+    assert!(hunks[0].winner.is_none());
 }
 
 #[tokio::test]
