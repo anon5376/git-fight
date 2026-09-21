@@ -1070,8 +1070,32 @@ pub fn clip_comment_text(s: &str) -> String {
     if t.is_empty() {
         "_".into()
     } else {
-        t.to_string()
+        break_www_autolink(t)
     }
+}
+
+fn break_www_autolink(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars.get(i..i + 4).is_some_and(|w| {
+            w[0].eq_ignore_ascii_case(&'w')
+                && w[1].eq_ignore_ascii_case(&'w')
+                && w[2].eq_ignore_ascii_case(&'w')
+                && w[3] == '.'
+        }) {
+            out.push(chars[i]);
+            out.push(chars[i + 1]);
+            out.push(chars[i + 2]);
+            out.push('_');
+            i += 4;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
@@ -1744,6 +1768,9 @@ mod tests {
         assert!(!hostile.contains("://"), "{hostile}");
         assert_eq!(clip_comment_text("   "), "_");
         assert_eq!(clip_comment_text(&"a".repeat(200)).chars().count(), 160);
+        let www = clip_comment_text("www.evil.example/x.rs");
+        assert!(!www.contains("www."), "{www}");
+        assert!(www.contains("www_"), "{www}");
     }
 
     #[tokio::test]
