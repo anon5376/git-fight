@@ -435,8 +435,8 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
         if let Some(ctx) = a.result {
             let id = a.id.to_string();
             tokio::spawn(async move {
-                if let Err(e) = result::publish(&ctx, &id).await {
-                    eprintln!("git fight result: {e}");
+                if result::publish(&ctx, &id).await.is_err() {
+                    eprintln!("git fight result failed");
                 }
             });
         }

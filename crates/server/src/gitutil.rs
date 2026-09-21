@@ -75,6 +75,8 @@ fn git_base() -> Command {
     c.arg("-c").arg("core.hooksPath=/dev/null");
     c.kill_on_drop(true);
     c.stdin(Stdio::null());
+    // Never inherit a user worktree as cwd (hooks, local config, relative dest).
+    c.current_dir("/");
     c
 }
 
@@ -158,6 +160,9 @@ fn git_dir(dir: &Path) -> Command {
 }
 
 pub async fn fetch_shas(dir: &Path, shas: &[&str], bearer: Option<&str>) -> Result<(), GitError> {
+    if shas.iter().any(|s| !is_safe_rev(s)) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
     let mut cmd = git_dir(dir);
     if let Some(token) = bearer {
         cmd.arg("-c")
@@ -247,6 +252,9 @@ pub async fn merge_tree(
     base: &str,
     head: &str,
 ) -> Result<(String, BTreeSet<String>, i32), GitError> {
+    if !is_safe_rev(base) || !is_safe_rev(head) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
     let mut cmd = git_dir(dir);
     cmd.args(["merge-tree", "--write-tree", "-z", base, head]);
     let (code, out, err) = run(cmd, CLONE_TIMEOUT).await?;
@@ -629,6 +637,9 @@ pub async fn commit_tree(
     parents: &[&str],
     message: &str,
 ) -> Result<String, GitError> {
+    if !is_safe_rev(tree) || parents.iter().any(|p| !is_safe_rev(p)) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
     let mut cmd = git_dir(dir);
     cmd.env("GIT_AUTHOR_NAME", "git-fight");
     cmd.env("GIT_AUTHOR_EMAIL", "git-fight@users.noreply.github.com");
@@ -758,6 +769,8 @@ mod tests {
         assert!(is_safe_rev("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(!is_safe_rev("HEAD"));
         assert!(!is_safe_rev("../main"));
+        assert!(!is_safe_rev("--upload-pack=true"));
+        assert!(!is_safe_rev("-C"));
     }
 
     #[test]

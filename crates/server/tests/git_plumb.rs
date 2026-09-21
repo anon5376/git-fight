@@ -450,3 +450,20 @@ async fn oversized_blob_has_no_fightable_hunks() {
         other => panic!("expected NothingToFight, got {other}"),
     }
 }
+
+#[tokio::test]
+async fn git_rejects_option_injection_in_revs() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = gitutil::merge_tree(dir.path(), "--upload-pack=true", "aaaaaaaa")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unsafe revision"), "{err}");
+    let err = gitutil::fetch_shas(dir.path(), &["HEAD"], None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unsafe revision"), "{err}");
+    let err = gitutil::fetch_shas(dir.path(), &["--foo"], None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unsafe revision"), "{err}");
+}

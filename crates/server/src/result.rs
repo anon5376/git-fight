@@ -125,9 +125,25 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
 
     if let Some(gh) = &ctx.gh {
         if let Some(inst) = row.installation_id.map(|i| i as u64) {
-            let pr = gh
+            let pr = match gh
                 .get_pull(inst, &row.owner, &row.repo, row.pr_number as u64)
-                .await?;
+                .await
+            {
+                Ok(pr) => pr,
+                Err(_) => {
+                    return skip_push(
+                        ctx,
+                        &row,
+                        match_id,
+                        "recheck",
+                        format!(
+                            "git fight: nothing pushed — could not re-check the pull request. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                            ctx.public_url.trim_end_matches('/')
+                        ),
+                    )
+                    .await;
+                }
+            };
             if !pr.head.sha.eq_ignore_ascii_case(&row.pr_head_sha)
                 || !pr.base.sha.eq_ignore_ascii_case(&row.pr_base_sha)
             {
@@ -202,9 +218,24 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     )
     .await;
 
-    let (tree, paths, code) = gitutil::merge_tree(&dest, &row.pr_base_sha, &row.pr_head_sha)
+    let (tree, paths, code) = match gitutil::merge_tree(&dest, &row.pr_base_sha, &row.pr_head_sha)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(v) => v,
+        Err(_) => {
+            return skip_push(
+                ctx,
+                &row,
+                match_id,
+                "push",
+                format!(
+                    "git fight: nothing pushed — could not rebuild the merge. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                    ctx.public_url.trim_end_matches('/')
+                ),
+            )
+            .await;
+        }
+    };
     if code == 0 {
         return skip_push(
             ctx,
@@ -228,25 +259,81 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         if !gitutil::is_safe_path(path) {
             continue;
         }
-        let blob = gitutil::cat_blob(&dest, &format!("{tree}:{path}"))
-            .await
-            .map_err(|e| e.to_string())?;
-        let parsed = ConflictFile::parse(&blob).map_err(|e| e.to_string())?;
+        let blob = match gitutil::cat_blob(&dest, &format!("{tree}:{path}")).await {
+            Ok(b) => b,
+            Err(_) => {
+                return skip_push(
+                    ctx,
+                    &row,
+                    match_id,
+                    "push",
+                    format!(
+                        "git fight: nothing pushed — could not read a conflicted file. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                        ctx.public_url.trim_end_matches('/')
+                    ),
+                )
+                .await;
+            }
+        };
+        let parsed = match ConflictFile::parse(&blob) {
+            Ok(p) => p,
+            Err(_) => {
+                return skip_push(
+                    ctx,
+                    &row,
+                    match_id,
+                    "push",
+                    format!(
+                        "git fight: nothing pushed — could not parse a conflicted file. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                        ctx.public_url.trim_end_matches('/')
+                    ),
+                )
+                .await;
+            }
+        };
         files.push((path.clone(), parsed.resolve(picks)));
     }
 
-    let new_tree = gitutil::build_resolved_tree(&dest, &tree, &files)
-        .await
-        .map_err(|e| e.to_string())?;
+    let new_tree = match gitutil::build_resolved_tree(&dest, &tree, &files).await {
+        Ok(t) => t,
+        Err(_) => {
+            return skip_push(
+                ctx,
+                &row,
+                match_id,
+                "push",
+                format!(
+                    "git fight: nothing pushed — could not write the result tree. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                    ctx.public_url.trim_end_matches('/')
+                ),
+            )
+            .await;
+        }
+    };
     let message = format!("git fight match {}\n\n{}\n", row.id, round_lines(&hunks));
-    let commit = gitutil::commit_tree(
+    let commit = match gitutil::commit_tree(
         &dest,
         &new_tree,
         &[&row.pr_head_sha, &row.pr_base_sha],
         &message,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return skip_push(
+                ctx,
+                &row,
+                match_id,
+                "push",
+                format!(
+                    "git fight: nothing pushed — could not write the result commit. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                    ctx.public_url.trim_end_matches('/')
+                ),
+            )
+            .await;
+        }
+    };
     if let Err(e) =
         gitutil::push_create_only(&dest, &url, &commit, &branch, bearer.as_deref()).await
     {
