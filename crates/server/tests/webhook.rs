@@ -172,6 +172,42 @@ fn binary_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     (tmp, bare, head, base)
 }
 
+fn modify_delete_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 1 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    git(&work, &["rm", "-q", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr-delete"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 3 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 fn write_hunk_fns(work: &Path, n: usize, body: i32) {
     let mut src = String::new();
     for i in 0..n {
@@ -1017,6 +1053,40 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
     );
     assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
     assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
+
+    let board = git_fight_server::db::list_player_stats(&pool, "acme", "box")
+        .await
+        .unwrap();
+    let alice = board.iter().find(|p| p.github_login == "alice");
+    let bob = board.iter().find(|p| p.github_login == "bob");
+    let carol = board.iter().find(|p| p.github_login == "carol");
+    assert_eq!(
+        alice.map(|p| (p.wins, p.losses, p.kos)),
+        Some((2, 0, 2)),
+        "{board:?}"
+    );
+    assert_eq!(
+        bob.map(|p| (p.wins, p.losses, p.conflicts_caused)),
+        Some((0, 1, 1)),
+        "{board:?}"
+    );
+    assert_eq!(
+        carol.map(|p| (p.wins, p.losses, p.conflicts_caused)),
+        Some((0, 1, 1)),
+        "{board:?}"
+    );
+    let (status, body) = http(
+        addr,
+        "GET",
+        "/acme/box/leaderboard",
+        &[("Accept", "application/json")],
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["players"][0]["login"], "alice");
+    assert_eq!(v["players"][0]["wins"], 2);
 }
 
 #[tokio::test]
@@ -1316,6 +1386,64 @@ async fn too_many_conflicts_comment_and_abort() {
             .unwrap()
             .is_none(),
         "too many conflicts must not leave a pending match"
+    );
+}
+
+#[tokio::test]
+async fn fifteen_hunks_starts_a_match() {
+    let (_keep, bare, head, base) = many_hunks_bare(15);
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-fifteen", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("15 rounds") && t.contains("/match/")),
+        "{comments:?}"
+    );
+    let id = match_id_from(&comments);
+    let hunks = git_fight_server::db::list_hunks(&pool, &id).await.unwrap();
+    assert_eq!(
+        hunks.len(),
+        15,
+        "{:?}",
+        hunks.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn modify_delete_conflict_is_not_fightable() {
+    let (_keep, bare, head, base) = modify_delete_conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-mod-del", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("not the kind git fight can play")
+                || t.contains("no conflicts to fight")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "modify-delete must not leave a pending match"
     );
 }
 
