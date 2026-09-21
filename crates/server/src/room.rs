@@ -990,14 +990,23 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     false
 }
 
-pub(crate) async fn hash_from_stored_round(
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum StoredHash {
+    Ready(String),
+    Retry,
+    Unhashable,
+}
+
+pub(crate) async fn stored_round_hash(
     pool: &SqlitePool,
     id: &str,
     seed: u64,
     hunks: &[db::HunkRow],
     round: u32,
-) -> Option<String> {
-    let inputs = db::load_inputs(pool, id, round).await.ok()?;
+) -> StoredHash {
+    let Ok(inputs) = db::load_inputs(pool, id, round).await else {
+        return StoredHash::Retry;
+    };
     let (ours_stats, theirs_stats) = db::stats_for_round(hunks, round);
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
     let mut log = Vec::new();
@@ -1010,11 +1019,24 @@ pub(crate) async fn hash_from_stored_round(
     {
         Some("forfeit_ours") => sim.forfeit(Side::Ours),
         Some("forfeit_theirs") => sim.forfeit(Side::Theirs),
-        Some(_) if sim.result.is_none() => return None,
+        Some(_) if sim.result.is_none() => return StoredHash::Unhashable,
         _ => {}
     }
     let (lo, hi) = split_hash(sim.state_hash());
-    Some(format!("{hi:08x}{lo:08x}"))
+    StoredHash::Ready(format!("{hi:08x}{lo:08x}"))
+}
+
+pub(crate) async fn hash_from_stored_round(
+    pool: &SqlitePool,
+    id: &str,
+    seed: u64,
+    hunks: &[db::HunkRow],
+    round: u32,
+) -> Option<String> {
+    match stored_round_hash(pool, id, seed, hunks, round).await {
+        StoredHash::Ready(hash) => Some(hash),
+        StoredHash::Retry | StoredHash::Unhashable => None,
+    }
 }
 
 async fn try_finish_scored_all(
@@ -2038,6 +2060,11 @@ mod tests {
                 .await
                 .is_none(),
             "do not hash an unfinished sim as a fake final_hash"
+        );
+        assert_eq!(
+            stored_round_hash(&pool, "hf2", 11, &hunks, 0).await,
+            StoredHash::Unhashable,
+            "a stored winner that never reached sim.result cannot retry forever"
         );
     }
 

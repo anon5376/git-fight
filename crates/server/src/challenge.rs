@@ -401,15 +401,21 @@ pub async fn start_challenge(
     }
 
     let rounds = hunks.len();
-    let vs = vs_line(&display_login, &theirs_kind, &theirs_name);
-    let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
-    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(true) {
-        return Ok(silent());
+    // Only Ok(true) returns a fight link. Busy or already-closed is silent
+    // (no match_id) so spawn_challenge cannot POST after the row closed.
+    // The 5s expirer posts uncommented open rows that still have hunks.
+    match db::is_open_match(&ctx.pool, &id).await {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Ok(silent()),
     }
     Ok(ChallengeStart {
-        body: format!(
-            "git fight: {vs}. {rounds} round{}. {link}",
-            if rounds == 1 { "" } else { "s" }
+        body: fight_link_body(
+            &ctx.public_url,
+            &id,
+            &display_login,
+            &theirs_kind,
+            &theirs_name,
+            rounds,
         ),
         match_id: Some(id),
     })
@@ -466,7 +472,23 @@ async fn blame_login(
     Ok(login)
 }
 
-fn vs_line(display_login: &str, theirs_kind: &str, theirs_name: &str) -> String {
+pub(crate) fn fight_link_body(
+    public_url: &str,
+    id: &str,
+    display_login: &str,
+    theirs_kind: &str,
+    theirs_name: &str,
+    rounds: usize,
+) -> String {
+    let vs = vs_line(display_login, theirs_kind, theirs_name);
+    let link = format!("{}/match/{id}", public_url.trim_end_matches('/'));
+    format!(
+        "git fight: {vs}. {rounds} round{}. {link}",
+        if rounds == 1 { "" } else { "s" }
+    )
+}
+
+pub(crate) fn vs_line(display_login: &str, theirs_kind: &str, theirs_name: &str) -> String {
     let ours = db::clip_comment_text(display_login);
     let theirs = db::clip_comment_text(theirs_name);
     if theirs_kind == "cpu" {
@@ -531,6 +553,38 @@ mod tests {
         assert!(!vs.contains("]("), "{vs}");
         assert!(!vs.contains('@'), "{vs}");
         assert!(!vs.contains("://"), "{vs}");
+    }
+
+    #[test]
+    fn fight_link_body_matches_the_challenge_comment() {
+        let body = fight_link_body("https://fight.example", "m1", "alice", "cpu", "bob", 2);
+        assert_eq!(
+            body,
+            "git fight: alice vs bob (CPU). 2 rounds. https://fight.example/match/m1"
+        );
+        let one = fight_link_body("https://fight.example/", "m2", "alice", "github", "bob", 1);
+        assert_eq!(
+            one,
+            "git fight: alice vs bob. 1 round. https://fight.example/match/m2"
+        );
+    }
+
+    #[test]
+    fn final_open_gate_is_silent_when_status_is_unknown() {
+        assert_eq!(final_open_followup(Ok(true)), "post");
+        assert_eq!(final_open_followup(Ok(false)), "silent");
+        assert_eq!(
+            final_open_followup(Err(())),
+            "silent",
+            "busy final is_open_match must not return a fight link"
+        );
+    }
+
+    fn final_open_followup(open: Result<bool, ()>) -> &'static str {
+        match open {
+            Ok(true) => "post",
+            Ok(false) | Err(()) => "silent",
+        }
     }
 
     #[test]

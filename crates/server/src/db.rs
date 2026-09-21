@@ -684,6 +684,24 @@ pub async fn finish_open_match(
     Ok(res.rows_affected() > 0)
 }
 
+/// Finish a scored-open row whose last-round inputs cannot replay to
+/// `sim.result`. Does not invent a `final_hash`.
+pub async fn finish_open_match_unhashed(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query(
+        "UPDATE matches SET status = 'finished',
+            started_at = COALESCE(started_at, ?),
+            finished_at = ?
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// pending → in_progress. True if the match is still playable.
 /// Join cannot un-expire, un-abort, or un-finish a row.
 pub async fn start_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
@@ -1453,6 +1471,46 @@ pub async fn list_scored_open_matches(pool: &SqlitePool) -> Result<Vec<String>, 
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
+/// GitHub `/fight` rows that never grew hunks after the git job window.
+/// Clone-in-progress stays pending; a leftover after that window blocks rematch.
+pub async fn list_stale_preparing_matches(
+    pool: &SqlitePool,
+    older_than_secs: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let cutoff = (Utc::now() - Duration::seconds(older_than_secs)).to_rfc3339();
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM matches
+         WHERE status IN ('pending', 'in_progress')
+           AND pr_number > 0
+           AND created_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM match_hunks h WHERE h.match_id = matches.id
+           )",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+/// Open GitHub fights that have hunks but never posted a challenge comment.
+pub async fn list_uncommented_open_matches(
+    pool: &SqlitePool,
+) -> Result<Vec<MatchRow>, sqlx::Error> {
+    sqlx::query_as::<_, MatchRow>(&format!(
+        "SELECT {MATCH_COLS} FROM matches
+         WHERE status IN ('pending', 'in_progress')
+           AND pr_number > 0
+           AND owner != ''
+           AND challenge_comment_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM match_hunks h WHERE h.match_id = matches.id
+           )"
+    ))
+    .fetch_all(pool)
+    .await
+}
+
 /// Finished GitHub fights that never stored a branch or skip reason (crash
 /// after `finish_open_match`, before publish completed).
 pub async fn list_unpublished_results(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
@@ -1608,6 +1666,134 @@ mod tests {
             list_unpublished_results(&pool).await.unwrap(),
             vec!["won1".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn stale_preparing_github_match_is_listed_after_the_git_window() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "prep1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_match(&pool, "local", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(
+            list_stale_preparing_matches(&pool, 120)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a just-inserted clone is not stale"
+        );
+        let old = (Utc::now() - Duration::seconds(121)).to_rfc3339();
+        sqlx::query("UPDATE matches SET created_at = ? WHERE id = 'prep1'")
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE matches SET created_at = ? WHERE id = 'local'")
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_stale_preparing_matches(&pool, 120).await.unwrap(),
+            vec!["prep1".to_string()],
+            "local demo and a live clone window must not be aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommented_open_github_match_needs_hunks() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "cmt1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(list_uncommented_open_matches(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "cmt1",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let rows = list_uncommented_open_matches(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "cmt1");
+        set_challenge_comment_id(&pool, "cmt1", 99).await.unwrap();
+        assert!(list_uncommented_open_matches(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_open_match_unhashed_leaves_final_hash_null() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "uh1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(finish_open_match_unhashed(&pool, "uh1").await.unwrap());
+        let row = get_match(&pool, "uh1").await.unwrap().unwrap();
+        assert_eq!(row.status, "finished");
+        assert!(row.final_hash.is_none(), "{row:?}");
     }
 
     #[tokio::test]

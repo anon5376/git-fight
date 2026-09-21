@@ -616,6 +616,15 @@ pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) {
     comment(ctx, row, &body).await;
 }
 
+pub(crate) async fn comment_outdated(ctx: &ResultCtx, row: &MatchRow) {
+    let public = ctx.public_url.trim_end_matches('/');
+    let body = format!(
+        "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch.\nopen match: {public}/match/{}",
+        row.id
+    );
+    comment(ctx, row, &body).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

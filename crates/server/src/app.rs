@@ -114,6 +114,9 @@ pub struct AppState {
     pub config: Config,
     rooms: Arc<Mutex<HashMap<String, mpsc::Sender<RoomEvent>>>>,
     publishing: Arc<Mutex<HashSet<String>>>,
+    /// SHA-drift aborts that exhausted the short retry loop. Restart loses
+    /// this map; the next `synchronize` or 24h expiry covers leftover rows.
+    pending_aborts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub github: Option<GitHub>,
     pub auth: Auth,
     pub webhook_secret: Option<Vec<u8>>,
@@ -145,13 +148,25 @@ pub fn router(state: AppState) -> Router {
 }
 
 impl AppState {
-    fn result_ctx(&self) -> ResultCtx {
+    pub(crate) fn result_ctx(&self) -> ResultCtx {
         ResultCtx {
             gh: self.github.clone(),
             pool: self.pool.clone(),
             public_url: self.auth.public_url.clone(),
             test_repos: self.test_repos.clone(),
             publishing: self.publishing.clone(),
+        }
+    }
+
+    pub(crate) fn queue_abort(&self, id: String, reason: String) {
+        if let Ok(mut map) = self.pending_aborts.lock() {
+            map.insert(id, reason);
+        }
+    }
+
+    fn dequeue_abort(&self, id: &str) {
+        if let Ok(mut map) = self.pending_aborts.lock() {
+            map.remove(id);
         }
     }
 
@@ -165,7 +180,7 @@ impl AppState {
         }
     }
 
-    async fn finish_scored_open(&self) {
+    async fn finish_scored_open(&self, allow_unhashed: bool) {
         self.record_missing_stats().await;
         let Ok(ids) = db::list_scored_open_matches(&self.pool).await else {
             return;
@@ -181,17 +196,113 @@ impl AppState {
             crate::stats::record_stored_winners(&self.pool, &id, &hunks).await;
             let seed: u64 = row.seed.parse().unwrap_or(1);
             let last = u32::try_from(hunks.len().saturating_sub(1)).unwrap_or(0);
-            let Some(hash) =
-                room::hash_from_stored_round(&self.pool, &id, seed, &hunks, last).await
-            else {
+            match room::stored_round_hash(&self.pool, &id, seed, &hunks, last).await {
+                room::StoredHash::Ready(hash) => {
+                    if db::finish_open_match(&self.pool, &id, &hash)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        self.result_ctx().spawn_publish(id.clone());
+                        self.close_room(&id).await;
+                    }
+                }
+                room::StoredHash::Retry => {}
+                room::StoredHash::Unhashable if allow_unhashed => {
+                    // Do not invent final_hash. Picks can still publish.
+                    if db::finish_open_match_unhashed(&self.pool, &id)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        self.result_ctx().spawn_publish(id.clone());
+                        self.close_room(&id).await;
+                    }
+                }
+                room::StoredHash::Unhashable => {}
+            }
+        }
+    }
+
+    async fn retry_pending_aborts(&self) {
+        let pending: Vec<(String, String)> = {
+            let Ok(map) = self.pending_aborts.lock() else {
+                return;
+            };
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        for (id, reason) in pending {
+            match db::abort_open_match(&self.pool, &id, &reason).await {
+                Ok(true) => {
+                    self.dequeue_abort(&id);
+                    self.close_room(&id).await;
+                    if let Ok(Some(row)) = db::get_match(&self.pool, &id).await {
+                        crate::result::comment_outdated(&self.result_ctx(), &row).await;
+                    }
+                }
+                Ok(false) => {
+                    self.dequeue_abort(&id);
+                    self.close_room(&id).await;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    async fn abort_stale_preparing(&self) {
+        let older = crate::limits::GIT_JOB_TIMEOUT.as_secs() as i64;
+        let Ok(ids) = db::list_stale_preparing_matches(&self.pool, older).await else {
+            return;
+        };
+        for id in ids {
+            if db::abort_open_match(&self.pool, &id, "clone").await.is_ok() {
+                self.close_room(&id).await;
+            }
+        }
+    }
+
+    async fn post_uncommented_challenges(&self) {
+        let Some(gh) = &self.github else {
+            return;
+        };
+        let Ok(rows) = db::list_uncommented_open_matches(&self.pool).await else {
+            return;
+        };
+        for row in rows {
+            if row.pr_number <= 0 || row.owner.is_empty() {
+                continue;
+            }
+            let Some(inst) = row.installation_id.filter(|i| *i > 0).map(|i| i as u64) else {
                 continue;
             };
-            if db::finish_open_match(&self.pool, &id, &hash)
-                .await
-                .unwrap_or(false)
+            if !crate::gh::is_safe_github_name(&row.owner)
+                || !crate::gh::is_safe_github_name(&row.repo)
             {
-                self.result_ctx().spawn_publish(id.clone());
-                self.close_room(&id).await;
+                continue;
+            }
+            match db::is_open_match(&self.pool, &row.id).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => continue,
+            }
+            let hunks = db::list_hunks(&self.pool, &row.id)
+                .await
+                .unwrap_or_default();
+            if hunks.is_empty() {
+                continue;
+            }
+            let display = row.ours_login.as_deref().unwrap_or(row.ours_name.as_str());
+            let body = crate::challenge::fight_link_body(
+                &self.auth.public_url,
+                &row.id,
+                display,
+                &row.theirs_kind,
+                &row.theirs_name,
+                hunks.len(),
+            );
+            let posted = gh
+                .comment(inst, &row.owner, &row.repo, row.pr_number as u64, &body)
+                .await
+                .unwrap_or(0);
+            if posted > 0 {
+                let _ = db::set_challenge_comment_id(&self.pool, &row.id, posted as i64).await;
             }
         }
     }
@@ -262,20 +373,26 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         config,
         rooms: Arc::new(Mutex::new(HashMap::new())),
         publishing: Arc::new(Mutex::new(HashSet::new())),
+        pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
     if let Ok(rows) = db::list_live_matches(&state.pool).await {
         for row in rows {
             let _ = state.room_tx(&row).await;
         }
     }
-    state.finish_scored_open().await;
+    state.finish_scored_open(false).await;
     state.retry_unpublished();
     let expirer = state.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(5));
+        let mut allow_unhashed = false;
         loop {
             iv.tick().await;
-            expirer.finish_scored_open().await;
+            expirer.finish_scored_open(allow_unhashed).await;
+            allow_unhashed = true;
+            expirer.retry_pending_aborts().await;
+            expirer.abort_stale_preparing().await;
+            expirer.post_uncommented_challenges().await;
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
                 for id in ids {
                     expirer.close_room(&id).await;
@@ -865,6 +982,7 @@ mod tests {
             config: Config::default(),
             rooms: Arc::new(Mutex::new(map)),
             publishing: Arc::new(Mutex::new(HashSet::new())),
+            pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             github: None,
             auth: Auth::default(),
             webhook_secret: None,
@@ -873,5 +991,141 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), state.close_room("m1"))
             .await
             .expect("close_room waited on a full room channel");
+    }
+
+    fn test_state(pool: SqlitePool) -> AppState {
+        AppState {
+            pool,
+            config: Config::default(),
+            rooms: Arc::new(Mutex::new(HashMap::new())),
+            publishing: Arc::new(Mutex::new(HashSet::new())),
+            pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            github: None,
+            auth: Auth::default(),
+            webhook_secret: None,
+            test_repos: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_scored_open_unhashable_waits_until_allowed() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "uhash".into(),
+                seed: 11,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 60,
+                installation_id: None,
+                owner: String::new(),
+                repo: String::new(),
+                pr_number: 0,
+                pr_head_sha: String::new(),
+                pr_base_sha: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::insert_hunk(
+            &pool,
+            &crate::db::NewHunk {
+                match_id: "uhash",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crate::db::set_hunk_winner(&pool, "uhash", 0, "ours", false)
+            .await
+            .unwrap());
+        let state = test_state(pool.clone());
+        state.finish_scored_open(false).await;
+        let row = crate::db::get_match(&pool, "uhash").await.unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(row.final_hash.is_none());
+        state.finish_scored_open(true).await;
+        let row = crate::db::get_match(&pool, "uhash").await.unwrap().unwrap();
+        assert_eq!(row.status, "finished");
+        assert!(
+            row.final_hash.is_none(),
+            "unhashable scored-all must not invent final_hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_pending_aborts_closes_a_queued_row() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "ab1", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        let state = test_state(pool.clone());
+        state.queue_abort("ab1".into(), "outdated".into());
+        state.retry_pending_aborts().await;
+        let row = crate::db::get_match(&pool, "ab1").await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
+        assert!(state.pending_aborts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abort_stale_preparing_skips_a_live_clone() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "prep2".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let state = test_state(pool.clone());
+        state.abort_stale_preparing().await;
+        let row = crate::db::get_match(&pool, "prep2").await.unwrap().unwrap();
+        assert_eq!(row.status, "pending", "clone still inside GIT_JOB_TIMEOUT");
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(121)).to_rfc3339();
+        sqlx::query("UPDATE matches SET created_at = ? WHERE id = 'prep2'")
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        state.abort_stale_preparing().await;
+        let row = crate::db::get_match(&pool, "prep2").await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        assert_eq!(row.abort_reason.as_deref(), Some("clone"));
     }
 }

@@ -225,35 +225,15 @@ fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
                 Err(_) => {}
             }
         }
+        // Short retry exhausted. The 5s expirer drains pending_aborts so a
+        // leftover open row cannot hold matches_one_open_per_pr.
+        state.queue_abort(row.id, "outdated".into());
     });
 }
 
 async fn close_and_comment_outdated(state: &crate::app::AppState, row: &db::MatchRow) {
     state.close_room(&row.id).await;
-    let Some(inst) = row.installation_id.filter(|i| *i > 0).map(|i| i as u64) else {
-        return;
-    };
-    let Some(gh) = &state.github else {
-        return;
-    };
-    if row.pr_number <= 0 {
-        return;
-    }
-    let public = state.auth.public_url.trim_end_matches('/');
-    let body = format!(
-        "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch.\nopen match: {public}/match/{}",
-        row.id
-    );
-    let _ = gh
-        .issue_comment(
-            inst,
-            &row.owner,
-            &row.repo,
-            row.pr_number as u64,
-            row.challenge_comment_id,
-            &body,
-        )
-        .await;
+    crate::result::comment_outdated(&state.result_ctx(), row).await;
 }
 
 async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64) -> HttpStatus {
@@ -349,7 +329,7 @@ fn schedule_challenge_comment(
     start: challenge::ChallengeStart,
 ) {
     tokio::spawn(async move {
-        for delay_ms in [25_u64, 50, 100, 200] {
+        for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             let Some(ref match_id) = start.match_id else {
                 return;
