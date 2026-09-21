@@ -172,16 +172,6 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   const tickMs = 1000 / tps;
   let last = performance.now();
   let leftover = 0;
-  let pendingDesync = false;
-  let desyncApplies = 0;
-  let desyncTimer: number | null = null;
-
-  const clearDesyncTimer = () => {
-    if (desyncTimer !== null) {
-      window.clearTimeout(desyncTimer);
-      desyncTimer = null;
-    }
-  };
 
   const applySnapshot = (snap: SnapshotMsg): void => {
     const rebuilt = fightFromWire(
@@ -206,8 +196,6 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     confirmed = snap.confirmed_tick;
     round = snap.round ?? round;
     nextSend = Math.max(0, confirmed + 1);
-    pendingDesync = false;
-    clearDesyncTimer();
     if (rebuilt.tick() > 0 && role !== "spectator") {
       ui.wait.classList.add("hidden");
     }
@@ -313,34 +301,14 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         return;
       }
       if (hash.n !== fight.tick() || !hashesMatch(fight, hash.hi, hash.lo)) {
-        pendingDesync = true;
         ui.wait.classList.remove("hidden");
-        ui.wait.textContent = "desync — waiting for snapshot";
-        clearDesyncTimer();
-        desyncTimer = window.setTimeout(() => {
-          if (!stopped && !finished && pendingDesync) {
-            ui.wait.textContent = "desync — reloading";
-            window.location.reload();
-          }
-        }, 1500);
-      } else {
-        pendingDesync = false;
-        desyncApplies = 0;
-        clearDesyncTimer();
+        ui.wait.textContent = "desync — reloading";
+        window.location.reload();
       }
     } else if (msg.type === "snapshot") {
       const snap = msg as SnapshotMsg;
       const expect = snap.confirmed_tick < 0 ? 0 : snap.confirmed_tick + 1;
-      if (pendingDesync || !fight || fight.tick() !== expect) {
-        if (pendingDesync) {
-          desyncApplies += 1;
-          if (desyncApplies >= 2) {
-            ui.wait.classList.remove("hidden");
-            ui.wait.textContent = "desync — reloading";
-            window.location.reload();
-            return;
-          }
-        }
+      if (!fight || fight.tick() !== expect) {
         applySnapshot(snap);
       }
     } else if (msg.type === "end") {
@@ -414,9 +382,6 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       keys.unbind();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
-      }
-      if (desyncTimer !== null) {
-        window.clearTimeout(desyncTimer);
       }
     },
   };

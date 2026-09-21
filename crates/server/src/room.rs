@@ -64,7 +64,7 @@ pub fn spawn_room(
     pool: SqlitePool,
     settings: RoomSettings,
 ) -> mpsc::Sender<RoomEvent> {
-    let (tx, rx) = mpsc::channel(256);
+    let (tx, rx) = mpsc::channel(512);
     tokio::spawn(run_room(row, pool, settings, rx));
     tx
 }
@@ -410,19 +410,6 @@ async fn advance(a: Advance<'_>) -> bool {
                 lo,
             });
             broadcast(a.conns, &hash).await;
-            let confirmed = if *a.next_tick == 0 {
-                -1
-            } else {
-                *a.next_tick as i32 - 1
-            };
-            let snap = snapshot_msg(
-                round_seed(a.seed, *a.round),
-                *a.round,
-                confirmed,
-                db::stats_for_round(a.hunks, *a.round),
-                a.log,
-            );
-            broadcast(a.conns, &encode(&snap)).await;
         }
     }
     if let Some(result) = a.sim.result {

@@ -222,7 +222,14 @@ async fn later_round_gives_theirs_slot_to_that_hunk_author() {
         let v: Value = serde_json::from_str(&text).unwrap();
         match v["type"].as_str() {
             Some("tick") => confirmed = v["n"].as_i64().unwrap_or(0) as i32,
-            Some("end") => break v,
+            Some("end") => {
+                assert_eq!(
+                    v["round"].as_u64(),
+                    Some(0),
+                    "first end should be round 0, got {v}"
+                );
+                break v;
+            }
             Some("error") => panic!("server error {}", v["message"]),
             _ => {}
         }

@@ -381,7 +381,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     let conn_id = uuid::Uuid::new_v4().as_u128() as u64;
     let tx = state.room_tx(&row).await;
 
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(512);
     let _ = tx
         .send(RoomEvent::Join {
             conn_id,

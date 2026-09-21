@@ -215,7 +215,7 @@ The server confirms tick `n` when both slots have an input for `n`, or when the 
 Tick { n, ours, theirs }
 ```
 
-to every client, including spectators. Everyone, server included, applies those two inputs and steps one tick. After the step the server records `(n, ours, theirs)` in `match_inputs` and may send `Hash { n, state_hash }` so a desynced client can see it is wrong. After Hello (catch-up) and after Hash, the server may send `Snapshot { round, seed, confirmed_tick, stats, ticks }` with the confirmed input log for the current round. A desynced client does not get to overrule the server; it should resync from that snapshot or reload.
+to every client, including spectators. Everyone, server included, applies those two inputs and steps one tick. After the step the server records `(n, ours, theirs)` in `match_inputs` and may send `Hash { n, state_hash }` so a desynced client can see it is wrong. After Hello, the server sends `Snapshot { round, seed, confirmed_tick, stats, ticks }` with the confirmed input log for the current round so a joiner or reconnect can catch up in one message. A desynced client does not get to overrule the server; it should resync from that snapshot (reconnect) or reload.
 
 `--lag-ms` delays that broadcast (and inbound `Input`) by the requested milliseconds.
 
