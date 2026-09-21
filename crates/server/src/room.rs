@@ -114,7 +114,8 @@ async fn run_room(
     let mut pending_ours: BTreeMap<u32, u8> = BTreeMap::new();
     let mut pending_theirs: BTreeMap<u32, u8> = BTreeMap::new();
     let mut started_at: Option<Instant> = None;
-    let mut done = sim.result.is_some() || row.status == "finished" || row.status == "expired";
+    let mut done =
+        sim.result.is_some() || matches!(row.status.as_str(), "finished" | "expired" | "aborted");
     let mut mirror = false;
     let id = row.id.clone();
     let ours_name = row.ours_name.clone();
@@ -430,8 +431,11 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
     let hash_s = format!("{hi:08x}{lo:08x}");
-    if match_over {
-        let _ = db::set_status(a.pool, a.id, "finished", true, true, Some(&hash_s), None).await;
+    if match_over
+        && db::finish_open_match(a.pool, a.id, &hash_s)
+            .await
+            .unwrap_or(false)
+    {
         if let Some(ctx) = a.result {
             let id = a.id.to_string();
             tokio::spawn(async move {
@@ -489,6 +493,14 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     false
 }
 
+fn terminal_ws_error(row: &MatchRow) -> String {
+    if row.abort_reason.as_deref() == Some("outdated") {
+        "outdated".into()
+    } else {
+        row.status.clone()
+    }
+}
+
 async fn expire_now(
     pool: &SqlitePool,
     id: &str,
@@ -496,12 +508,14 @@ async fn expire_now(
     result: Option<&ResultCtx>,
 ) {
     let row = db::get_match(pool, id).await.ok().flatten();
-    if row.as_ref().is_some_and(|r| r.status == "expired") {
-        let msg = encode(&ServerMsg::Error {
-            message: "expired".into(),
-        });
-        broadcast(conns, &msg).await;
-        return;
+    if let Some(row) = row.as_ref() {
+        if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
+            let msg = encode(&ServerMsg::Error {
+                message: terminal_ws_error(row),
+            });
+            broadcast(conns, &msg).await;
+            return;
+        }
     }
     let _ = db::set_status(pool, id, "expired", false, true, None, Some("expired")).await;
     if let (Some(ctx), Some(row)) = (result, row) {

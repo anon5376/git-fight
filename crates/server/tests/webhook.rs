@@ -2037,6 +2037,42 @@ async fn pr_synchronize_moved_sha_comments_once() {
         patched[0].contains("outdated") && patched[0].contains("/fight"),
         "{patched:?}"
     );
+    let drifted = git_fight_server::db::get_match(&pool, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(drifted.status, "aborted");
+    assert_eq!(drifted.abort_reason.as_deref(), Some("outdated"));
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "outdated match must free the PR slot for a rematch"
+    );
+
+    git_fight_server::db::insert_session(&pool, "sid-alice", 1, "alice")
+        .await
+        .unwrap();
+    let cookie = git_fight_server::sign_session(SESSION_KEY, "sid-alice");
+    let ws_url = format!("ws://{addr}/ws?match={id}");
+    let mut req = ws_url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cookie", format!("git_fight_sid={cookie}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("ws timeout")
+        .expect("ws closed")
+        .unwrap();
+    let Message::Text(text) = err else {
+        panic!("expected text error, got {err:?}");
+    };
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["type"].as_str(), Some("error"));
+    assert_eq!(v["message"].as_str(), Some("outdated"), "{v}");
+
     assert_eq!(
         post_signed(
             addr,
@@ -2063,6 +2099,53 @@ async fn pr_synchronize_moved_sha_comments_once() {
         1,
         "outdated notice must not edit again: {patched:?}"
     );
+
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-rematch", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 2).await;
+    assert_eq!(
+        comments.len(),
+        2,
+        "rematch must post a new challenge: {comments:?}"
+    );
+    let rematch_id = comments
+        .iter()
+        .filter_map(|t| {
+            t.split("/match/")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .find(|mid| *mid != id)
+        .expect("rematch /match/");
+    assert_ne!(rematch_id, id, "{comments:?}");
+    let rematch = git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rematch.id, rematch_id);
+    assert_eq!(rematch.status, "pending");
+
+    assert_eq!(
+        post_signed(
+            addr,
+            "pull_request",
+            "deliv-sync-same-after-rematch",
+            &pr_event_body("synchronize", &head, &base)
+        )
+        .await,
+        200
+    );
+    let comments = settle_posted(&mock).await;
+    let patched = settle_patched(&mock).await;
+    assert_eq!(
+        comments.len(),
+        2,
+        "same-SHA sync must not comment: {comments:?}"
+    );
+    assert_eq!(patched.len(), 1, "same-SHA sync must not edit: {patched:?}");
 }
 
 #[tokio::test]
@@ -2250,6 +2333,12 @@ async fn failed_clone_aborts_open_match() {
     assert!(
         comments.iter().any(|t| t.contains("could not start")),
         "{comments:?}"
+    );
+    assert!(
+        comments
+            .iter()
+            .all(|t| !t.contains("/nope") && !t.contains("fatal:")),
+        "clone stderr must not land on the PR: {comments:?}"
     );
     assert!(
         git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)

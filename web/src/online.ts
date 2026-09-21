@@ -405,7 +405,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
       ui.wait.classList.remove("hidden");
-      const terminal = err.message === "expired" || err.message === "aborted" || err.message === "not found";
+      const terminal = err.message === "expired" || err.message === "aborted" || err.message === "not found" || err.message === "outdated";
       if (err.message === "preparing") {
         preparing = true;
         ui.wait.textContent = "preparing match…";
@@ -413,6 +413,9 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       } else if (err.message === "expired") {
         preparing = false;
         ui.wait.textContent = "this match expired";
+      } else if (err.message === "outdated") {
+        preparing = false;
+        ui.wait.textContent = "PR moved — comment /fight for a rematch";
       } else if (err.message === "aborted") {
         preparing = false;
         ui.wait.textContent = "this match could not start";

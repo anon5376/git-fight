@@ -362,6 +362,50 @@ pub async fn set_status(
     Ok(())
 }
 
+/// Abort a still-open match so a rematch `/fight` can start. No-op if finished.
+pub async fn abort_open_match(
+    pool: &SqlitePool,
+    id: &str,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query(
+        "UPDATE matches SET status = 'aborted',
+            finished_at = ?,
+            abort_reason = COALESCE(?, abort_reason)
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
+    )
+    .bind(&now)
+    .bind(reason)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Mark a match finished only if it is still open (not aborted/expired).
+pub async fn finish_open_match(
+    pool: &SqlitePool,
+    id: &str,
+    hash: &str,
+) -> Result<bool, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query(
+        "UPDATE matches SET status = 'finished',
+            started_at = COALESCE(started_at, ?),
+            finished_at = ?,
+            final_hash = COALESCE(?, final_hash)
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(hash)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     let rows = sqlx::query_as::<_, (String,)>(
@@ -1014,6 +1058,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(open.id, "open2");
+    }
+
+    #[tokio::test]
+    async fn abort_open_match_does_not_clobber_finished() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "fin1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(finish_open_match(&pool, "fin1", "deadbeef").await.unwrap());
+        assert!(!abort_open_match(&pool, "fin1", "outdated").await.unwrap());
+        let row = get_match(&pool, "fin1").await.unwrap().unwrap();
+        assert_eq!(row.status, "finished");
+        assert_eq!(row.final_hash.as_deref(), Some("deadbeef"));
+        assert!(row.abort_reason.is_none());
     }
 
     #[tokio::test]

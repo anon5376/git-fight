@@ -129,6 +129,13 @@ impl AppState {
             })
             .clone()
     }
+
+    pub(crate) async fn close_room(&self, id: &str) {
+        let mut rooms = self.rooms.lock().await;
+        if let Some(tx) = rooms.remove(id) {
+            let _ = tx.send(RoomEvent::Shutdown).await;
+        }
+    }
 }
 
 pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> std::io::Result<()> {
@@ -407,7 +414,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         return;
     };
     if matches!(row.status.as_str(), "expired" | "aborted") {
-        reject_socket(socket, &row.status).await;
+        let message = if row.abort_reason.as_deref() == Some("outdated") {
+            "outdated"
+        } else {
+            row.status.as_str()
+        };
+        reject_socket(socket, message).await;
         return;
     }
     if row.pr_number > 0 {

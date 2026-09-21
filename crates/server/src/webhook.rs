@@ -147,14 +147,22 @@ async fn notice_if_outdated(
     if head.eq_ignore_ascii_case(&row.pr_head_sha) && base.eq_ignore_ascii_case(&row.pr_base_sha) {
         return;
     }
-    let _ = db::set_result_branch(&state.pool, &row.id, None, Some("outdated")).await;
+    if !db::abort_open_match(&state.pool, &row.id, "outdated")
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
     let Some(inst) = hook.installation.as_ref().map(|i| i.id) else {
+        state.close_room(&row.id).await;
         return;
     };
     let Some(gh) = &state.github else {
+        state.close_room(&row.id).await;
         return;
     };
     let Some(repo) = &hook.repository else {
+        state.close_room(&row.id).await;
         return;
     };
     let public = state.auth.public_url.trim_end_matches('/');
@@ -172,6 +180,7 @@ async fn notice_if_outdated(
             &body,
         )
         .await;
+    state.close_room(&row.id).await;
 }
 
 async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64) -> HttpStatus {
@@ -200,8 +209,8 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         };
         let start = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
             Ok(msg) => msg,
-            Err(e) => challenge::ChallengeStart {
-                body: format!("git fight could not start: {e}"),
+            Err(_) => challenge::ChallengeStart {
+                body: "git fight could not start".into(),
                 match_id: None,
             },
         };

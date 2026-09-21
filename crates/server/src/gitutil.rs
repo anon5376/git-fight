@@ -418,6 +418,9 @@ fn parse_blame_author(porcelain: &[u8]) -> (String, String, String) {
 }
 
 async fn fallback_author(dir: &Path, base_sha: &str, path: &str) -> (String, String, String) {
+    if !is_safe_rev(base_sha) || !is_safe_path(path) {
+        return ("theirs".into(), String::new(), String::new());
+    }
     let mut cmd = git_dir(dir);
     cmd.args(["log", "-1", "--format=%an%n%ae%n%H", base_sha, "--", path]);
     if let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await {

@@ -103,6 +103,9 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     if row.result_branch.is_some() {
         return Ok(());
     }
+    if matches!(row.status.as_str(), "aborted" | "expired") || row.abort_reason.is_some() {
+        return Ok(());
+    }
     let hunks = db::list_hunks(&ctx.pool, match_id)
         .await
         .map_err(|e| e.to_string())?;
