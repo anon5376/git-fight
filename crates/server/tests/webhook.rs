@@ -855,8 +855,10 @@ async fn second_fight_while_cloning_gets_open_link() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
     let addr = spawn(cfg_for(&mock, bare)).await;
-    let a = post_signed(addr, "issue_comment", "deliv-race-a", &fight_body());
-    let b = post_signed(addr, "issue_comment", "deliv-race-b", &fight_body());
+    let body_a = fight_body();
+    let body_b = fight_body();
+    let a = post_signed(addr, "issue_comment", "deliv-race-a", &body_a);
+    let b = post_signed(addr, "issue_comment", "deliv-race-b", &body_b);
     let (sa, sb) = tokio::join!(a, b);
     assert_eq!(sa, 200);
     assert_eq!(sb, 200);
