@@ -217,7 +217,6 @@ async fn run_room(
                                 github,
                                 &mut ours,
                                 &mut theirs,
-                                started_at.is_some(),
                             );
                             if ours.seen && theirs.seen && started_at.is_none() {
                                 if db::start_open_match(&pool, &id).await.unwrap_or(false) {
@@ -276,7 +275,6 @@ async fn run_room(
                                 github,
                                 &mut ours,
                                 &mut theirs,
-                                started_at.is_some(),
                             );
                         }
                     }
@@ -402,16 +400,21 @@ async fn advance(a: Advance<'_>) -> bool {
         return finish(a, result, false).await;
     }
 
-    if let Some(at) = a.ours.disconnected_at {
-        if at.elapsed() >= a.disconnect {
-            a.sim.forfeit(Side::Ours);
-            return finish(a, RoundResult::Theirs, true).await;
+    // Disconnect forfeit is only for someone who already occupied a slot
+    // after the match started. A fighter who has not shown up yet waits
+    // until expires_at (24h), not 30 seconds.
+    if a.started_at.is_some() {
+        if let Some(at) = a.ours.disconnected_at {
+            if at.elapsed() >= a.disconnect {
+                a.sim.forfeit(Side::Ours);
+                return finish(a, RoundResult::Theirs, true).await;
+            }
         }
-    }
-    if let Some(at) = a.theirs.disconnected_at {
-        if at.elapsed() >= a.disconnect {
-            a.sim.forfeit(Side::Theirs);
-            return finish(a, RoundResult::Ours, true).await;
+        if let Some(at) = a.theirs.disconnected_at {
+            if at.elapsed() >= a.disconnect {
+                a.sim.forfeit(Side::Theirs);
+                return finish(a, RoundResult::Ours, true).await;
+            }
         }
     }
 
@@ -550,7 +553,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
         false,
     );
     refresh_slots(
-        a.conns, a.row, a.hunks, *a.round, a.github, a.ours, a.theirs, true,
+        a.conns, a.row, a.hunks, *a.round, a.github, a.ours, a.theirs,
     );
     *a.started_at = Some(Instant::now());
     for conn in a.conns.values() {
@@ -816,12 +819,19 @@ fn apply_round_identity(
         theirs.seen = true;
         theirs.disconnected_at = None;
     } else if !initial {
-        theirs.seen = false;
         theirs.disconnected_at = None;
+        // A new blamed author has not occupied this slot. Keep `seen`
+        // false so apply_presence does not start a disconnect clock.
+        if github && round > 0 {
+            let prev = db::theirs_login_for_round(hunks, round - 1, row.theirs_login.as_deref());
+            let new = db::theirs_login_for_round(hunks, round, row.theirs_login.as_deref());
+            if !crate::gh::same_github_login(prev, new) {
+                theirs.seen = false;
+            }
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refresh_slots(
     conns: &BTreeMap<u64, Conn>,
     row: &MatchRow,
@@ -830,7 +840,6 @@ fn refresh_slots(
     github: bool,
     ours: &mut Slot,
     theirs: &mut Slot,
-    match_started: bool,
 ) {
     let mut ours_here = ours.kind_cpu;
     let mut theirs_here = theirs.kind_cpu;
@@ -845,11 +854,14 @@ fn refresh_slots(
             Role::Spectator => {}
         }
     }
-    apply_presence(ours, ours_here, match_started);
-    apply_presence(theirs, theirs_here, match_started);
+    apply_presence(ours, ours_here);
+    apply_presence(theirs, theirs_here);
 }
 
-fn apply_presence(slot: &mut Slot, here: bool, match_started: bool) {
+/// Start the 30s rejoin clock only after this login has occupied the slot.
+/// `match_started` must not count: a later-round blamed author who has never
+/// been here is "never showed up" (wait until expires_at), not a disconnect.
+fn apply_presence(slot: &mut Slot, here: bool) {
     if here {
         slot.seen = true;
         slot.disconnected_at = None;
@@ -859,7 +871,7 @@ fn apply_presence(slot: &mut Slot, here: bool, match_started: bool) {
         slot.disconnected_at = None;
         return;
     }
-    if (slot.seen || match_started) && slot.disconnected_at.is_none() {
+    if slot.seen && slot.disconnected_at.is_none() {
         slot.disconnected_at = Some(Instant::now());
     }
 }
@@ -886,5 +898,123 @@ mod tests {
         })
         .await;
         assert!(hung.is_ok(), "broadcast waited on a full spectator buffer");
+    }
+
+    #[test]
+    fn unseen_slot_does_not_start_disconnect_clock() {
+        let mut slot = Slot {
+            kind_cpu: false,
+            seen: false,
+            disconnected_at: None,
+        };
+        apply_presence(&mut slot, false);
+        assert!(
+            slot.disconnected_at.is_none(),
+            "a login that has not occupied the slot is not on the 30s clock"
+        );
+        assert!(!slot.seen);
+    }
+
+    #[test]
+    fn seen_fighter_who_left_starts_disconnect_clock() {
+        let mut slot = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: None,
+        };
+        apply_presence(&mut slot, false);
+        assert!(slot.disconnected_at.is_some());
+        assert!(slot.seen);
+    }
+
+    #[test]
+    fn later_round_author_clears_seen() {
+        let row = MatchRow {
+            id: "m".into(),
+            seed: "1".into(),
+            status: "in_progress".into(),
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_token: None,
+            theirs_token: None,
+            ours_login: Some("alice".into()),
+            theirs_login: Some("bob".into()),
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+            installation_id: None,
+            input_delay_ticks: 3,
+            created_at: String::new(),
+            expires_at: String::new(),
+            result_branch: None,
+            final_hash: None,
+            abort_reason: None,
+            challenge_comment_id: None,
+        };
+        let hunks = vec![
+            db::HunkRow {
+                round_index: 0,
+                path: "a.rs".into(),
+                hunk_index: 0,
+                winner: None,
+                theirs_name: Some("bob".into()),
+                theirs_login: Some("bob".into()),
+                ours_hp: 100,
+                ours_armor: false,
+                ours_special: false,
+                theirs_hp: 100,
+                theirs_armor: false,
+                theirs_special: false,
+            },
+            db::HunkRow {
+                round_index: 1,
+                path: "b.rs".into(),
+                hunk_index: 0,
+                winner: None,
+                theirs_name: Some("carol".into()),
+                theirs_login: Some("carol".into()),
+                ours_hp: 100,
+                ours_armor: false,
+                ours_special: false,
+                theirs_hp: 100,
+                theirs_armor: false,
+                theirs_special: false,
+            },
+        ];
+        let mut ours = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: None,
+        };
+        let mut theirs = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: Some(Instant::now()),
+        };
+        let mut theirs_name = String::from("bob");
+        let mut mirror = false;
+        apply_round_identity(
+            &row,
+            &hunks,
+            1,
+            true,
+            &mut ours,
+            &mut theirs,
+            &mut theirs_name,
+            &mut mirror,
+            false,
+        );
+        assert!(!theirs.seen, "carol has not occupied the right slot");
+        assert!(theirs.disconnected_at.is_none());
+        assert_eq!(theirs_name, "carol");
+        apply_presence(&mut theirs, false);
+        assert!(
+            theirs.disconnected_at.is_none(),
+            "carol must not be forfeited before she joins"
+        );
     }
 }

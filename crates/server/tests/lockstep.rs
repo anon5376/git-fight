@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
@@ -1227,6 +1228,224 @@ async fn forfeit_round_then_return_plays_later_round() {
 }
 
 #[tokio::test]
+async fn later_round_author_is_not_forfeited_before_they_join() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = git_fight_server::test_tmp_dir("gf-later-author");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "laterauth01laterauth01laterauth0";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 7,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: Some("alice".into()),
+            theirs_login: Some("bob".into()),
+            ours_token: String::new(),
+            theirs_token: String::new(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 0,
+            path: "a.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: Some("bob"),
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 1,
+            path: "b.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: Some("carol"),
+            theirs_name: Some("carol"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-alice", 1, "alice")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-bob", 2, "bob")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-carol", 3, "carol")
+        .await
+        .unwrap();
+    let key = git_fight_server::Auth::default().session_key;
+    let alice_c = git_fight_server::sign_session(&key, "sid-alice");
+    let bob_c = git_fight_server::sign_session(&key, "sid-bob");
+    let carol_c = git_fight_server::sign_session(&key, "sid-carol");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                disconnect: Duration::from_millis(80),
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (mut alice_sink, mut alice_stream) = connect_cookie(addr, id, &alice_c).await;
+    let (mut bob_sink, mut bob_stream) = connect_cookie(addr, id, &bob_c).await;
+    let alice_h = wait_type(&mut alice_stream, "hello").await;
+    let bob_h = wait_type(&mut bob_stream, "hello").await;
+    assert_eq!(alice_h["your_role"].as_str(), Some("ours"), "{alice_h}");
+    assert_eq!(bob_h["your_role"].as_str(), Some("theirs"), "{bob_h}");
+
+    let mut next_send = 0u32;
+    let mut confirmed: i32 = -1;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let horizon = u32::try_from(confirmed.saturating_add(1)).unwrap_or(0) + 24;
+        while next_send <= horizon {
+            let punch = format!(r#"{{"type":"input","tick":{next_send},"buttons":2,"round":0}}"#);
+            let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0,"round":0}}"#);
+            alice_sink.send(Message::Text(punch.into())).await.unwrap();
+            bob_sink.send(Message::Text(idle.into())).await.unwrap();
+            next_send = next_send.saturating_add(1);
+        }
+        let msg = tokio::time::timeout_at(deadline, alice_stream.next())
+            .await
+            .expect("timeout waiting for round 0")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("tick") => confirmed = v["n"].as_i64().unwrap_or(0) as i32,
+            Some("end") => {
+                assert_eq!(v["round"].as_u64(), Some(0));
+                assert_eq!(v["match_over"].as_bool(), Some(false));
+                break;
+            }
+            Some("error") => panic!("server error {}", v["message"]),
+            _ => {}
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    while let Ok(Some(msg)) =
+        tokio::time::timeout(Duration::from_millis(20), alice_stream.next()).await
+    {
+        let Message::Text(text) = msg.unwrap() else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        if v["type"].as_str() == Some("end") && v["round"].as_u64() == Some(1) {
+            panic!("carol was forfeited before she joined: {v}");
+        }
+    }
+    let hunks = git_fight_server::db::list_hunks(&pool, id).await.unwrap();
+    assert_eq!(hunks.len(), 2);
+    assert!(hunks[0].winner.is_some(), "round 0 should have a winner");
+    assert_ne!(
+        hunks[0].winner.as_deref(),
+        Some("forfeit_ours"),
+        "{:?}",
+        hunks[0].winner
+    );
+    assert!(
+        hunks[1].winner.is_none(),
+        "later-round author must not be auto-forfeited: {:?}",
+        hunks[1].winner
+    );
+
+    let (mut carol_sink, mut carol_stream) = connect_cookie(addr, id, &carol_c).await;
+    let carol_h = wait_type(&mut carol_stream, "hello").await;
+    assert_eq!(carol_h["your_role"].as_str(), Some("theirs"), "{carol_h}");
+    assert_eq!(carol_h["round"].as_u64(), Some(1), "{carol_h}");
+
+    next_send = 0;
+    confirmed = -1;
+    let play = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let horizon = u32::try_from(confirmed.saturating_add(1)).unwrap_or(0) + 24;
+        while next_send <= horizon {
+            let punch = format!(r#"{{"type":"input","tick":{next_send},"buttons":2,"round":1}}"#);
+            let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0,"round":1}}"#);
+            alice_sink.send(Message::Text(punch.into())).await.unwrap();
+            carol_sink.send(Message::Text(idle.into())).await.unwrap();
+            next_send = next_send.saturating_add(1);
+        }
+        let msg = tokio::time::timeout_at(play, alice_stream.next())
+            .await
+            .expect("timeout waiting for carol's round")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("tick") => confirmed = v["n"].as_i64().unwrap_or(0) as i32,
+            Some("end") => {
+                assert_eq!(v["round"].as_u64(), Some(1));
+                assert_eq!(v["match_over"].as_bool(), Some(true));
+                break;
+            }
+            Some("error") => panic!("server error {}", v["message"]),
+            _ => {}
+        }
+    }
+    let done = git_fight_server::db::list_hunks(&pool, id).await.unwrap();
+    assert_eq!(
+        done[1].winner.as_deref(),
+        Some("ours"),
+        "{:?}",
+        done[1].winner
+    );
+}
+
+#[tokio::test]
 async fn previous_round_input_does_not_steer_the_next_round() {
     use git_fight_server::db::{NewHunk, NewMatch};
     let dir = std::env::temp_dir().join(format!(
@@ -1407,6 +1626,27 @@ async fn previous_round_input_does_not_steer_the_next_round() {
         serde_json::json!([0, 0]),
         "stale round-0 special must not confirm as round 1 tick 5"
     );
+}
+
+async fn connect_cookie(
+    addr: std::net::SocketAddr,
+    match_id: &str,
+    cookie: &str,
+) -> (
+    futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        Message,
+    >,
+    futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    >,
+) {
+    let url = format!("ws://{addr}/ws?match={match_id}");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cookie", format!("git_fight_sid={cookie}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.split()
 }
 
 async fn spawn_server(cfg: Config) -> std::net::SocketAddr {
