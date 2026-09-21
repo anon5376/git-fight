@@ -51,8 +51,8 @@ pub fn role_for(
         let Some(login) = login else {
             return Role::Spectator;
         };
-        let ours = ours_login == Some(login);
-        let theirs = theirs_login == Some(login);
+        let ours = ours_login.is_some_and(|o| o.eq_ignore_ascii_case(login));
+        let theirs = theirs_login.is_some_and(|t| t.eq_ignore_ascii_case(login));
         return match (ours, theirs) {
             (true, true) => Role::Both,
             (true, false) => Role::Ours,
@@ -89,10 +89,14 @@ pub fn can_enqueue_input(
         let Some(login) = login.filter(|s| !s.is_empty()) else {
             return false;
         };
-        if ours_login == Some(login) || match_theirs_login == Some(login) {
+        if ours_login.is_some_and(|o| o.eq_ignore_ascii_case(login))
+            || match_theirs_login.is_some_and(|t| t.eq_ignore_ascii_case(login))
+        {
             return true;
         }
-        return hunk_theirs_logins.contains(&login);
+        return hunk_theirs_logins
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(login));
     }
     role_for(false, None, None, login, token, ours_token, theirs_token) != Role::Spectator
 }
@@ -248,6 +252,56 @@ mod tests {
             Some("ours-token"),
             Some("theirs-token")
         ));
+        assert_eq!(
+            role_for(
+                true,
+                Some("Alice"),
+                Some("Bob"),
+                Some("alice"),
+                None,
+                None,
+                None
+            ),
+            Role::Ours,
+            "GitHub logins are case-insensitive"
+        );
+        assert_eq!(
+            role_for(
+                true,
+                Some("alice"),
+                Some("BOB"),
+                Some("bob"),
+                None,
+                None,
+                None
+            ),
+            Role::Theirs
+        );
+        assert_eq!(
+            role_for(
+                true,
+                Some("Alice"),
+                Some("ALICE"),
+                Some("alice"),
+                None,
+                None,
+                None
+            ),
+            Role::Both
+        );
+        assert!(
+            can_enqueue_input(
+                true,
+                Some("Alice"),
+                Some("Bob"),
+                &["Carol"],
+                Some("carol"),
+                None,
+                None,
+                None
+            ),
+            "later-round theirs matches regardless of case"
+        );
         assert_eq!(round_seed(7, 0), 7);
         assert_eq!(round_seed(7, 1), 14);
     }

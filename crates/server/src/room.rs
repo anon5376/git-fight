@@ -795,11 +795,12 @@ fn apply_round_identity(
     if github {
         let ours_login = row.ours_login.as_deref();
         let t_login = db::theirs_login_for_round(hunks, round, row.theirs_login.as_deref());
-        *mirror = t_login.is_some() && t_login == ours_login;
+        *mirror = crate::gh::same_github_login(t_login, ours_login);
         ours.kind_cpu = row.ours_kind == "cpu";
         theirs.kind_cpu = !*mirror
             && (t_login.is_none()
-                || (row.theirs_kind == "cpu" && t_login == row.theirs_login.as_deref()));
+                || (row.theirs_kind == "cpu"
+                    && crate::gh::same_github_login(t_login, row.theirs_login.as_deref())));
     } else {
         *mirror = row.ours_kind == "mirror" || row.theirs_kind == "mirror";
         ours.kind_cpu = row.ours_kind == "cpu";

@@ -450,7 +450,7 @@ impl GitHub {
         }
         row.author
             .and_then(|a| a.login)
-            .filter(|l| is_safe_github_name(l))
+            .and_then(|l| normalize_github_login(&l))
     }
 
     pub async fn login_for_email(
@@ -503,7 +503,7 @@ impl GitHub {
                 if let Some(login) = row
                     .author
                     .and_then(|a| a.login)
-                    .filter(|l| is_safe_github_name(l))
+                    .and_then(|l| normalize_github_login(&l))
                 {
                     return Some(login);
                 }
@@ -568,10 +568,8 @@ impl GitHub {
         let user: User = json_capped(user_res, MAX_TOKEN_JSON)
             .await
             .ok_or_else(|| "user json".to_string())?;
-        if !is_safe_github_name(&user.login) {
-            return Err("bad login".into());
-        }
-        Ok((user.id, user.login))
+        let login = normalize_github_login(&user.login).ok_or_else(|| "bad login".to_string())?;
+        Ok((user.id, login))
     }
 
     pub fn authorize_url(&self, redirect_uri: &str, state: &str, code_challenge: &str) -> String {
@@ -655,6 +653,20 @@ pub fn is_safe_github_name(s: &str) -> bool {
         && !s.contains("..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// GitHub logins are case-insensitive. Store one spelling so a fighter
+/// cannot be locked out of their slot or split on the leaderboard.
+pub fn normalize_github_login(s: &str) -> Option<String> {
+    let t = s.trim();
+    is_safe_github_name(t).then(|| t.to_ascii_lowercase())
+}
+
+pub fn same_github_login(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
 }
 
 fn is_safe_git_ref(s: &str) -> bool {
@@ -777,6 +789,19 @@ mod tests {
         drop_expired_tokens(&mut cache, now);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&1).map(|(t, _)| t.as_str()), Some("live"));
+    }
+
+    #[test]
+    fn github_logins_fold_case() {
+        assert_eq!(normalize_github_login("Alice").as_deref(), Some("alice"));
+        assert_eq!(normalize_github_login("  BOB  ").as_deref(), Some("bob"));
+        assert!(normalize_github_login("").is_none());
+        assert!(normalize_github_login("../x").is_none());
+        assert!(same_github_login(Some("Alice"), Some("alice")));
+        assert!(same_github_login(Some("BOB"), Some("bob")));
+        assert!(!same_github_login(Some("alice"), Some("bob")));
+        assert!(!same_github_login(Some("alice"), Some("")));
+        assert!(!same_github_login(None, Some("alice")));
     }
 
     #[test]

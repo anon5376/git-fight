@@ -127,7 +127,10 @@ pub async fn start_challenge(
         return Ok(note("git fight could not start"));
     }
 
-    let ours_login = pr.user.login.clone();
+    let display_login = pr.user.login.clone();
+    let Some(ours_login) = crate::gh::normalize_github_login(&display_login) else {
+        return Ok(note("git fight could not start"));
+    };
     let id = uuid::Uuid::new_v4().simple().to_string();
     let seed = uuid::Uuid::new_v4().as_u128() as u64;
     // Share tokens are local-demo only. GitHub matches assign roles from the session.
@@ -137,7 +140,7 @@ pub async fn start_challenge(
             id: id.clone(),
             seed,
             delay: INPUT_DELAY,
-            ours_name: ours_login.clone(),
+            ours_name: display_login.clone(),
             theirs_name: "theirs".into(),
             ours_kind: "github".into(),
             theirs_kind: "cpu".into(),
@@ -277,7 +280,7 @@ pub async fn start_challenge(
                 let ours_author =
                     gitutil::latest_author(&dest, &pr.head.sha, &h.path, bearer.as_deref())
                         .await
-                        .unwrap_or_else(|| ours_login.clone());
+                        .unwrap_or_else(|| display_login.clone());
                 let ours_stats = gitutil::fighter_stats(
                     &dest,
                     &pr.head.sha,
@@ -377,11 +380,11 @@ pub async fn start_challenge(
 
     let rounds = hunks.len();
     let vs = if theirs_kind == "cpu" {
-        format!("{ours_login} vs {theirs_name} (CPU)")
+        format!("{display_login} vs {theirs_name} (CPU)")
     } else if theirs_kind == "mirror" {
-        format!("{ours_login} vs {ours_login} (mirror)")
+        format!("{display_login} vs {display_login} (mirror)")
     } else {
-        format!("{ours_login} vs {theirs_name}")
+        format!("{display_login} vs {theirs_name}")
     };
     let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
     if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
@@ -446,8 +449,16 @@ fn side_from_blame(
     blame_name: &str,
 ) -> (String, String, Option<String>) {
     match login {
-        Some(l) if l == ours_login => ("mirror".into(), ours_login.to_string(), Some(l)),
-        Some(l) => ("github".into(), l.clone(), Some(l)),
+        Some(l) if l.eq_ignore_ascii_case(ours_login) => {
+            let stored = crate::gh::normalize_github_login(&l)
+                .unwrap_or_else(|| ours_login.to_ascii_lowercase());
+            ("mirror".into(), ours_login.to_string(), Some(stored))
+        }
+        Some(l) => {
+            let stored =
+                crate::gh::normalize_github_login(&l).unwrap_or_else(|| l.to_ascii_lowercase());
+            ("github".into(), l, Some(stored))
+        }
         None => ("cpu".into(), blame_name.to_string(), None),
     }
 }
@@ -469,6 +480,18 @@ mod tests {
         assert!(is_bot_user(Some("Bot"), Some("git-fight[bot]")));
         assert!(is_bot_user(Some("User"), Some("foo[bot]")));
         assert!(!is_bot_user(Some("User"), Some("alice")));
+    }
+
+    #[test]
+    fn blame_login_case_is_the_same_fighter() {
+        let (kind, name, login) = side_from_blame("alice", Some("Alice".into()), "Alice");
+        assert_eq!(kind, "mirror");
+        assert_eq!(name, "alice");
+        assert_eq!(login.as_deref(), Some("alice"));
+        let (kind, name, login) = side_from_blame("alice", Some("Bob".into()), "Bob");
+        assert_eq!(kind, "github");
+        assert_eq!(name, "Bob");
+        assert_eq!(login.as_deref(), Some("bob"));
     }
 
     #[tokio::test]

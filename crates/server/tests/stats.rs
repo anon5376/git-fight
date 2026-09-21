@@ -101,6 +101,88 @@ async fn ko_win_updates_wins_losses_kos_and_conflicts_caused() {
 }
 
 #[tokio::test]
+async fn login_case_does_not_split_the_leaderboard() {
+    let pool = pool().await;
+    seed(&pool, "m-case", Some("Alice"), Some("BOB"), "acme", "box").await;
+    git_fight_server::record_round(&pool, "m-case", 0, "ours", true)
+        .await
+        .unwrap();
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: "m-case-2".into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: Some("alice".into()),
+            theirs_login: Some("bob".into()),
+            ours_token: "o".into(),
+            theirs_token: "t".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: 2,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: "m-case-2",
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: Some("bob"),
+            theirs_name: Some("bob"),
+            ours_stats: Default::default(),
+            theirs_stats: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::record_round(&pool, "m-case-2", 0, "ours", false)
+        .await
+        .unwrap();
+    let board = git_fight_server::db::list_player_stats(&pool, "acme", "box")
+        .await
+        .unwrap();
+    assert_eq!(
+        board,
+        vec![
+            PlayerStat {
+                github_login: "alice".into(),
+                wins: 2,
+                losses: 0,
+                kos: 1,
+                conflicts_caused: 0,
+            },
+            PlayerStat {
+                github_login: "bob".into(),
+                wins: 0,
+                losses: 2,
+                kos: 0,
+                conflicts_caused: 2,
+            },
+        ]
+    );
+    let alice = git_fight_server::db::get_player_stats(&pool, "acme", "box", "ALICE")
+        .await
+        .unwrap();
+    assert_eq!(alice.wins, 2);
+    assert_eq!(alice.github_login, "alice");
+}
+
+#[tokio::test]
 async fn aborted_match_does_not_record_stats() {
     let pool = pool().await;
     seed(&pool, "m-ab", Some("alice"), Some("bob"), "acme", "box").await;

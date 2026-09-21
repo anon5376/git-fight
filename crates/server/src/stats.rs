@@ -45,10 +45,13 @@ pub async fn record_round(
 
     let mut delta: BTreeMap<String, [i64; 4]> = BTreeMap::new();
     let bump = |map: &mut BTreeMap<String, [i64; 4]>, login: Option<&str>, d: [i64; 4]| {
-        let Some(login) = login.map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(login) = login
+            .and_then(crate::gh::normalize_github_login)
+            .filter(|s| !s.is_empty())
+        else {
             return;
         };
-        let slot = map.entry(login.to_string()).or_insert([0, 0, 0, 0]);
+        let slot = map.entry(login).or_insert([0, 0, 0, 0]);
         for i in 0..4 {
             slot[i] += d[i];
         }

@@ -926,6 +926,8 @@ pub async fn insert_session(
 ) -> Result<(), sqlx::Error> {
     let now = Utc::now();
     let expires = now + Duration::seconds(crate::limits::SESSION_TTL_SECS);
+    let login = crate::gh::normalize_github_login(login)
+        .unwrap_or_else(|| login.trim().to_ascii_lowercase());
     sqlx::query(
         "INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?)",
@@ -1052,6 +1054,8 @@ pub async fn add_player_stats(
     repo: &str,
     stat: &PlayerStat,
 ) -> Result<(), sqlx::Error> {
+    let login = crate::gh::normalize_github_login(&stat.github_login)
+        .unwrap_or_else(|| stat.github_login.trim().to_ascii_lowercase());
     sqlx::query(
         "INSERT INTO player_stats (owner, repo, github_login, wins, losses, kos, conflicts_caused)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1063,7 +1067,7 @@ pub async fn add_player_stats(
     )
     .bind(owner)
     .bind(repo)
-    .bind(&stat.github_login)
+    .bind(login)
     .bind(stat.wins)
     .bind(stat.losses)
     .bind(stat.kos)
@@ -1129,7 +1133,8 @@ pub async fn get_player_stats(
             },
         )
         .unwrap_or(PlayerStat {
-            github_login: login.to_string(),
+            github_login: crate::gh::normalize_github_login(login)
+                .unwrap_or_else(|| login.trim().to_ascii_lowercase()),
             wins: 0,
             losses: 0,
             kos: 0,
@@ -1879,6 +1884,55 @@ mod tests {
         assert_eq!(
             session_login(&pool, "live").await.unwrap().as_deref(),
             Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_and_stats_store_logins_lowercase() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_session(&pool, "s1", 1, "Alice").await.unwrap();
+        assert_eq!(
+            session_login(&pool, "s1").await.unwrap().as_deref(),
+            Some("alice")
+        );
+        add_player_stats(
+            &pool,
+            "acme",
+            "box",
+            &PlayerStat {
+                github_login: "Alice".into(),
+                wins: 1,
+                losses: 0,
+                kos: 0,
+                conflicts_caused: 0,
+            },
+        )
+        .await
+        .unwrap();
+        add_player_stats(
+            &pool,
+            "acme",
+            "box",
+            &PlayerStat {
+                github_login: "ALICE".into(),
+                wins: 1,
+                losses: 0,
+                kos: 1,
+                conflicts_caused: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let board = list_player_stats(&pool, "acme", "box").await.unwrap();
+        assert_eq!(
+            board,
+            vec![PlayerStat {
+                github_login: "alice".into(),
+                wins: 2,
+                losses: 0,
+                kos: 1,
+                conflicts_caused: 0,
+            }]
         );
     }
 

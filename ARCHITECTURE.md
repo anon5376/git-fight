@@ -249,7 +249,7 @@ SQLite via sqlx. Migrations run at server start on a single connection. No secre
 | `pr_head_sha`, `pr_base_sha` | `TEXT` | Frozen at challenge time. |
 | `seed` | `TEXT` | `u64` decimal. |
 | `status` | `TEXT` | `pending` / `in_progress` / `finished` / `expired` / `aborted`. |
-| `ours_login`, `theirs_login` | `TEXT` NULL | GitHub login, or NULL when that side is CPU-only. |
+| `ours_login`, `theirs_login` | `TEXT` NULL | GitHub login stored lowercase, or NULL when that side is CPU-only. Compared case-insensitively. |
 | `ours_name`, `theirs_name` | `TEXT` | Display names (CPU keeps the git author name). |
 | `ours_kind`, `theirs_kind` | `TEXT` | `github` / `cpu` / `mirror`. |
 | `input_delay_ticks` | `INTEGER` | Default 3. |
@@ -295,7 +295,7 @@ Primary key `(match_id, round_index, tick)`. Append-only (`INSERT OR IGNORE`; th
 |---|---|---|
 | `id` | `TEXT` PK | Random. HttpOnly cookie, signed with `SESSION_KEY`. |
 | `github_user_id` | `INTEGER` | |
-| `github_login` | `TEXT` | |
+| `github_login` | `TEXT` | Stored lowercase. GitHub logins are case-insensitive. |
 | `created_at`, `expires_at` | `TEXT` | 14-day TTL. Expired rows are pruned. |
 
 No GitHub access tokens here. Login exchanges the OAuth `code`, calls `GET /user`, stores id + login, discards the token. The `code` is length-capped before the token exchange.
@@ -304,7 +304,7 @@ No GitHub access tokens here. Login exchanges the OAuth `code`, calls `GET /user
 
 Milestone 6. Per repo, per login: `wins`, `losses`, `kos`, `conflicts_caused`. `conflicts_caused` increments for the base-side blamed author of each fought hunk.
 
-Primary key `(owner, repo, github_login)`.
+Primary key `(owner, repo, github_login)`. Logins are stored lowercase so `Alice` and `alice` are one row.
 
 ### `webhook_deliveries`
 
@@ -350,7 +350,7 @@ Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like 
 
 A spectator (or a stranger who found the match URL) sends `Input` for a fighter slot, or spoofs a query param `role=ours`.
 
-**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped **before** they enter the room event queue, so a spectator flood cannot fill the 512-slot channel and stall fighter confirm or Leave. Fighter `Input` is `try_send` (late = idle). CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
+**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. GitHub logins are compared case-insensitively and stored lowercase so a fighter cannot be locked out of their slot or split on the leaderboard. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped **before** they enter the room event queue, so a spectator flood cannot fill the 512-slot channel and stall fighter confirm or Leave. Fighter `Input` is `try_send` (late = idle). CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
 
 ### Hostile repos
 
