@@ -2,6 +2,7 @@
 
 use crate::limits::MAX_FIGHT_YML_BYTES;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +28,8 @@ const MERGEABLE_POLL_CAP: Duration = Duration::from_secs(4);
 const MERGEABLE_POLL_TRIES: u32 = 8;
 /// Contents JSON for a 4 KiB yaml plus GitHub metadata. Bigger is not a config.
 const MAX_CONTENTS_JSON: usize = 16 * 1024;
+/// List-commits JSON (`per_page=1`, no `files` patches). Bigger is hostile.
+const MAX_COMMITS_JSON: usize = 64 * 1024;
 
 impl std::fmt::Debug for GitHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -328,18 +331,6 @@ impl GitHub {
         if !resp.status().is_success() {
             return false;
         }
-        if resp
-            .content_length()
-            .is_some_and(|n| n > MAX_CONTENTS_JSON as u64)
-        {
-            return false;
-        }
-        let Ok(bytes) = resp.bytes().await else {
-            return false;
-        };
-        if bytes.len() > MAX_CONTENTS_JSON {
-            return false;
-        }
         #[derive(Deserialize)]
         struct File {
             #[serde(rename = "type")]
@@ -348,7 +339,7 @@ impl GitHub {
             encoding: Option<String>,
             size: Option<u64>,
         }
-        let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
+        let Some(file) = json_capped::<File>(resp, MAX_CONTENTS_JSON).await else {
             return false;
         };
         if file.kind.as_deref() != Some("file") {
@@ -394,11 +385,15 @@ impl GitHub {
         {
             return None;
         }
+        // List API (no `files` patches). GET /commits/{sha} can be many MB.
         let res = self
             .authed(
                 installation_id,
                 reqwest::Method::GET,
-                &format!("/repos/{owner}/{repo}/commits/{sha}"),
+                &format!(
+                    "/repos/{owner}/{repo}/commits?sha={}&per_page=1",
+                    urlencoding(sha)
+                ),
             )
             .await
             .ok()?
@@ -409,17 +404,21 @@ impl GitHub {
             return None;
         }
         #[derive(Deserialize)]
-        struct Commit {
+        struct Row {
+            sha: Option<String>,
             author: Option<User>,
         }
         #[derive(Deserialize)]
         struct User {
             login: Option<String>,
         }
-        res.json::<Commit>()
-            .await
-            .ok()
-            .and_then(|c| c.author.and_then(|a| a.login))
+        let rows: Vec<Row> = json_capped(res, MAX_COMMITS_JSON).await?;
+        let row = rows.into_iter().next()?;
+        let got = row.sha.as_deref().unwrap_or("");
+        if !got.eq_ignore_ascii_case(sha) {
+            return None;
+        }
+        row.author.and_then(|a| a.login)
     }
 
     pub async fn login_for_email(
@@ -466,7 +465,7 @@ impl GitHub {
         struct GitUser {
             email: Option<String>,
         }
-        let rows: Vec<Row> = res.json().await.ok()?;
+        let rows: Vec<Row> = json_capped(res, MAX_COMMITS_JSON).await?;
         for row in rows {
             if row.commit.author.and_then(|a| a.email).as_deref() == Some(email) {
                 if let Some(login) = row.author.and_then(|a| a.login) {
@@ -539,6 +538,17 @@ impl GitHub {
             urlencoding(code_challenge),
         )
     }
+}
+
+async fn json_capped<T: DeserializeOwned>(resp: reqwest::Response, max: usize) -> Option<T> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() > max {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// GitHub owner or repo name. Used in clone URLs and API paths — never a slash or host.

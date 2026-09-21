@@ -291,3 +291,57 @@ async fn login_for_email_queries_author() {
         });
     assert!(asked, "commits list must filter by author email");
 }
+
+#[tokio::test]
+async fn login_for_commit_uses_list_api_not_files_payload() {
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/acme/box/commits/{sha}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sha": sha,
+            "author": { "login": "from-files-endpoint" },
+            "files": [{ "filename": "huge.rs", "patch": "x".repeat(1024) }]
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "sha": sha,
+            "author": { "login": "bob" }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", sha).await.as_deref(),
+        Some("bob")
+    );
+    let asked = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|r| {
+            r.method.as_str() == "GET"
+                && r.url.path() == "/repos/acme/box/commits"
+                && r.url.query_pairs().any(|(k, v)| k == "sha" && v == sha)
+                && r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "per_page" && v == "1")
+        });
+    assert!(
+        asked,
+        "login_for_commit must use list-commits ?sha=&per_page=1"
+    );
+}

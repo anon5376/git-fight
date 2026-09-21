@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const SECRET: &[u8] = b"webhook-secret-for-tests";
 const APP_PEM: &str = include_str!("fixtures/app_key.txt");
@@ -674,6 +674,40 @@ impl Respond for PullMergeable {
     }
 }
 
+struct HasQueryParam(&'static str);
+
+impl Match for HasQueryParam {
+    fn matches(&self, request: &Request) -> bool {
+        request.url.query_pairs().any(|(k, _)| k == self.0)
+    }
+}
+
+struct CommitShaAuthors {
+    by_sha: Vec<(String, Value)>,
+    default_author: Value,
+}
+
+impl Respond for CommitShaAuthors {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let sha = request
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "sha")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        let author = self
+            .by_sha
+            .iter()
+            .find(|(s, _)| s.eq_ignore_ascii_case(&sha))
+            .map(|(_, a)| a.clone())
+            .unwrap_or_else(|| self.default_author.clone());
+        ResponseTemplate::new(200).set_body_json(json!([{
+            "sha": sha,
+            "author": author,
+        }]))
+    }
+}
+
 async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
@@ -724,25 +758,15 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
             .mount(&mock)
             .await;
     }
-    if opts.commit_authors.is_empty() {
-        Mock::given(method("GET"))
-            .and(path_regex(r"/repos/acme/box/commits/.*"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "author": opts.commit_author
-            })))
-            .mount(&mock)
-            .await;
-    } else {
-        for (sha, author) in &opts.commit_authors {
-            Mock::given(method("GET"))
-                .and(path(format!("/repos/acme/box/commits/{sha}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "author": author
-                })))
-                .mount(&mock)
-                .await;
-        }
-    }
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .and(HasQueryParam("sha"))
+        .respond_with(CommitShaAuthors {
+            by_sha: opts.commit_authors,
+            default_author: opts.commit_author,
+        })
+        .mount(&mock)
+        .await;
     Mock::given(method("POST"))
         .and(path("/repos/acme/box/issues/1/comments"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 99 })))
