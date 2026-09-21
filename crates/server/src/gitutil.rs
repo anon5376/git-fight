@@ -791,12 +791,7 @@ pub fn result_ref(pr_number: i64, match_id: &str) -> Result<String, GitError> {
     if pr_number <= 0 {
         return Err(GitError::Command("missing pull request".into()));
     }
-    if match_id.is_empty()
-        || match_id.len() > 64
-        || !match_id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    if !crate::protocol::is_match_id(match_id) {
         return Err(GitError::Command("unsafe match id".into()));
     }
     Ok(format!("git-fight/pr-{pr_number}-{match_id}"))

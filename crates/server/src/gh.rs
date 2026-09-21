@@ -580,11 +580,21 @@ async fn json_capped<T: DeserializeOwned>(resp: reqwest::Response, max: usize) -
     if resp.content_length().is_some_and(|n| n > max as u64) {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
-    if bytes.len() > max {
-        return None;
+    let mut acc = Vec::new();
+    let mut resp = resp;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if acc.len().saturating_add(chunk.len()) > max {
+                    return None;
+                }
+                acc.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
     }
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice(&acc).ok()
 }
 
 fn require_names(owner: &str, repo: &str) -> Result<(), String> {

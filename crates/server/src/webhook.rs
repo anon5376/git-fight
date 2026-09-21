@@ -95,6 +95,11 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     let Some(repo) = &hook.repository else {
         return HttpStatus::OK;
     };
+    if !crate::gh::is_safe_github_name(&repo.owner.login)
+        || !crate::gh::is_safe_github_name(&repo.name)
+    {
+        return HttpStatus::OK;
+    }
     if let Ok(Some(row)) =
         db::open_match_for_pr(&state.pool, &repo.owner.login, &repo.name, pr.number).await
     {

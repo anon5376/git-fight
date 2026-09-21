@@ -2,7 +2,8 @@ use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
 use crate::protocol::{
-    round_seed, split_seed, ClientMsg, ServerMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY,
+    is_match_id, round_seed, split_seed, ClientMsg, ServerMsg, DISCONNECT_SECS, EXPIRE_SECS,
+    INPUT_DELAY,
 };
 use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
@@ -308,6 +309,9 @@ async fn get_match(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<MatchPublic>, StatusCode> {
+    if !is_match_id(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let row = db::get_match(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -363,6 +367,9 @@ async fn get_replay(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ReplayOut>, StatusCode> {
+    if !is_match_id(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let row = db::get_match(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -452,6 +459,10 @@ async fn reject_socket(mut socket: WebSocket, message: &str) {
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Option<String>) {
+    if !is_match_id(&q.match_id) {
+        reject_socket(socket, "not found").await;
+        return;
+    }
     let Ok(Some(row)) = db::get_match(&state.pool, &q.match_id).await else {
         reject_socket(socket, "not found").await;
         return;

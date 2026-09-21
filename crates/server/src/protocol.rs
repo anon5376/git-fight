@@ -7,6 +7,15 @@ pub const INPUT_WINDOW: u32 = 90;
 pub const DISCONNECT_SECS: u64 = 30;
 pub const EXPIRE_SECS: i64 = 24 * 60 * 60;
 
+/// URL- and `git-fight/pr-<n>-<id>`-safe. Lowercase hex (or test ids).
+pub fn is_match_id(id: &str) -> bool {
+    let n = id.len();
+    (1..=64).contains(&n)
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {
     Ours,
@@ -140,6 +149,19 @@ mod tests {
         assert_eq!(v["path"], "lib.rs");
         assert_eq!(v["hunk_index"], 1);
         assert_eq!(v["ticks"], serde_json::json!([[0, 1, 0], [1, 0, 2]]));
+    }
+
+    #[test]
+    fn match_ids_are_url_and_ref_safe() {
+        assert!(is_match_id("deadbeef"));
+        assert!(is_match_id("match1"));
+        assert!(is_match_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!is_match_id(""));
+        assert!(!is_match_id("../main"));
+        assert!(!is_match_id("MAIN"));
+        assert!(!is_match_id(&"a".repeat(65)));
+        assert!(!is_match_id("x/y"));
+        assert!(!is_match_id("id;drop"));
     }
 
     #[test]
