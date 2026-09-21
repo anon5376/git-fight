@@ -33,7 +33,7 @@ async fn seed(
             ours_name: ours.unwrap_or("ours").into(),
             theirs_name: theirs.unwrap_or("theirs").into(),
             ours_kind: "github".into(),
-            theirs_kind: if theirs.is_some() { "github" } else { "cpu" }.into(),
+            theirs_kind: "cpu".into(),
             ours_login: ours.map(str::to_string),
             theirs_login: theirs.map(str::to_string),
             ours_token: "o".into(),
