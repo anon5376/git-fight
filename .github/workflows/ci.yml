@@ -25,3 +25,14 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Golden test in WebAssembly (Node)
         run: wasm-pack test --node crates/wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Web tests
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm test

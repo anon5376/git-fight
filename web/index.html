@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>git fight</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <main>
+      <section id="menu" data-testid="menu">
+        <canvas id="title" width="640" height="72" aria-hidden="true"></canvas>
+        <p class="tag">resolve merge conflicts by beating up the other branch</p>
+        <div class="actions">
+          <button type="button" data-testid="demo">Demo</button>
+          <button type="button" data-testid="cpu">vs CPU</button>
+          <button type="button" data-testid="two">2 players</button>
+        </div>
+        <p class="keys">
+          P1 <kbd>a</kbd> punch <kbd>s</kbd> kick <kbd>d</kbd> block <kbd>f</kbd> special
+          · P2 <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd> <kbd>;</kbd>
+        </p>
+      </section>
+
+      <section id="demo-panel" class="hidden" data-testid="demo-panel">
+        <p>Built-in conflict. No repo required.</p>
+        <pre data-testid="demo-conflict"></pre>
+        <div class="actions">
+          <button type="button" data-testid="demo-fight">Fight this hunk</button>
+          <button type="button" data-testid="back-demo" class="ghost">Back</button>
+        </div>
+      </section>
+
+      <section id="side-pick" class="hidden" data-testid="side-pick">
+        <p>play as</p>
+        <div class="actions">
+          <button type="button" data-testid="play-ours">ours (left)</button>
+          <button type="button" data-testid="play-theirs">theirs (right)</button>
+          <button type="button" data-testid="back-side" class="ghost">Back</button>
+        </div>
+        <p class="keys">CPU matches use the player 1 keys on whichever side you pick.</p>
+      </section>
+
+      <section id="arena" class="hidden" data-testid="arena">
+        <canvas id="stage" data-testid="stage" width="880" height="420"></canvas>
+        <div id="ko" class="hidden" data-testid="ko">KO</div>
+        <p class="keys" id="resolved" data-testid="resolved"></p>
+      </section>
+    </main>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

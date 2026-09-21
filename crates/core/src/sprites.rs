@@ -20,6 +20,49 @@ pub enum Pose {
 pub const SPRITE_ROWS: usize = 5;
 pub const SPRITE_COLS: usize = 8;
 
+impl Pose {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Punch,
+            2 => Self::Kick,
+            3 => Self::Block,
+            4 => Self::Special,
+            5 => Self::Hit,
+            6 => Self::Ko,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Punch => 1,
+            Self::Kick => 2,
+            Self::Block => 3,
+            Self::Special => 4,
+            Self::Hit => 5,
+            Self::Ko => 6,
+        }
+    }
+}
+
+impl Side {
+    pub fn from_u8(v: u8) -> Self {
+        if v == 1 {
+            Self::Theirs
+        } else {
+            Self::Ours
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Ours => 0,
+            Self::Theirs => 1,
+        }
+    }
+}
+
 const IDLE_OURS: [&str; SPRITE_ROWS] =
     ["  .-.   ", "  |o|   ", "  /|\\   ", "  / \\   ", "        "];
 const PUNCH_OURS: [&str; SPRITE_ROWS] =
@@ -89,6 +132,9 @@ mod tests {
                     assert_eq!(row.len(), SPRITE_COLS, "{row:?}");
                     assert!(row.bytes().all(|b| b < 128), "non-ascii {row:?}");
                 }
+            }
+            for v in 0..=6 {
+                assert_eq!(Pose::from_u8(v).as_u8(), v);
             }
         }
     }
