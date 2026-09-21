@@ -319,9 +319,11 @@ async fn run_room(
             _ = clock.tick() => {
                 if !done {
                     if let Some(exp) = expires_at {
-                        if Utc::now() >= exp {
+                        if Utc::now() >= exp && !scored_all {
                             expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
-                            done = true;
+                            // expire_open_match no-ops a fully scored row;
+                            // stay in the room so last-round finish can retry.
+                            done = match_is_open(&pool, &id).await == MatchOpen::Closed;
                         }
                     }
                 }
@@ -736,7 +738,10 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         AfterNonFinal::EndAndAdvance => {}
     }
     let msg = encode(&end_msg(a.sim, result, *a.round, false));
-    broadcast(a.conns, &msg);
+    // Clients advance Input.round on End. Queue if the outbound
+    // channel is full — Snapshot ticks do not recover a missed
+    // inter-round End, and --instant will not idle-confirm.
+    broadcast_or_spawn(a.conns, &msg);
     *a.round += 1;
     let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
     *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
@@ -813,15 +818,17 @@ async fn try_finish_scored_all(
     let Some(hash) = hash_from_stored_round(pool, id, seed, hunks, last).await else {
         return false;
     };
-    if db::finish_open_match(pool, id, &hash)
+    let marked = db::finish_open_match(pool, id, &hash)
         .await
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    if marked {
         if let Some(ctx) = result {
             ctx.spawn_publish(id.to_string());
         }
     }
-    true
+    // Same retry as live last-round finish: a busy mark must not
+    // stop the room while the row is still pending/in_progress.
+    last_round_done(marked, match_is_open(pool, id).await)
 }
 
 fn apply_input_log(
@@ -964,10 +971,12 @@ async fn expire_now(
     if !db::expire_open_match(pool, id).await.unwrap_or(false) {
         let row = db::get_match(pool, id).await.ok().flatten();
         if let Some(row) = row.as_ref() {
-            let msg = encode(&ServerMsg::Error {
-                message: terminal_ws_error(row),
-            });
-            broadcast_or_spawn(conns, &msg);
+            if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
+                let msg = encode(&ServerMsg::Error {
+                    message: terminal_ws_error(row),
+                });
+                broadcast_or_spawn(conns, &msg);
+            }
         }
         return;
     }
@@ -1078,7 +1087,8 @@ fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
     }
 }
 
-/// Terminal End / Error cannot be recovered from Snapshot. Queue if full.
+/// End (including inter-round) and Error cannot be recovered from
+/// Snapshot ticks. Queue if the outbound channel is full.
 fn broadcast_or_spawn(conns: &BTreeMap<u64, Conn>, msg: &str) {
     for conn in conns.values() {
         try_send_or_spawn(&conn.tx, msg.to_string());
@@ -1462,6 +1472,29 @@ mod tests {
             .await
             .expect("spawned End waited")
             .expect("channel open");
+        assert!(next.contains("match_over"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_or_spawn_delivers_non_final_end_when_buffer_is_full() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("held".into()).unwrap();
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            1,
+            Conn {
+                login: None,
+                token: None,
+                tx,
+            },
+        );
+        broadcast_or_spawn(&conns, r#"{"type":"end","match_over":false,"round":0}"#);
+        assert_eq!(rx.recv().await.as_deref(), Some("held"));
+        let next = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("spawned inter-round End waited")
+            .expect("channel open");
+        assert!(next.contains("\"round\":0"), "{next}");
         assert!(next.contains("match_over"), "{next}");
     }
 

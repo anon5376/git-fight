@@ -722,14 +722,22 @@ pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Erro
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
-/// Expire a still-open match. No-op if finished/aborted/already expired.
+/// Expire a still-open match. No-op if finished/aborted/already expired
+/// or every hunk already has a winner (finish+publish, do not bury).
 pub async fn expire_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     let res = sqlx::query(
         "UPDATE matches SET status = 'expired',
             finished_at = ?,
             abort_reason = COALESCE(?, abort_reason)
-         WHERE id = ? AND status IN ('pending', 'in_progress')",
+         WHERE id = ? AND status IN ('pending', 'in_progress')
+           AND NOT (
+             EXISTS (SELECT 1 FROM match_hunks h WHERE h.match_id = matches.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM match_hunks h
+               WHERE h.match_id = matches.id AND h.winner IS NULL
+             )
+           )",
     )
     .bind(&now)
     .bind("expired")
@@ -1577,6 +1585,74 @@ mod tests {
         assert_eq!(
             list_unpublished_results(&pool).await.unwrap(),
             vec!["won1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn expire_open_match_does_not_bury_a_scored_open_match() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "won2".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 0,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 2,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        set_status(&pool, "won2", "in_progress", true, false, None, None)
+            .await
+            .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "won2",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(set_hunk_winner(&pool, "won2", 0, "ours", false)
+            .await
+            .unwrap());
+        assert!(
+            !expire_open_match(&pool, "won2").await.unwrap(),
+            "live room clock must not expire a fully scored fight"
+        );
+        let row = get_match(&pool, "won2").await.unwrap().unwrap();
+        assert_eq!(row.status, "in_progress");
+        assert!(row.abort_reason.is_none());
+        insert_match(&pool, "open0", 1, 3, "o", "t", 0)
+            .await
+            .unwrap();
+        assert!(
+            expire_open_match(&pool, "open0").await.unwrap(),
+            "a match with no hunks still expires"
         );
     }
 

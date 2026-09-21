@@ -399,6 +399,101 @@ async fn scored_rounds_resume_finishes_without_replaying() {
 }
 
 #[tokio::test]
+async fn scored_all_past_deadline_finishes_not_expires() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = git_fight_server::test_tmp_dir("gf-scored-deadline");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "scoredalldeadline00000000000000";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 0,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours", false)
+        .await
+        .unwrap();
+    git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut status = String::new();
+    for _ in 0..50 {
+        let row = git_fight_server::db::get_match(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        status = row.status;
+        if status == "finished" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        status, "finished",
+        "a fully scored fight past expires_at must finish, not expire"
+    );
+}
+
+#[tokio::test]
 async fn lag_holds_outbound_hello() {
     let addr = spawn_server(Config {
         lag: Duration::from_millis(80),
