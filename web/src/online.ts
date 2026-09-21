@@ -117,6 +117,8 @@ export function paintFight(
   roundLabel: string,
   path?: string,
   hunkIndex?: number,
+  youSide?: string,
+  youAre?: string,
 ): void {
   const tps = ticks_per_second();
   const round = round_ticks();
@@ -135,10 +137,13 @@ export function paintFight(
     theirsSprite: sprite(1, fight.theirs_pose()),
     timer: String(secs).padStart(2, " "),
     roundLabel,
+    youSide,
   });
   stage.dataset.oursHp = String(fight.ours_hp());
   stage.dataset.theirsHp = String(fight.theirs_hp());
   stage.dataset.round = String(roundLabel);
+  stage.dataset.role = youSide ?? "";
+  stage.dataset.youAre = youAre ?? "";
   if (path) {
     stage.dataset.path = path;
   }
@@ -190,6 +195,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let totalRounds = 1;
   let path = "";
   let hunkIndex = 0;
+  let youAre = "";
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
@@ -311,6 +317,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       totalRounds = hello.total_rounds ?? 1;
       path = hello.path ?? "";
       hunkIndex = hello.hunk_index ?? 0;
+      youAre = hello.you_are ?? "";
       nextSend = Math.max(0, confirmed + 1);
       finished = false;
       reconnectAttempts = 0;
@@ -332,7 +339,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
           void offerGithubLogin(matchId, ui);
         }
       } else {
-        ui.wait.textContent = "waiting for opponent…";
+        const who = hello.you_are ? hello.you_are : hello.your_role;
+        ui.wait.textContent = `you are ${who} · waiting for opponent…`;
       }
     } else if (msg.type === "tick") {
       const tick = msg as TickMsg;
@@ -454,6 +462,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         roundCaption("online", round, totalRounds, path),
         path,
         hunkIndex,
+        role,
+        youAre,
       );
     }
     requestAnimationFrame(loop);
@@ -606,6 +616,8 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
       roundCaption("replay", ri, rounds.length, current?.path ?? ""),
       current?.path,
       current?.hunk_index,
+      "spectator",
+      "",
     );
     requestAnimationFrame(loop);
   };

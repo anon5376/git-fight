@@ -114,14 +114,16 @@ function startFight(mode: Mode, fromDemo: boolean): void {
       leftover -= tickMs;
       stepOnce();
     }
-    paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
+    const youSide = mode.kind === "two" ? "both" : mode.human;
+    paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1", undefined, undefined, youSide);
     if (fight.result() !== -1) {
       finish();
     }
     requestAnimationFrame(loop);
   };
 
-  paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
+  const youSide = mode.kind === "two" ? "both" : mode.human;
+  paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1", undefined, undefined, youSide);
   requestAnimationFrame(loop);
   running = {
     stop: () => {

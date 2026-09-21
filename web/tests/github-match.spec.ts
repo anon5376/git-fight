@@ -93,6 +93,8 @@ test("github session match plays two CPU rounds in the browser", async ({ contex
   const stage = page.getByTestId("stage");
   await expect(stage).toBeVisible();
   await expect(stage).toHaveAttribute("data-path", /a\.rs|b\.rs/, { timeout: 10_000 });
+  await expect(stage).toHaveAttribute("data-role", "ours");
+  await expect(stage).toHaveAttribute("data-you-are", "alice");
   await expect(page.getByTestId("wait")).not.toContainText(/spectating/i);
 
   await stage.click();
@@ -117,6 +119,7 @@ test("logged-out visitor gets a GitHub login link instead of a fighter slot", as
   await expect(login).toBeVisible({ timeout: 10_000 });
   await expect(login).toHaveAttribute("href", `/auth/github?return=/match/${matchId}`);
   await expect(page.getByTestId("wait")).toContainText(/log in with GitHub/i);
+  await expect(page.getByTestId("stage")).toHaveAttribute("data-role", "spectator", { timeout: 10_000 });
 });
 
 test("two GitHub sessions play two rounds in the browser", async ({ browser, request }) => {
@@ -135,6 +138,10 @@ test("two GitHub sessions play two rounds in the browser", async ({ browser, req
   await expect(alice.getByTestId("wait")).not.toContainText(/spectating/i);
   await expect(bob.getByTestId("wait")).not.toContainText(/spectating/i);
   await expect(alice.getByTestId("stage")).toHaveAttribute("data-path", /a\.rs|b\.rs/, { timeout: 10_000 });
+  await expect(alice.getByTestId("stage")).toHaveAttribute("data-role", "ours");
+  await expect(alice.getByTestId("stage")).toHaveAttribute("data-you-are", "alice");
+  await expect(bob.getByTestId("stage")).toHaveAttribute("data-role", "theirs");
+  await expect(bob.getByTestId("stage")).toHaveAttribute("data-you-are", "bob");
 
   await alice.getByTestId("stage").click();
   await bob.getByTestId("stage").click();
