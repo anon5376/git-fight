@@ -88,6 +88,27 @@ async fn github_match(pool: &sqlx::SqlitePool) {
     .unwrap();
 }
 
+async fn starter_hunk(pool: &sqlx::SqlitePool) {
+    git_fight_server::db::insert_hunk(
+        pool,
+        &NewHunk {
+            match_id: "match1",
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: Some("bob"),
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 async fn session(pool: &sqlx::SqlitePool, login: &str) -> String {
     let sid = format!("sid-{login}");
     git_fight_server::db::insert_session(pool, &sid, 1, login)
@@ -129,6 +150,7 @@ async fn hello_role(
 async fn github_match_roles_follow_session_not_token() {
     let (addr, pool) = spawn().await;
     github_match(&pool).await;
+    starter_hunk(&pool).await;
     let alice = session(&pool, "alice").await;
     let bob = session(&pool, "bob").await;
     let carol = session(&pool, "carol").await;
