@@ -58,6 +58,7 @@ impl LookupTrack {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.lock().map(|g| g.is_empty()).unwrap_or(true)
     }
