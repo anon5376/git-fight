@@ -81,8 +81,21 @@ impl WasmFight {
     }
 
     pub fn with_hp(seed: u32, ours_hp: i32, theirs_hp: i32) -> WasmFight {
+        WasmFight::with_seed_hp(seed, 0, ours_hp, theirs_hp)
+    }
+
+    /// Same stats the server uses (`FighterStats::default`).
+    pub fn from_seed(seed_lo: u32, seed_hi: u32) -> WasmFight {
+        let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
         WasmFight {
-            state: FightState::new(u64::from(seed), stats(ours_hp), stats(theirs_hp)),
+            state: FightState::new(seed, FighterStats::default(), FighterStats::default()),
+        }
+    }
+
+    pub fn with_seed_hp(seed_lo: u32, seed_hi: u32, ours_hp: i32, theirs_hp: i32) -> WasmFight {
+        let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
+        WasmFight {
+            state: FightState::new(seed, stats(ours_hp), stats(theirs_hp)),
         }
     }
 

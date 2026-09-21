@@ -15,7 +15,9 @@
           <button type="button" data-testid="demo">Demo</button>
           <button type="button" data-testid="cpu">vs CPU</button>
           <button type="button" data-testid="two">2 players</button>
+          <button type="button" data-testid="host">Host match</button>
         </div>
+        <p id="flash" class="keys hidden" data-testid="flash"></p>
         <p class="keys">
           P1 <kbd>a</kbd> punch <kbd>s</kbd> kick <kbd>d</kbd> block <kbd>f</kbd> special
           · P2 <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd> <kbd>;</kbd>
@@ -42,7 +44,9 @@
       </section>
 
       <section id="arena" class="hidden" data-testid="arena">
+        <p id="share" class="keys hidden" data-testid="share"></p>
         <canvas id="stage" data-testid="stage" width="880" height="420"></canvas>
+        <div id="wait" class="hidden" data-testid="wait">waiting</div>
         <div id="ko" class="hidden" data-testid="ko">KO</div>
         <p class="keys" id="resolved" data-testid="resolved"></p>
       </section>

@@ -31,6 +31,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Build static site
         working-directory: web
+        env:
+          VITE_BASE: ./
         run: |
           npm ci
           npm run build

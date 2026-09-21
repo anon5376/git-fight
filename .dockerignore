@@ -1,0 +1,13 @@
+.git
+target
+data
+web/node_modules
+web/dist
+web/pkg
+web/playwright-report
+web/test-results
+crates/wasm/pkg
+crates/wasm/target
+**/*.pem
+.env
+.env.*
