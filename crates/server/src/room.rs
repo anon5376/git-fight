@@ -180,6 +180,31 @@ async fn run_room(
         true,
     );
 
+    // A disconnect forfeit latched before the hunk write must finish
+    // on boot — started_at is RAM-only, so the 30s path will not run
+    // until both fighters rejoin.
+    if replay_ok && !done && !scored_all {
+        if let Some(tag) = row.pending_forfeit_for(round) {
+            if persist_disconnect_forfeit(&pool, &id, round, tag).await {
+                forfeit_pending = true;
+                match tag {
+                    "forfeit_ours" => sim.forfeit(Side::Ours),
+                    "forfeit_theirs" => sim.forfeit(Side::Theirs),
+                    _ => {}
+                }
+            } else {
+                match tag {
+                    "forfeit_ours" => ours.forfeit_due = true,
+                    "forfeit_theirs" => theirs.forfeit_due = true,
+                    _ => {}
+                }
+                if started_at.is_none() {
+                    started_at = Some(Instant::now());
+                }
+            }
+        }
+    }
+
     // Replay can already have a KO. Finish before the first Join so
     // catch-up is the next conflict (or send_closed), not Hello+Snapshot
     // of a decided round. scored_all stays on try_finish_scored_all.
@@ -589,17 +614,15 @@ async fn advance(a: Advance<'_>) -> bool {
         // Latch when the timer fires. A reconnect clears
         // disconnected_at; forfeit_due keeps persist retrying.
         if a.ours.latch_forfeit(a.disconnect) {
-            // Persist first. Do not set forfeit_pending until the
-            // hunk is durable — a stale flag would tag a later KO
-            // as forfeit_*.
-            if !persist_disconnect_forfeit(
-                a.pool,
-                a.id,
-                *a.round,
-                result::winner_tag(RoundResult::Theirs, true),
-            )
-            .await
-            {
+            // Latch the match row first so a restart cannot drop a
+            // forfeit whose hunk write is still busy. Do not set
+            // forfeit_pending until the hunk is durable — a stale
+            // flag would tag a later KO as forfeit_*.
+            let tag = result::winner_tag(RoundResult::Theirs, true);
+            if !persist_pending_forfeit(a.pool, a.id, *a.round, tag).await {
+                return false;
+            }
+            if !persist_disconnect_forfeit(a.pool, a.id, *a.round, tag).await {
                 return false;
             }
             *a.forfeit_pending = true;
@@ -607,14 +630,11 @@ async fn advance(a: Advance<'_>) -> bool {
             return finish(a, RoundResult::Theirs).await;
         }
         if a.theirs.latch_forfeit(a.disconnect) {
-            if !persist_disconnect_forfeit(
-                a.pool,
-                a.id,
-                *a.round,
-                result::winner_tag(RoundResult::Ours, true),
-            )
-            .await
-            {
+            let tag = result::winner_tag(RoundResult::Ours, true);
+            if !persist_pending_forfeit(a.pool, a.id, *a.round, tag).await {
+                return false;
+            }
+            if !persist_disconnect_forfeit(a.pool, a.id, *a.round, tag).await {
                 return false;
             }
             *a.forfeit_pending = true;
@@ -863,6 +883,12 @@ fn stats_from_stored(
         StoredRound::Winner { tag, ko } => (tag.clone(), *ko),
         _ => (computed_tag.to_string(), computed_ko),
     }
+}
+
+async fn persist_pending_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &str) -> bool {
+    db::set_pending_forfeit(pool, id, round, tag)
+        .await
+        .unwrap_or(false)
 }
 
 async fn persist_disconnect_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &str) -> bool {
@@ -1667,6 +1693,8 @@ mod tests {
             final_hash: None,
             abort_reason: None,
             challenge_comment_id: None,
+            pending_forfeit: None,
+            pending_forfeit_round: None,
         };
         let hunks = vec![
             db::HunkRow {

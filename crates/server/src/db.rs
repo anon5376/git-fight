@@ -30,6 +30,21 @@ pub struct MatchRow {
     pub abort_reason: Option<String>,
     pub result_branch: Option<String>,
     pub challenge_comment_id: Option<i64>,
+    pub pending_forfeit: Option<String>,
+    pub pending_forfeit_round: Option<i64>,
+}
+
+impl MatchRow {
+    /// Disconnect forfeit latched before `set_hunk_winner` succeeded.
+    pub fn pending_forfeit_for(&self, round: u32) -> Option<&str> {
+        let tag = self.pending_forfeit.as_deref()?;
+        let stored = self.pending_forfeit_round?;
+        if stored == i64::from(round) && matches!(tag, "forfeit_ours" | "forfeit_theirs") {
+            Some(tag)
+        } else {
+            None
+        }
+    }
 }
 
 pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -79,12 +94,20 @@ async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
             result_branch TEXT,
             final_hash TEXT,
             abort_reason TEXT,
-            challenge_comment_id INTEGER
+            challenge_comment_id INTEGER,
+            pending_forfeit TEXT,
+            pending_forfeit_round INTEGER
         )",
     )
     .execute(&mut *conn)
     .await?;
     let _ = sqlx::query("ALTER TABLE matches ADD COLUMN challenge_comment_id INTEGER")
+        .execute(&mut *conn)
+        .await;
+    let _ = sqlx::query("ALTER TABLE matches ADD COLUMN pending_forfeit TEXT")
+        .execute(&mut *conn)
+        .await;
+    let _ = sqlx::query("ALTER TABLE matches ADD COLUMN pending_forfeit_round INTEGER")
         .execute(&mut *conn)
         .await;
     // GitHub owner/repo are case-insensitive. Recreate so a casing change
@@ -473,7 +496,8 @@ const MATCH_COLS: &str = "id, seed, status, ours_name, theirs_name, ours_kind, t
                 ours_token, theirs_token, ours_login, theirs_login, owner, repo, pr_number,
                 pr_head_sha, pr_base_sha, installation_id,
                 input_delay_ticks, created_at, expires_at,
-                final_hash, abort_reason, result_branch, challenge_comment_id";
+                final_hash, abort_reason, result_branch, challenge_comment_id,
+                pending_forfeit, pending_forfeit_round";
 
 pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, sqlx::Error> {
     sqlx::query_as::<_, MatchRow>(&format!("SELECT {MATCH_COLS} FROM matches WHERE id = ?"))
@@ -1433,6 +1457,46 @@ pub async fn set_challenge_comment_id(
     Ok(res.rows_affected() > 0)
 }
 
+/// Latch a disconnect forfeit before the hunk winner is durable.
+/// Write-once and only while the match is still open. The same tag+round
+/// already stored counts as durable so persist can retry `set_hunk_winner`.
+pub async fn set_pending_forfeit(
+    pool: &SqlitePool,
+    id: &str,
+    round: u32,
+    tag: &str,
+) -> Result<bool, sqlx::Error> {
+    if !matches!(tag, "forfeit_ours" | "forfeit_theirs") || round >= crate::limits::MAX_HUNKS as u32
+    {
+        return Ok(false);
+    }
+    let res = sqlx::query(
+        "UPDATE matches SET pending_forfeit = ?, pending_forfeit_round = ?
+         WHERE id = ? AND pending_forfeit IS NULL
+           AND status IN ('pending', 'in_progress')",
+    )
+    .bind(tag)
+    .bind(i64::from(round))
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT pending_forfeit, pending_forfeit_round FROM matches
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(matches!(
+        row,
+        Some((Some(t), Some(r)))
+            if t == tag && r == i64::from(round)
+    ))
+}
+
 /// Record the create-only branch or a skip reason. First writer wins.
 /// A successful branch is not overwritten by a later skip (or the reverse).
 pub async fn set_result_branch(
@@ -1606,6 +1670,8 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {
             abort_reason: row.try_get("abort_reason")?,
             result_branch: row.try_get("result_branch")?,
             challenge_comment_id: row.try_get("challenge_comment_id")?,
+            pending_forfeit: row.try_get("pending_forfeit")?,
+            pending_forfeit_round: row.try_get("pending_forfeit_round")?,
         })
     }
 }
@@ -3255,5 +3321,38 @@ mod tests {
             "a closed match must not treat a leftover tick as durable"
         );
         assert_eq!(load_inputs(&pool, "m1", 0).await.unwrap(), vec![(0, 1, 2)]);
+    }
+
+    #[tokio::test]
+    async fn pending_forfeit_is_write_once_and_open_only() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(set_pending_forfeit(&pool, "m1", 0, "forfeit_ours")
+            .await
+            .unwrap());
+        assert!(
+            set_pending_forfeit(&pool, "m1", 0, "forfeit_ours")
+                .await
+                .unwrap(),
+            "the same latch is durable"
+        );
+        assert!(
+            !set_pending_forfeit(&pool, "m1", 0, "forfeit_theirs")
+                .await
+                .unwrap(),
+            "a later side cannot replace the first latch"
+        );
+        let row = get_match(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(row.pending_forfeit_for(0), Some("forfeit_ours"));
+        assert!(row.pending_forfeit_for(1).is_none());
+        assert!(abort_open_match(&pool, "m1", "outdated").await.unwrap());
+        assert!(
+            !set_pending_forfeit(&pool, "m1", 0, "forfeit_ours")
+                .await
+                .unwrap(),
+            "a closed match must not latch a forfeit"
+        );
     }
 }
