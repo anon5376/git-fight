@@ -343,7 +343,7 @@ Absent or `false`: only `/fight` starts a match.
 
 Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like a `/fight` on a victim PR. If we trusted it, we would clone, comment, and eventually push `git-fight/*` with an installation token.
 
-**Mitigation:** `X-Hub-Signature-256` is required. HMAC-SHA256 over the **raw** body, constant-time compare, **then** parse. No signature or mismatch → `401` and no JSON. The webhook secret never logs. Delivery IDs are required and recorded, and the body hash is unique, so a captured payload replayed later is ignored even if the delivery header is swapped. Events whose GitHub timestamps are older than 24 hours are ignored, and delivery rows older than that are pruned. Clone URLs come from the authenticated installation + `owner/repo` on the payload after signature check, not from an arbitrary URL field. Live App HTTP is only `https://api.github.com` and `https://github.com`.
+**Mitigation:** `X-Hub-Signature-256` is required. HMAC-SHA256 over the **raw** body, constant-time compare, **then** parse. HMAC construction does not fall back to a zero key. No signature or mismatch → `401` and no JSON. The webhook secret never logs. Delivery IDs are required and recorded, and the body hash is unique, so a captured payload replayed later is ignored even if the delivery header is swapped. Events whose GitHub timestamps are older than 24 hours are ignored, and delivery rows older than that are pruned. Clone URLs come from the authenticated installation + `owner/repo` on the payload after signature check, not from an arbitrary URL field. Live App HTTP is only `https://api.github.com` and `https://github.com`.
 
 ### A non-fighter trying to play
 

@@ -389,7 +389,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       }
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
-      const matchOver = end.match_over !== false;
+      const matchOver = end.match_over === true;
       ui.wait.classList.add("hidden");
       showKo(ui.ko, end.result);
       if (matchOver) {

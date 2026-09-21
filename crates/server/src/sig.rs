@@ -22,8 +22,7 @@ pub fn verify_signature(secret: &[u8], body: &[u8], header: Option<&str>) -> boo
 }
 
 fn hmac_sha256(secret: &[u8], body: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 32]).expect("32-byte fallback key"));
+    let mut mac = HmacSha256::new_from_slice(secret).expect("hmac-sha256 accepts any key length");
     mac.update(body);
     let bytes = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
@@ -70,5 +69,16 @@ mod tests {
         assert!(!verify_signature(b"secret", b"body", None));
         assert!(!verify_signature(b"secret", b"body", Some("")));
         assert!(!verify_signature(b"secret", b"body", Some("sha1=abc")));
+    }
+
+    #[test]
+    fn hmac_does_not_fall_back_to_a_zero_key() {
+        let body = b"payload";
+        let real = hmac_sha256(b"webhook-secret", body);
+        let zero = hmac_sha256(&[0u8; 32], body);
+        assert_ne!(real, zero);
+        let header = format!("sha256={}", hex::encode(real));
+        assert!(verify_signature(b"webhook-secret", body, Some(&header)));
+        assert!(!verify_signature(&[0u8; 32], body, Some(&header)));
     }
 }

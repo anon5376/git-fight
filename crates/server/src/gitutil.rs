@@ -998,7 +998,8 @@ pub async fn inspect_result_ref(
     }
     let local = format!("refs/heads/{refname}");
     let mut sha = rev_parse_git_fight(dir, &local, bearer).await.ok();
-    if sha.is_none() {
+    let remote = ref_exists(url, refname, bearer).await?;
+    if sha.is_none() && remote {
         let spec = format!("+refs/heads/{refname}:refs/git-fight-fetch/result");
         if fetch_refspec(dir, &spec, bearer).await.is_ok() {
             sha = rev_parse_git_fight(dir, "refs/git-fight-fetch/result", bearer)
@@ -1007,17 +1008,15 @@ pub async fn inspect_result_ref(
         }
     }
     let Some(sha) = sha else {
-        return if ref_exists(url, refname, bearer).await? {
-            Ok(ExistingResult::Foreign)
+        return Ok(if remote {
+            ExistingResult::Foreign
         } else {
-            Ok(ExistingResult::Missing)
-        };
+            ExistingResult::Missing
+        });
     };
-    let raw = cat_commit(dir, &sha, bearer).await?;
-    if commit_is_match_result(&raw, match_id, head, base) {
-        Ok(ExistingResult::Ours)
-    } else {
-        Ok(ExistingResult::Foreign)
+    match cat_commit(dir, &sha, bearer).await {
+        Ok(raw) if commit_is_match_result(&raw, match_id, head, base) => Ok(ExistingResult::Ours),
+        _ => Ok(ExistingResult::Foreign),
     }
 }
 
