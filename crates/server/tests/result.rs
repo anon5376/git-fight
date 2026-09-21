@@ -510,7 +510,10 @@ async fn two_files_push_each_pick() {
         .unwrap();
     assert_eq!(collected.len(), 2, "expected a.rs and b.rs");
     let names: Vec<&str> = collected.iter().map(|h| h.path.as_str()).collect();
-    assert!(names.contains(&"a.rs") && names.contains(&"b.rs"), "{names:?}");
+    assert!(
+        names.contains(&"a.rs") && names.contains(&"b.rs"),
+        "{names:?}"
+    );
 
     let mock = github_mocks(&head, &base).await;
     let pool = pool().await;

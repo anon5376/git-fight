@@ -530,16 +530,19 @@ async fn fight_comment_two_files_is_two_rounds() {
     );
     let comments = wait_posted(&mock, 1).await;
     assert!(
-        comments.iter().any(|t| t.contains("2 rounds") && t.contains("/match/")),
+        comments
+            .iter()
+            .any(|t| t.contains("2 rounds") && t.contains("/match/")),
         "{comments:?}"
     );
     let id = match_id_from(&comments);
-    let hunks = git_fight_server::db::list_hunks(&pool, &id)
-        .await
-        .unwrap();
+    let hunks = git_fight_server::db::list_hunks(&pool, &id).await.unwrap();
     let paths: Vec<&str> = hunks.iter().map(|h| h.path.as_str()).collect();
     assert_eq!(hunks.len(), 2, "{paths:?}");
-    assert!(paths.contains(&"a.rs") && paths.contains(&"b.rs"), "{paths:?}");
+    assert!(
+        paths.contains(&"a.rs") && paths.contains(&"b.rs"),
+        "{paths:?}"
+    );
 }
 
 #[tokio::test]
