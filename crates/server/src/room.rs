@@ -2373,7 +2373,7 @@ mod tests {
         assert_eq!(
             closed_finish_followup(true, LastRoundStatus::Unknown),
             LastRound::Retry,
-            "busy get_match must not send Error { finished } in place of End"
+            "busy get_match must not send Error {{ finished }} in place of End"
         );
         assert_eq!(latched_forfeit_followup(false, false, true), "finish");
         assert_eq!(
