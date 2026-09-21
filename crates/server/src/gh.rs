@@ -20,6 +20,11 @@ pub struct GitHub {
     poll_wait: Duration,
 }
 
+/// Live GitHub often leaves `mergeable` null for seconds while it computes.
+const MERGEABLE_POLL_WAIT: Duration = Duration::from_secs(1);
+const MERGEABLE_POLL_CAP: Duration = Duration::from_secs(4);
+const MERGEABLE_POLL_TRIES: u32 = 8;
+
 impl std::fmt::Debug for GitHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHub")
@@ -50,7 +55,7 @@ impl GitHub {
             client_id,
             client_secret,
             tokens: Arc::new(Mutex::new(HashMap::new())),
-            poll_wait: Duration::from_millis(50),
+            poll_wait: MERGEABLE_POLL_WAIT,
         }
     }
 
@@ -195,11 +200,11 @@ impl GitHub {
         number: u64,
     ) -> Result<PullInfo, String> {
         let mut wait = self.poll_wait;
-        let cap = (self.poll_wait * 40)
+        let cap = (self.poll_wait * 8)
             .max(Duration::from_millis(1))
-            .min(Duration::from_secs(2));
+            .min(MERGEABLE_POLL_CAP);
         let mut last = None;
-        for _ in 0..8 {
+        for _ in 0..MERGEABLE_POLL_TRIES {
             let pr = self.get_pull(installation_id, owner, repo, number).await?;
             if pr.mergeable.is_some() {
                 return Ok(pr);
@@ -579,4 +584,16 @@ pub struct ShaRef {
 #[derive(Clone, Debug, Deserialize)]
 pub struct UserInfo {
     pub login: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_mergeable_poll_waits_for_github() {
+        assert!(MERGEABLE_POLL_WAIT >= Duration::from_secs(1));
+        assert!(MERGEABLE_POLL_CAP >= Duration::from_secs(4));
+        assert_eq!(MERGEABLE_POLL_TRIES, 8);
+    }
 }

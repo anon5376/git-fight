@@ -769,14 +769,17 @@ fn cfg_for(mock: &MockServer, bare: PathBuf) -> Config {
     test_repos.insert("acme/box".into(), bare);
     Config {
         webhook_secret: Some(SECRET.to_vec()),
-        github: Some(GitHub::new(
-            mock.uri(),
-            mock.uri(),
-            1,
-            APP_PEM.to_string(),
-            "cid".into(),
-            "csec".into(),
-        )),
+        github: Some(
+            GitHub::new(
+                mock.uri(),
+                mock.uri(),
+                1,
+                APP_PEM.to_string(),
+                "cid".into(),
+                "csec".into(),
+            )
+            .with_poll_wait(std::time::Duration::from_millis(1)),
+        ),
         auth: Auth {
             session_key: SESSION_KEY.to_vec(),
             public_url: "http://fight.test".into(),
