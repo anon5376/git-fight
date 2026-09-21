@@ -1041,6 +1041,7 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let branch = branch.expect("result branch after two author rounds");
+    assert!(branch.starts_with("git-fight/pr-1-"), "{branch}");
     assert_eq!(
         git_dir(&bare, &["show", &format!("{branch}:a.rs")]),
         "fn a() { 2 }",
@@ -1053,6 +1054,37 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
     );
     assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
     assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
+    let parents = git_dir(&bare, &["rev-list", "--parents", "-n1", &branch]);
+    let parts: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(parts.len(), 3, "{parents}");
+    assert!(parts.contains(&head.as_str()), "{parents}");
+    assert!(parts.contains(&base.as_str()), "{parents}");
+    let msg = git_dir(&bare, &["log", "-1", "--format=%B", &branch]);
+    assert!(msg.contains("round 1: a.rs"), "{msg}");
+    assert!(msg.contains("round 2: b.rs"), "{msg}");
+
+    let patched = wait_patched(&mock, 1).await;
+    assert!(
+        patched.iter().any(|c| {
+            c.contains("git fight finished")
+                && c.contains("compare:")
+                && c.contains(&format!("/replay/{id}"))
+                && c.contains(&branch)
+                && c.contains("a.rs")
+                && c.contains("b.rs")
+        }),
+        "{patched:?}"
+    );
+    let (status, body) = http(addr, "GET", &format!("/api/replays/{id}"), &[], b"").await;
+    assert_eq!(status, 200);
+    let replay: Value = serde_json::from_slice(&body).unwrap();
+    let rounds = replay["rounds"].as_array().cloned().unwrap_or_default();
+    assert_eq!(rounds.len(), 2, "{replay}");
+    let paths: Vec<&str> = rounds.iter().filter_map(|r| r["path"].as_str()).collect();
+    assert!(
+        paths.contains(&"a.rs") && paths.contains(&"b.rs"),
+        "{paths:?}"
+    );
 
     let board = git_fight_server::db::list_player_stats(&pool, "acme", "box")
         .await
