@@ -520,10 +520,12 @@ async fn valid_fight_comments_challenge() {
 }
 
 #[tokio::test]
-async fn fight_comment_two_files_is_two_rounds() {
+async fn fight_comment_two_files_plays_two_rounds_and_pushes_both() {
     let (_keep, bare, head, base, _, _) = conflict_two_authors();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
-    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    let mut cfg = cfg_for(&mock, bare.clone());
+    cfg.instant = true;
+    let (addr, pool) = spawn_with_pool(cfg).await;
     assert_eq!(
         post_signed(addr, "issue_comment", "deliv-two-files", &fight_body()).await,
         200
@@ -542,6 +544,101 @@ async fn fight_comment_two_files_is_two_rounds() {
     assert!(
         paths.contains(&"a.rs") && paths.contains(&"b.rs"),
         "{paths:?}"
+    );
+
+    git_fight_server::db::insert_session(&pool, "sid-alice", 1, "alice")
+        .await
+        .unwrap();
+    let cookie = git_fight_server::sign_session(SESSION_KEY, "sid-alice");
+    let url = format!("ws://{addr}/ws?match={id}");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cookie", format!("git_fight_sid={cookie}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let (mut sink, mut stream) = ws.split();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut next_send = 0u32;
+    let mut ends = 0u32;
+    let mut hellos = 0u32;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timeout waiting for two-round match")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("hello") => {
+                hellos += 1;
+                assert_eq!(v["your_role"].as_str(), Some("ours"), "{v}");
+                assert_eq!(v["total_rounds"].as_u64(), Some(2), "{v}");
+                next_send = 0;
+                while next_send < 16 {
+                    let body = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                    sink.send(Message::Text(body.into())).await.unwrap();
+                    next_send += 1;
+                }
+            }
+            Some("tick") => {
+                let n = v["n"].as_u64().unwrap() as u32;
+                while next_send <= n + 8 {
+                    let body = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                    sink.send(Message::Text(body.into())).await.unwrap();
+                    next_send += 1;
+                }
+            }
+            Some("end") => {
+                ends += 1;
+                let over = v["match_over"].as_bool() == Some(true);
+                if over {
+                    assert_eq!(ends, 2, "{v}");
+                    break;
+                }
+                assert_eq!(v["round"].as_u64(), Some(0), "{v}");
+            }
+            Some("error") => panic!("{}", v["message"]),
+            _ => {}
+        }
+    }
+    assert_eq!(hellos, 2, "expected Hello for each round");
+    assert_eq!(ends, 2);
+
+    let mut branch = None;
+    for _ in 0..80 {
+        let row = git_fight_server::db::get_match(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.result_branch.is_some() || row.abort_reason.is_some() {
+            assert!(row.abort_reason.is_none(), "unexpected abort {row:?}");
+            branch = row.result_branch;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let branch = branch.expect("result branch after two rounds");
+    assert!(branch.starts_with("git-fight/pr-1-"), "{branch}");
+    let a = git_dir(&bare, &["show", &format!("{branch}:a.rs")]);
+    let b = git_dir(&bare, &["show", &format!("{branch}:b.rs")]);
+    assert!(!a.contains("<<<<<<<"), "a.rs still conflicted: {a}");
+    assert!(!b.contains("<<<<<<<"), "b.rs still conflicted: {b}");
+    assert!(a.contains("fn a()"), "{a}");
+    assert!(b.contains("fn b()"), "{b}");
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
+
+    let patched = wait_patched(&mock, 1).await;
+    assert!(
+        patched.iter().any(|c| {
+            c.contains("git fight finished")
+                && c.contains("a.rs")
+                && c.contains("b.rs")
+                && c.contains(&branch)
+        }),
+        "{patched:?}"
     );
 }
 
