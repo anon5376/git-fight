@@ -135,6 +135,43 @@ fn conflict_two_authors() -> (tempfile::TempDir, PathBuf, String, String, String
     (tmp, bare, head, carol_sha.clone(), bob_sha, carol_sha)
 }
 
+fn binary_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
+    git(&work, &["add", "blob.bin"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::write(work.join("blob.bin"), [0u8, 9, 9, 9]).unwrap();
+    git(&work, &["add", "blob.bin"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("blob.bin"), [0u8, 7, 7, 7]).unwrap();
+    git(&work, &["add", "blob.bin"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 async fn spawn(cfg: Config) -> std::net::SocketAddr {
     spawn_with_pool(cfg).await.0
 }
@@ -1177,6 +1214,31 @@ async fn mergeable_null_then_false_starts_fight() {
     assert!(
         pulls >= 2,
         "expected mergeable poll, got {pulls} GET /pulls/1"
+    );
+}
+
+#[tokio::test]
+async fn binary_conflict_is_not_fightable() {
+    let (_keep, bare, head, base) = binary_conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-binary", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("not the kind git fight can play")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "unfightable conflicts must not leave a pending match"
     );
 }
 
