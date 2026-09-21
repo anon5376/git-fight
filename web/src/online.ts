@@ -259,6 +259,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let reconnectTimer: number | null = null;
   let reconnectAttempts = 0;
   let preparing = false;
+  let busy = false;
   const maxReconnects = 8;
 
   const clearReconnect = () => {
@@ -301,8 +302,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       return;
     }
     ui.wait.classList.remove("hidden");
-    if (preparing) {
-      ui.wait.textContent = "preparing match…";
+    if (preparing || busy) {
+      ui.wait.textContent = preparing ? "preparing match…" : "match busy — retrying";
       reconnectAttempts = 0;
       clearReconnect();
       reconnectTimer = window.setTimeout(() => {
@@ -345,6 +346,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       heldTheirs = 0;
       finished = false;
       preparing = false;
+      busy = false;
       reconnectAttempts = 0;
       ui.ko.classList.add("hidden");
       fight = fightFromWire(
@@ -402,6 +404,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
       const matchOver = end.match_over === true;
+      const endedRound = end.round ?? round;
       ui.wait.classList.add("hidden");
       showKo(ui.ko, end.result);
       if (matchOver) {
@@ -412,7 +415,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         // Next-round Hello is try_send. If it is late or dropped, Input
         // tagged with the finished Hello `round` is ignored and --instant
         // never idles — the canvas stays on "round 1/2".
-        round = (end.round ?? round) + 1;
+        round = endedRound + 1;
         confirmed = -1;
         nextSend = 0;
       }
@@ -421,7 +424,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       } else if (matchOver) {
         ui.resolved.textContent = `replay /replay/${matchId}`;
       } else {
-        ui.resolved.textContent = `round ${(end.round ?? round) + 1}/${totalRounds}`;
+        ui.resolved.textContent = `round ${endedRound + 1}/${totalRounds}`;
       }
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
@@ -434,26 +437,38 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         err.message === "finished";
       if (err.message === "preparing") {
         preparing = true;
+        busy = false;
         ui.wait.textContent = "preparing match…";
+        reconnectAttempts = 0;
+      } else if (err.message === "busy") {
+        busy = true;
+        preparing = false;
+        ui.wait.textContent = "match busy — retrying";
         reconnectAttempts = 0;
       } else if (err.message === "expired") {
         preparing = false;
+        busy = false;
         ui.wait.textContent = "this match expired";
       } else if (err.message === "outdated") {
         preparing = false;
+        busy = false;
         ui.wait.textContent = "PR moved — comment /fight for a rematch";
       } else if (err.message === "aborted") {
         preparing = false;
+        busy = false;
         ui.wait.textContent = "this match could not start";
       } else if (err.message === "not found") {
         preparing = false;
+        busy = false;
         ui.wait.textContent = "match not found";
       } else if (err.message === "finished") {
         preparing = false;
+        busy = false;
         ui.wait.textContent = "this match is over";
         ui.resolved.textContent = `replay /replay/${matchId}`;
       } else {
         preparing = false;
+        busy = false;
         ui.wait.textContent = err.message;
       }
       if (terminal) {
@@ -479,6 +494,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       // flash "waiting for opponent…" over preparing/connecting.
       if (preparing) {
         ui.wait.textContent = "preparing match…";
+      } else if (busy) {
+        ui.wait.textContent = "match busy — retrying";
       }
     });
     socket.addEventListener("close", () => {
