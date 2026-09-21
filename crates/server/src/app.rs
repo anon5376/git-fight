@@ -2,8 +2,8 @@ use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
 use crate::protocol::{
-    is_match_id, round_seed, split_seed, ClientMsg, ServerMsg, DISCONNECT_SECS, EXPIRE_SECS,
-    INPUT_DELAY,
+    closed_ws_message, is_match_id, round_seed, split_seed, ClientMsg, ServerMsg, DISCONNECT_SECS,
+    EXPIRE_SECS, INPUT_DELAY,
 };
 use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
@@ -143,28 +143,37 @@ pub fn router(state: AppState) -> Router {
 }
 
 impl AppState {
-    async fn room_tx(&self, row: &MatchRow) -> mpsc::Sender<RoomEvent> {
+    async fn room_tx(&self, row: &MatchRow) -> Result<mpsc::Sender<RoomEvent>, String> {
+        let Some(fresh) = db::get_match(&self.pool, &row.id).await.ok().flatten() else {
+            return Err("not found".into());
+        };
+        if let Some(message) = closed_ws_message(&fresh.status, fresh.abort_reason.as_deref()) {
+            return Err(message.to_string());
+        }
         let mut rooms = self.rooms.lock().await;
-        rooms
-            .entry(row.id.clone())
-            .or_insert_with(|| {
-                room::spawn_room(
-                    row.clone(),
-                    self.pool.clone(),
-                    RoomSettings {
-                        instant: self.config.instant,
-                        disconnect: self.config.disconnect,
-                        result: Some(ResultCtx {
-                            gh: self.github.clone(),
-                            pool: self.pool.clone(),
-                            public_url: self.auth.public_url.clone(),
-                            test_repos: self.test_repos.clone(),
-                        }),
-                    },
-                    self.rooms.clone(),
-                )
-            })
-            .clone()
+        if let Some(existing) = rooms.get(&fresh.id) {
+            if !existing.is_closed() {
+                return Ok(existing.clone());
+            }
+            rooms.remove(&fresh.id);
+        }
+        let tx = room::spawn_room(
+            fresh.clone(),
+            self.pool.clone(),
+            RoomSettings {
+                instant: self.config.instant,
+                disconnect: self.config.disconnect,
+                result: Some(ResultCtx {
+                    gh: self.github.clone(),
+                    pool: self.pool.clone(),
+                    public_url: self.auth.public_url.clone(),
+                    test_repos: self.test_repos.clone(),
+                }),
+            },
+            self.rooms.clone(),
+        );
+        rooms.insert(fresh.id, tx.clone());
+        Ok(tx)
     }
 
     pub(crate) async fn close_room(&self, id: &str) {
@@ -196,20 +205,19 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         loop {
             iv.tick().await;
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
-                let mut rooms = expirer.rooms.lock().await;
                 for id in ids {
                     if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
-                        let ctx = ResultCtx {
-                            gh: expirer.github.clone(),
-                            pool: expirer.pool.clone(),
-                            public_url: expirer.auth.public_url.clone(),
-                            test_repos: expirer.test_repos.clone(),
-                        };
-                        crate::result::comment_expired(&ctx, &row).await;
+                        if row.status == "expired" {
+                            let ctx = ResultCtx {
+                                gh: expirer.github.clone(),
+                                pool: expirer.pool.clone(),
+                                public_url: expirer.auth.public_url.clone(),
+                                test_repos: expirer.test_repos.clone(),
+                            };
+                            crate::result::comment_expired(&ctx, &row).await;
+                        }
                     }
-                    if let Some(tx) = rooms.remove(&id) {
-                        let _ = tx.send(RoomEvent::Shutdown).await;
-                    }
+                    expirer.close_room(&id).await;
                 }
             }
             let _ = db::prune_deliveries(&expirer.pool, crate::limits::WEBHOOK_MAX_AGE_SECS).await;
@@ -470,12 +478,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         reject_socket(socket, "not found").await;
         return;
     };
-    if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
-        let message = if row.abort_reason.as_deref() == Some("outdated") {
-            "outdated"
-        } else {
-            row.status.as_str()
-        };
+    if let Some(message) = closed_ws_message(&row.status, row.abort_reason.as_deref()) {
         reject_socket(socket, message).await;
         return;
     }
@@ -489,22 +492,53 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         }
     }
     let conn_id = uuid::Uuid::new_v4().as_u128() as u64;
-    let tx = state.room_tx(&row).await;
-
     let (out_tx, mut out_rx) = mpsc::channel::<String>(512);
-    let _ = tx
-        .send(RoomEvent::Join {
-            conn_id,
-            login,
-            token: q.token,
-            tx: out_tx,
-        })
-        .await;
+    let mut join = Some(RoomEvent::Join {
+        conn_id,
+        login,
+        token: q.token,
+        tx: out_tx,
+    });
+    let mut live = None;
+    for _ in 0..2 {
+        match state.room_tx(&row).await {
+            Ok(tx) => {
+                let Some(ev) = join.take() else {
+                    break;
+                };
+                match tx.send(ev).await {
+                    Ok(()) => {
+                        live = Some(tx);
+                        break;
+                    }
+                    Err(sent) => {
+                        join = Some(sent.0);
+                    }
+                }
+            }
+            Err(message) => {
+                reject_socket(socket, &message).await;
+                return;
+            }
+        }
+    }
+    let Some(tx) = live else {
+        if let Some(message) = db::get_match(&state.pool, &q.match_id)
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|r| closed_ws_message(&r.status, r.abort_reason.as_deref()))
+        {
+            reject_socket(socket, message).await;
+        }
+        return;
+    };
 
     let (mut sink, mut stream) = socket.split();
     let lag = state.config.lag;
     let leave_tx = tx.clone();
-    let read = tokio::spawn(async move {
+    let mut read = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             let Message::Text(text) = msg else {
                 continue;
@@ -532,7 +566,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
     });
 
-    let write = tokio::spawn(async move {
+    let mut write = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
             if lag > Duration::ZERO {
                 tokio::time::sleep(lag).await;
@@ -543,7 +577,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         }
     });
 
-    let _ = tokio::join!(read, write);
+    tokio::select! {
+        _ = &mut read => {
+            write.abort();
+        }
+        _ = &mut write => {
+            read.abort();
+        }
+    }
 }
 
 #[cfg(test)]

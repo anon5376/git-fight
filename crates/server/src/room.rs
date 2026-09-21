@@ -1,7 +1,7 @@
 use crate::db::{self, MatchRow};
 use crate::protocol::{
-    role_for, round_seed, split_hash, split_seed, Role, ServerMsg, DISCONNECT_SECS, INPUT_DELAY,
-    INPUT_WINDOW,
+    closed_ws_message, role_for, round_seed, split_hash, split_seed, Role, ServerMsg,
+    DISCONNECT_SECS, INPUT_DELAY, INPUT_WINDOW,
 };
 use crate::result::{self, ResultCtx};
 use chrono::{DateTime, Utc};
@@ -68,9 +68,13 @@ pub fn spawn_room(
 ) -> mpsc::Sender<RoomEvent> {
     let (tx, rx) = mpsc::channel(512);
     let id = row.id.clone();
+    let posted = tx.clone();
     tokio::spawn(async move {
         run_room(row, pool, settings, rx).await;
-        rooms.lock().await.remove(&id);
+        let mut rooms = rooms.lock().await;
+        if rooms.get(&id).is_some_and(|t| t.same_channel(&posted)) {
+            rooms.remove(&id);
+        }
     });
     tx
 }
@@ -120,8 +124,7 @@ async fn run_room(
     let mut pending_ours: BTreeMap<u32, u8> = BTreeMap::new();
     let mut pending_theirs: BTreeMap<u32, u8> = BTreeMap::new();
     let mut started_at: Option<Instant> = None;
-    let mut done =
-        sim.result.is_some() || matches!(row.status.as_str(), "finished" | "expired" | "aborted");
+    let mut done = matches!(row.status.as_str(), "finished" | "expired" | "aborted");
     let mut mirror = false;
     let id = row.id.clone();
     let ours_name = row.ours_name.clone();
@@ -143,6 +146,9 @@ async fn run_room(
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if done {
+            break;
+        }
         tokio::select! {
             ev = rx.recv() => {
                 let Some(ev) = ev else { break };
@@ -154,54 +160,58 @@ async fn run_room(
                         break;
                     }
                     RoomEvent::Join { conn_id, login, token, tx } => {
-                        let conn = Conn { login, token, tx: tx.clone() };
-                        let role = conn_role(&conn, &row, &hunks, round, github);
-                        let confirmed = if next_tick == 0 { -1 } else { next_tick as i32 - 1 };
-                        let hello = hello_msg(
-                            &id,
-                            round_seed(seed, round),
-                            delay,
-                            role.as_str(),
-                            conn.login.as_deref().unwrap_or(""),
-                            &ours_name,
-                            &theirs_name,
-                            round,
-                            total_rounds,
-                            confirmed,
-                            db::stats_for_round(&hunks, round),
-                            &hunks,
-                        );
-                        let _ = tx.send(encode(&hello)).await;
-                        let snap = snapshot_msg(
-                            round_seed(seed, round),
-                            round,
-                            confirmed,
-                            db::stats_for_round(&hunks, round),
-                            &log,
-                            &hunks,
-                        );
-                        let _ = tx.send(encode(&snap)).await;
-                        if let Some(result) = sim.result {
-                            let match_over = round + 1 >= total_rounds;
-                            let _ = tx.send(encode(&end_msg(&sim, result, round, match_over))).await;
-                        }
-                        conns.insert(conn_id, conn);
-                        refresh_slots(
-                            &conns,
-                            &row,
-                            &hunks,
-                            round,
-                            github,
-                            &mut ours,
-                            &mut theirs,
-                            started_at.is_some(),
-                        );
-                        if !done && ours.seen && theirs.seen && started_at.is_none() {
-                            started_at = Some(Instant::now());
-                            let _ = db::set_status(
-                                &pool, &id, "in_progress", true, false, None, None,
-                            )
-                            .await;
+                        if done {
+                            send_closed(&tx, &pool, &id).await;
+                        } else {
+                            let conn = Conn { login, token, tx: tx.clone() };
+                            let role = conn_role(&conn, &row, &hunks, round, github);
+                            let confirmed = if next_tick == 0 { -1 } else { next_tick as i32 - 1 };
+                            let hello = hello_msg(
+                                &id,
+                                round_seed(seed, round),
+                                delay,
+                                role.as_str(),
+                                conn.login.as_deref().unwrap_or(""),
+                                &ours_name,
+                                &theirs_name,
+                                round,
+                                total_rounds,
+                                confirmed,
+                                db::stats_for_round(&hunks, round),
+                                &hunks,
+                            );
+                            let _ = tx.send(encode(&hello)).await;
+                            let snap = snapshot_msg(
+                                round_seed(seed, round),
+                                round,
+                                confirmed,
+                                db::stats_for_round(&hunks, round),
+                                &log,
+                                &hunks,
+                            );
+                            let _ = tx.send(encode(&snap)).await;
+                            if let Some(result) = sim.result {
+                                let match_over = round + 1 >= total_rounds;
+                                let _ = tx.send(encode(&end_msg(&sim, result, round, match_over))).await;
+                            }
+                            conns.insert(conn_id, conn);
+                            refresh_slots(
+                                &conns,
+                                &row,
+                                &hunks,
+                                round,
+                                github,
+                                &mut ours,
+                                &mut theirs,
+                                started_at.is_some(),
+                            );
+                            if !done && ours.seen && theirs.seen && started_at.is_none() {
+                                started_at = Some(Instant::now());
+                                let _ = db::set_status(
+                                    &pool, &id, "in_progress", true, false, None, None,
+                                )
+                                .await;
+                            }
                         }
                     }
                     RoomEvent::Leave { conn_id } => {
@@ -297,6 +307,7 @@ async fn run_room(
         })
         .await;
     }
+    drain_late_joins(&mut rx, &pool, &id).await;
 }
 
 struct Advance<'a> {
@@ -491,10 +502,33 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
 }
 
 fn terminal_ws_error(row: &MatchRow) -> String {
-    if row.abort_reason.as_deref() == Some("outdated") {
-        "outdated".into()
-    } else {
-        row.status.clone()
+    closed_ws_message(&row.status, row.abort_reason.as_deref())
+        .unwrap_or(row.status.as_str())
+        .to_string()
+}
+
+async fn closed_message(pool: &SqlitePool, id: &str) -> String {
+    match db::get_match(pool, id).await {
+        Ok(Some(row)) => terminal_ws_error(&row),
+        _ => "finished".into(),
+    }
+}
+
+async fn send_closed(tx: &mpsc::Sender<String>, pool: &SqlitePool, id: &str) {
+    let message = closed_message(pool, id).await;
+    let _ = tx.send(encode(&ServerMsg::Error { message })).await;
+}
+
+async fn drain_late_joins(rx: &mut mpsc::Receiver<RoomEvent>, pool: &SqlitePool, id: &str) {
+    let message = closed_message(pool, id).await;
+    while let Ok(ev) = rx.try_recv() {
+        if let RoomEvent::Join { tx, .. } = ev {
+            let _ = tx
+                .send(encode(&ServerMsg::Error {
+                    message: message.clone(),
+                }))
+                .await;
+        }
     }
 }
 

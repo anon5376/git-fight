@@ -71,6 +71,20 @@ pub fn role_for(
     }
 }
 
+/// `GET /ws` Error body for a match that is not a room.
+pub fn closed_ws_message<'a>(status: &'a str, abort_reason: Option<&str>) -> Option<&'a str> {
+    match status {
+        "expired" | "aborted" | "finished" => {
+            if abort_reason == Some("outdated") {
+                Some("outdated")
+            } else {
+                Some(status)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +203,25 @@ mod tests {
         assert_eq!(INPUT_DELAY, 3);
         assert_eq!(DISCONNECT_SECS, 30);
         assert_eq!(EXPIRE_SECS, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn closed_ws_messages() {
+        assert_eq!(closed_ws_message("finished", None), Some("finished"));
+        assert_eq!(
+            closed_ws_message("expired", Some("expired")),
+            Some("expired")
+        );
+        assert_eq!(
+            closed_ws_message("aborted", Some("too_many")),
+            Some("aborted")
+        );
+        assert_eq!(
+            closed_ws_message("aborted", Some("outdated")),
+            Some("outdated")
+        );
+        assert_eq!(closed_ws_message("in_progress", None), None);
+        assert_eq!(closed_ws_message("pending", None), None);
     }
 }
 

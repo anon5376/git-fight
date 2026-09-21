@@ -40,6 +40,142 @@ async fn two_clients_agree_with_server_hash() {
 }
 
 #[tokio::test]
+async fn reconnect_after_finish_is_not_a_room() {
+    let addr = spawn_server(Config {
+        instant: true,
+        ..Config::default()
+    })
+    .await;
+
+    let created: Value = http_post(addr, "/api/matches", r#"{"seed":1}"#).await.1;
+    let id = created["id"].as_str().unwrap().to_string();
+    let ours_token = created["ours_token"].as_str().unwrap().to_string();
+    let theirs_token = created["theirs_token"].as_str().unwrap().to_string();
+
+    let _ = tokio::join!(
+        play(addr, &id, &ours_token, true),
+        play(addr, &id, &theirs_token, false),
+    );
+
+    let url = format!("ws://{addr}/ws?match={id}&token={ours_token}");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let err = wait_type(&mut stream, "error").await;
+    assert_eq!(err["message"].as_str(), Some("finished"), "{err}");
+}
+
+#[tokio::test]
+async fn resume_after_stored_round_result_starts_next_round() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = std::env::temp_dir().join(format!(
+        "gf-resume-result-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "resume-ko1resume-ko1resume-ko1resu";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    for round in 0..2 {
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: id,
+                round,
+                path: "lib.rs",
+                hunk_index: round,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let seed = git_fight_server::protocol::round_seed(11, 0);
+    let mut sim = FightState::new(seed, FighterStats::default(), FighterStats::default());
+    let mut tick = 0u32;
+    while sim.result.is_none() {
+        let ours = if tick.is_multiple_of(14) { 1 } else { 0 };
+        sim.step(Input::from_u8(ours), Input::from_u8(0));
+        git_fight_server::db::insert_input(&pool, id, 0, tick, ours, 0)
+            .await
+            .unwrap();
+        tick = tick.saturating_add(1);
+        assert!(tick < 20_000, "round 0 never ended");
+    }
+    git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let mut round = None;
+    for _ in 0..8 {
+        let hello = wait_type(&mut stream, "hello").await;
+        round = hello["round"].as_u64();
+        if round == Some(1) {
+            break;
+        }
+    }
+    assert_eq!(
+        round,
+        Some(1),
+        "stored KO must resume into round 1, not exit"
+    );
+}
+
+#[tokio::test]
 async fn lag_holds_outbound_hello() {
     let addr = spawn_server(Config {
         lag: Duration::from_millis(80),
