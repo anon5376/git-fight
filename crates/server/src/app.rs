@@ -531,6 +531,31 @@ async fn ws_upgrade(
         .on_upgrade(move |socket| handle_socket(socket, state, q, login))
 }
 
+/// `Leave` is `try_send`; a full queue is spawned so the read task
+/// cannot stall the disconnect clock.
+fn enqueue_leave(tx: mpsc::Sender<RoomEvent>, conn_id: u64) {
+    if tx.try_send(RoomEvent::Leave { conn_id }).is_err() {
+        tokio::spawn(async move {
+            let _ = tx.send(RoomEvent::Leave { conn_id }).await;
+        });
+    }
+}
+
+/// A busy `current_theirs_login` must not drop the current-round
+/// theirs. Retry already happened; fall back to the last good login.
+fn coalesce_theirs_login(
+    lookup: Result<Option<String>, sqlx::Error>,
+    cached: &mut Option<String>,
+) -> Option<String> {
+    match lookup {
+        Ok(v) => {
+            *cached = v.clone();
+            v
+        }
+        Err(_) => cached.clone(),
+    }
+}
+
 async fn reject_socket(mut socket: WebSocket, message: &str) {
     let body = serde_json::to_string(&ServerMsg::Error {
         message: message.to_string(),
@@ -560,7 +585,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         return;
     }
     let github = db::github_identity(&row, &hunks);
-    let current_theirs = db::current_theirs_login(&state.pool, &row.id)
+    let mut current_theirs = db::current_theirs_login(&state.pool, &row.id)
         .await
         .ok()
         .flatten();
@@ -663,10 +688,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 continue;
             };
             let current = if github {
-                db::current_theirs_login(&pool, &match_id)
-                    .await
-                    .ok()
-                    .flatten()
+                let looked = match db::current_theirs_login(&pool, &match_id).await {
+                    Ok(v) => Ok(v),
+                    Err(_) => db::current_theirs_login(&pool, &match_id).await,
+                };
+                coalesce_theirs_login(looked, &mut current_theirs)
             } else {
                 None
             };
@@ -689,13 +715,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 round,
             });
         }
-        if enqueue_join {
-            let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
-        } else if leave_tx.try_send(RoomEvent::Leave { conn_id }).is_err() {
-            tokio::spawn(async move {
-                let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
-            });
-        }
+        // Fighter Leave must not block on a full room queue or the
+        // 30s disconnect clock never starts.
+        enqueue_leave(leave_tx, conn_id);
     });
 
     let write = tokio::spawn(async move {
@@ -788,6 +810,47 @@ mod tests {
         assert!(!is_live_public_url("ftp://fight.example"));
         assert!(!is_live_public_url("https://evil\n.example"));
         assert!(!is_live_public_url(""));
+    }
+
+    #[test]
+    fn coalesce_theirs_login_keeps_cache_on_error() {
+        let mut cached = Some("bob".into());
+        assert_eq!(
+            coalesce_theirs_login(Err(sqlx::Error::Protocol("busy".into())), &mut cached)
+                .as_deref(),
+            Some("bob"),
+            "a busy current-round read must not drop theirs Input"
+        );
+        assert_eq!(cached.as_deref(), Some("bob"));
+        assert_eq!(
+            coalesce_theirs_login(Ok(Some("carol".into())), &mut cached).as_deref(),
+            Some("carol")
+        );
+        assert_eq!(cached.as_deref(), Some("carol"));
+        assert_eq!(
+            coalesce_theirs_login(Ok(None), &mut cached).as_deref(),
+            None,
+            "every hunk scored: no current theirs"
+        );
+        assert!(cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn fighter_leave_does_not_wait_on_a_full_event_channel() {
+        let (tx, _rx) = mpsc::channel::<RoomEvent>(1);
+        tx.try_send(RoomEvent::Input {
+            conn_id: 1,
+            tick: 0,
+            buttons: 0,
+            theirs_buttons: None,
+            round: Some(0),
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            enqueue_leave(tx, 2);
+        })
+        .await
+        .expect("fighter Leave waited on a full room channel");
     }
 
     #[tokio::test]

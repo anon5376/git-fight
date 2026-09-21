@@ -494,6 +494,12 @@ struct Advance<'a> {
 }
 
 async fn advance(a: Advance<'_>) -> bool {
+    // A last-round sim that already ended must reach finish() even if
+    // another writer marked the row finished — that path sends End,
+    // not a generic terminal Error.
+    if let Some(result) = a.sim.result {
+        return finish(a, result).await;
+    }
     match match_is_open(a.pool, a.id).await {
         MatchOpen::Closed => {
             expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
@@ -501,9 +507,6 @@ async fn advance(a: Advance<'_>) -> bool {
         }
         MatchOpen::Unknown => return false,
         MatchOpen::Open => {}
-    }
-    if let Some(result) = a.sim.result {
-        return finish(a, result).await;
     }
     if a.started_at.is_none() && a.ours.seen && a.theirs.seen {
         match db::start_open_match(a.pool, a.id).await {
@@ -722,6 +725,16 @@ fn last_round_followup(marked: bool, status: LastRoundStatus) -> LastRound {
     }
 }
 
+/// The row is already closed. Last-round + `finished` still owes
+/// `End { match_over }` to sockets that were in the room.
+fn closed_finish_followup(last_round: bool, status: LastRoundStatus) -> LastRound {
+    if last_round && status == LastRoundStatus::Finished {
+        LastRound::MatchOver
+    } else {
+        LastRound::Terminal
+    }
+}
+
 async fn match_last_round_status(pool: &SqlitePool, id: &str) -> LastRoundStatus {
     match db::get_match(pool, id).await {
         Err(_) => LastRoundStatus::Unknown,
@@ -797,12 +810,23 @@ async fn stored_round(pool: &SqlitePool, id: &str, round: u32) -> StoredRound {
     }
 }
 
+async fn finish_closed(a: Advance<'_>, result: RoundResult) -> bool {
+    let last_round = *a.round + 1 >= a.total_rounds;
+    match closed_finish_followup(last_round, match_last_round_status(a.pool, a.id).await) {
+        LastRound::MatchOver => {
+            let msg = encode(&end_msg(a.sim, result, *a.round, true));
+            broadcast_or_spawn(a.conns, &msg);
+        }
+        LastRound::Terminal | LastRound::Retry => {
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+        }
+    }
+    true
+}
+
 async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     match match_is_open(a.pool, a.id).await {
-        MatchOpen::Closed => {
-            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-            return true;
-        }
+        MatchOpen::Closed => return finish_closed(a, result).await,
         MatchOpen::Unknown => return false,
         MatchOpen::Open => {}
     }
@@ -838,8 +862,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         }
         FinishAfterWrite::Close => {
             *a.forfeit_pending = false;
-            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-            return true;
+            return finish_closed(a, result).await;
         }
         FinishAfterWrite::Retry => return false,
     }
@@ -1694,6 +1717,21 @@ mod tests {
             last_round_followup(false, LastRoundStatus::Unknown),
             LastRound::Retry,
             "busy mark must not leave a won fight without a room"
+        );
+        assert_eq!(
+            closed_finish_followup(true, LastRoundStatus::Finished),
+            LastRound::MatchOver,
+            "existing sockets still get End after another writer marks finished"
+        );
+        assert_eq!(
+            closed_finish_followup(true, LastRoundStatus::Closed),
+            LastRound::Terminal,
+            "aborted/expired last round stays an Error"
+        );
+        assert_eq!(
+            closed_finish_followup(false, LastRoundStatus::Finished),
+            LastRound::Terminal,
+            "a non-final closed row is not match_over"
         );
         assert_eq!(
             after_non_final(MatchOpen::Open),
