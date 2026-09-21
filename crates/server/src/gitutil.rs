@@ -683,8 +683,7 @@ fn line_range(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
         .iter()
         .filter(|b| **b == b'\n')
         .count()
-        .max(1)
-        .min(BLAME_MAX_LINES);
+        .clamp(1, BLAME_MAX_LINES);
     Some((start, start + nlines - 1))
 }
 
@@ -1235,7 +1234,7 @@ mod tests {
             "1 MiB-class hunk search must not be quadratic"
         );
         let mut hay = Vec::from(&b"fn base()\n"[..]);
-        hay.extend(std::iter::repeat(b'z').take(80_000));
+        hay.extend(std::iter::repeat_n(b'z', 80_000));
         assert_eq!(line_range(&hay, b"fn base()\n"), Some((1, 1)));
     }
 
