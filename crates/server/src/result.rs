@@ -235,7 +235,26 @@ async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) {
     let Some(inst) = row.installation_id.map(|i| i as u64) else {
         return;
     };
+    if row.pr_number <= 0 || row.owner.is_empty() {
+        return;
+    }
     let _ = gh
-        .comment(inst, &row.owner, &row.repo, row.pr_number as u64, body)
+        .issue_comment(
+            inst,
+            &row.owner,
+            &row.repo,
+            row.pr_number as u64,
+            row.challenge_comment_id,
+            body,
+        )
         .await;
+}
+
+pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) {
+    let public = ctx.public_url.trim_end_matches('/');
+    let body = format!(
+        "git fight: this match expired before anyone finished. Nothing was pushed.\nopen match: {public}/match/{}",
+        row.id
+    );
+    comment(ctx, row, &body).await;
 }

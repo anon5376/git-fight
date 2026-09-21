@@ -29,6 +29,7 @@ pub struct MatchRow {
     pub final_hash: Option<String>,
     pub abort_reason: Option<String>,
     pub result_branch: Option<String>,
+    pub challenge_comment_id: Option<i64>,
 }
 
 pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -76,6 +77,9 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    let _ = sqlx::query("ALTER TABLE matches ADD COLUMN challenge_comment_id INTEGER")
+        .execute(pool)
+        .await;
     ensure_match_inputs(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS match_hunks (
@@ -232,7 +236,7 @@ const MATCH_COLS: &str = "id, seed, status, ours_name, theirs_name, ours_kind, t
                 ours_token, theirs_token, ours_login, theirs_login, owner, repo, pr_number,
                 pr_head_sha, pr_base_sha, installation_id,
                 input_delay_ticks, created_at, expires_at,
-                final_hash, abort_reason, result_branch";
+                final_hash, abort_reason, result_branch, challenge_comment_id";
 
 pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, sqlx::Error> {
     sqlx::query_as::<_, MatchRow>(&format!("SELECT {MATCH_COLS} FROM matches WHERE id = ?"))
@@ -750,6 +754,19 @@ pub async fn get_player_stats(
         }))
 }
 
+pub async fn set_challenge_comment_id(
+    pool: &SqlitePool,
+    id: &str,
+    comment_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE matches SET challenge_comment_id = ? WHERE id = ?")
+        .bind(comment_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_result_branch(
     pool: &SqlitePool,
     id: &str,
@@ -818,6 +835,7 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {
             final_hash: row.try_get("final_hash")?,
             abort_reason: row.try_get("abort_reason")?,
             result_branch: row.try_get("result_branch")?,
+            challenge_comment_id: row.try_get("challenge_comment_id")?,
         })
     }
 }
@@ -905,5 +923,9 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(open.challenge_comment_id.is_none());
+        set_challenge_comment_id(&pool, "inst1", 99).await.unwrap();
+        let stored = get_match(&pool, "inst1").await.unwrap().unwrap();
+        assert_eq!(stored.challenge_comment_id, Some(99));
     }
 }

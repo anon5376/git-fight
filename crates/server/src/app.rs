@@ -137,6 +137,15 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
                 let mut rooms = expirer.rooms.lock().await;
                 for id in ids {
+                    if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
+                        let ctx = ResultCtx {
+                            gh: expirer.github.clone(),
+                            pool: expirer.pool.clone(),
+                            public_url: expirer.auth.public_url.clone(),
+                            test_repos: expirer.test_repos.clone(),
+                        };
+                        crate::result::comment_expired(&ctx, &row).await;
+                    }
                     if let Some(tx) = rooms.remove(&id) {
                         let _ = tx.send(RoomEvent::Shutdown).await;
                     }

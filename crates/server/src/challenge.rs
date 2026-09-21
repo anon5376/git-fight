@@ -17,41 +17,55 @@ pub struct ChallengeCtx {
     pub expire_secs: i64,
 }
 
+pub struct ChallengeStart {
+    pub body: String,
+    pub match_id: Option<String>,
+}
+
+fn note(body: impl Into<String>) -> ChallengeStart {
+    ChallengeStart {
+        body: body.into(),
+        match_id: None,
+    }
+}
+
 pub async fn start_challenge(
     ctx: &ChallengeCtx,
     installation_id: u64,
     owner: &str,
     repo: &str,
     number: u64,
-) -> Result<String, String> {
+) -> Result<ChallengeStart, String> {
     if let Some(existing) = db::open_match_for_pr(&ctx.pool, owner, repo, number)
         .await
         .map_err(|e| e.to_string())?
     {
-        return Ok(format!(
+        return Ok(note(format!(
             "a fight is already open: {}/match/{}",
             ctx.public_url.trim_end_matches('/'),
             existing.id
-        ));
+        )));
     }
 
     let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, owner, repo, number, 3600)
         .await
         .map_err(|e| e.to_string())?;
     if recent_pr >= crate::limits::MAX_MATCHES_PER_PR_HOUR {
-        return Ok("too many fights on this pull request; try later".into());
+        return Ok(note("too many fights on this pull request; try later"));
     }
 
     let recent = db::count_recent_matches_for_install(&ctx.pool, installation_id, 3600)
         .await
         .map_err(|e| e.to_string())?;
     if recent >= crate::limits::MAX_MATCHES_PER_INSTALL_HOUR {
-        return Ok("too many fights from this installation; try later".into());
+        return Ok(note("too many fights from this installation; try later"));
     }
 
     let repo_info = ctx.gh.get_repo(installation_id, owner, repo).await?;
     if repo_info.size > MAX_REPO_KB {
-        return Ok("this repo is over 1 GB, so git fight will not clone it".into());
+        return Ok(note(
+            "this repo is over 1 GB, so git fight will not clone it",
+        ));
     }
 
     let pr = ctx
@@ -59,8 +73,8 @@ pub async fn start_challenge(
         .poll_mergeable(installation_id, owner, repo, number)
         .await?;
     match pr.mergeable {
-        Some(true) => return Ok("no conflicts to fight".into()),
-        None => return Ok("could not determine mergeability".into()),
+        Some(true) => return Ok(note("no conflicts to fight")),
+        None => return Ok(note("could not determine mergeability")),
         Some(false) => {}
     }
 
@@ -88,26 +102,26 @@ pub async fn start_challenge(
         .await
         .map_err(|e| e.to_string())?;
     if code == 0 {
-        return Ok("no conflicts to fight".into());
+        return Ok(note("no conflicts to fight"));
     }
 
     let hunks = match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths).await {
         Ok(h) => h,
         Err(gitutil::GitError::TooMany(n)) => {
-            return Ok(format!(
+            return Ok(note(format!(
                 "too many conflicts for one fight ({n}; max {MAX_HUNKS})"
-            ));
+            )));
         }
         Err(gitutil::GitError::NothingToFight) => {
-            return Ok("the conflicts are not the kind git fight can play".into());
+            return Ok(note("the conflicts are not the kind git fight can play"));
         }
         Err(e) => return Err(e.to_string()),
     };
     if hunks.len() > MAX_HUNKS {
-        return Ok(format!(
+        return Ok(note(format!(
             "too many conflicts for one fight ({}; max {MAX_HUNKS})",
             hunks.len()
-        ));
+        )));
     }
 
     let ours_login = pr.user.login.clone();
@@ -202,10 +216,13 @@ pub async fn start_challenge(
         format!("{ours_login} vs {theirs_name}")
     };
     let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
-    Ok(format!(
-        "git fight: {vs}. {rounds} round{}. {link}",
-        if rounds == 1 { "" } else { "s" }
-    ))
+    Ok(ChallengeStart {
+        body: format!(
+            "git fight: {vs}. {rounds} round{}. {link}",
+            if rounds == 1 { "" } else { "s" }
+        ),
+        match_id: Some(id),
+    })
 }
 
 pub fn is_fight_comment(body: &str) -> bool {

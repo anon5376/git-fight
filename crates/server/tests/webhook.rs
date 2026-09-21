@@ -213,7 +213,17 @@ fn pr_event_body(action: &str, head: &str, base: &str) -> Vec<u8> {
 
 fn posted_comments(rec: &[wiremock::Request]) -> Vec<String> {
     rec.iter()
-        .filter(|r| r.url.path().ends_with("/comments"))
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/comments"))
+        .filter_map(|r| {
+            let posted: Value = serde_json::from_slice(&r.body).ok()?;
+            posted["body"].as_str().map(str::to_string)
+        })
+        .collect()
+}
+
+fn patched_comments(rec: &[wiremock::Request]) -> Vec<String> {
+    rec.iter()
+        .filter(|r| r.method.as_str() == "PATCH" && r.url.path().contains("/issues/comments/"))
         .filter_map(|r| {
             let posted: Value = serde_json::from_slice(&r.body).ok()?;
             posted["body"].as_str().map(str::to_string)
@@ -295,6 +305,11 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
     Mock::given(method("POST"))
         .and(path("/repos/acme/box/issues/1/comments"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 99 })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"/repos/acme/box/issues/comments/\d+"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 99 })))
         .mount(&mock)
         .await;
     mock
@@ -397,7 +412,7 @@ async fn invalid_signature_is_401() {
 async fn valid_fight_comments_challenge() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
-    let addr = spawn(cfg_for(&mock, bare)).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
     let status = post_signed(addr, "issue_comment", "deliv-1", &fight_body()).await;
     assert_eq!(status, 200);
     let rec = mock.received_requests().await.unwrap();
@@ -407,6 +422,18 @@ async fn valid_fight_comments_challenge() {
     assert!(text.contains("git fight"), "{text}");
     assert!(text.contains("/match/"), "{text}");
     assert!(text.contains("CPU"), "{text}");
+    let id = text
+        .split("/match/")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let row = git_fight_server::db::get_match(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.challenge_comment_id, Some(99));
 }
 
 #[tokio::test]
@@ -584,11 +611,14 @@ async fn pr_synchronize_moved_sha_comments_once() {
         .await,
         200
     );
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
-    assert_eq!(comments.len(), 2, "{comments:?}");
+    let rec = mock.received_requests().await.unwrap();
+    let comments = posted_comments(&rec);
+    assert_eq!(comments.len(), 1, "challenge stays one POST: {comments:?}");
+    let patched = patched_comments(&rec);
+    assert_eq!(patched.len(), 1, "{patched:?}");
     assert!(
-        comments[1].contains("outdated") && comments[1].contains("/fight"),
-        "{comments:?}"
+        patched[0].contains("outdated") && patched[0].contains("/fight"),
+        "{patched:?}"
     );
     assert_eq!(
         post_signed(
@@ -604,11 +634,18 @@ async fn pr_synchronize_moved_sha_comments_once() {
         .await,
         200
     );
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let rec = mock.received_requests().await.unwrap();
     assert_eq!(
-        comments.len(),
-        2,
-        "outdated notice must not repeat: {comments:?}"
+        posted_comments(&rec).len(),
+        1,
+        "outdated notice must not post again: {:?}",
+        posted_comments(&rec)
+    );
+    assert_eq!(
+        patched_comments(&rec).len(),
+        1,
+        "outdated notice must not edit again: {:?}",
+        patched_comments(&rec)
     );
 }
 

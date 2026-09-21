@@ -142,7 +142,7 @@ async fn run_room(
                 match ev {
                     RoomEvent::Shutdown => {
                         if !done {
-                            expire_now(&pool, &id, &conns).await;
+                            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
                         }
                         break;
                     }
@@ -247,7 +247,7 @@ async fn run_room(
                 if !done && started_at.is_none() {
                     if let Some(exp) = expires_at {
                         if Utc::now() >= exp {
-                            expire_now(&pool, &id, &conns).await;
+                            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
                             done = true;
                         }
                     }
@@ -476,8 +476,24 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     false
 }
 
-async fn expire_now(pool: &SqlitePool, id: &str, conns: &BTreeMap<u64, Conn>) {
+async fn expire_now(
+    pool: &SqlitePool,
+    id: &str,
+    conns: &BTreeMap<u64, Conn>,
+    result: Option<&ResultCtx>,
+) {
+    let row = db::get_match(pool, id).await.ok().flatten();
+    if row.as_ref().is_some_and(|r| r.status == "expired") {
+        let msg = encode(&ServerMsg::Error {
+            message: "expired".into(),
+        });
+        broadcast(conns, &msg).await;
+        return;
+    }
     let _ = db::set_status(pool, id, "expired", false, true, None, Some("expired")).await;
+    if let (Some(ctx), Some(row)) = (result, row) {
+        result::comment_expired(ctx, &row).await;
+    }
     let msg = encode(&ServerMsg::Error {
         message: "expired".into(),
     });

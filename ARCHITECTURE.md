@@ -252,7 +252,7 @@ SQLite via sqlx. Migrations run at server start. No secrets, no installation tok
 | `result_branch` | `TEXT` NULL | Set only after a successful create-only push. |
 | `final_hash` | `TEXT` NULL | Server `state_hash` at match end. |
 | `abort_reason` | `TEXT` NULL | `draw` / `outdated` / `expired` / `too_many` / … |
-| `challenge_comment_id` | `INTEGER` NULL | |
+| `challenge_comment_id` | `INTEGER` NULL | GitHub issue-comment id of the challenge. Outcome comments (result, draw, outdated, expired) edit this comment when set. |
 
 ### `match_hunks`
 
@@ -277,11 +277,12 @@ Replay log and lockstep resume.
 | Column | Type | Notes |
 |---|---|---|
 | `match_id` | `TEXT` | |
-| `tick` | `INTEGER` | |
+| `round_index` | `INTEGER` | Round that produced this tick. |
+| `tick` | `INTEGER` | Tick index within that round. |
 | `ours` | `INTEGER` | Packed buttons. |
 | `theirs` | `INTEGER` | Packed buttons. |
 
-Primary key `(match_id, tick)`. Append-only.
+Primary key `(match_id, round_index, tick)`. Append-only.
 
 ### `sessions`
 

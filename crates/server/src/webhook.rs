@@ -163,7 +163,14 @@ async fn notice_if_outdated(
         row.id
     );
     let _ = gh
-        .comment(inst, &repo.owner.login, &repo.name, pr.number, &body)
+        .issue_comment(
+            inst,
+            &repo.owner.login,
+            &repo.name,
+            pr.number,
+            row.challenge_comment_id,
+            &body,
+        )
         .await;
 }
 
@@ -184,11 +191,23 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
     };
     let owner = repo.owner.login.clone();
     let name = repo.name.clone();
-    let body = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
+    let start = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
         Ok(msg) => msg,
-        Err(e) => format!("git fight could not start: {e}"),
+        Err(e) => challenge::ChallengeStart {
+            body: format!("git fight could not start: {e}"),
+            match_id: None,
+        },
     };
-    let _ = ctx.gh.comment(inst, &owner, &name, number, &body).await;
+    let posted = ctx
+        .gh
+        .comment(inst, &owner, &name, number, &start.body)
+        .await
+        .unwrap_or(0);
+    if let Some(match_id) = start.match_id {
+        if posted > 0 {
+            let _ = db::set_challenge_comment_id(&ctx.pool, &match_id, posted as i64).await;
+        }
+    }
     HttpStatus::OK
 }
 

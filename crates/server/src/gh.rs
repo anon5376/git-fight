@@ -227,6 +227,54 @@ impl GitHub {
         Ok(res.json::<Id>().await.map(|c| c.id).unwrap_or(0))
     }
 
+    pub async fn edit_comment(
+        &self,
+        installation_id: u64,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<u64, String> {
+        let res = self
+            .authed(
+                installation_id,
+                reqwest::Method::PATCH,
+                &format!("/repos/{owner}/{repo}/issues/comments/{comment_id}"),
+            )
+            .await?
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("edit_comment {}", res.status()));
+        }
+        Ok(comment_id)
+    }
+
+    /// Edit the original challenge comment when we have its id; otherwise post a new one.
+    pub async fn issue_comment(
+        &self,
+        installation_id: u64,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        existing_id: Option<i64>,
+        body: &str,
+    ) -> Result<u64, String> {
+        if let Some(id) = existing_id.filter(|i| *i > 0) {
+            if self
+                .edit_comment(installation_id, owner, repo, id as u64, body)
+                .await
+                .is_ok()
+            {
+                return Ok(id as u64);
+            }
+        }
+        self.comment(installation_id, owner, repo, number, body)
+            .await
+    }
+
     pub async fn auto_challenge_enabled(
         &self,
         installation_id: u64,

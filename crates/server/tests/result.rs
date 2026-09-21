@@ -115,6 +115,11 @@ async fn github_mocks(head: &str, base: &str) -> MockServer {
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 42 })))
         .mount(&mock)
         .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/acme/box/issues/comments/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 42 })))
+        .mount(&mock)
+        .await;
     mock
 }
 
@@ -208,7 +213,20 @@ async fn posted_comments(mock: &MockServer) -> Vec<String> {
         .await
         .unwrap()
         .iter()
-        .filter(|r| r.url.path().ends_with("/comments"))
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/comments"))
+        .filter_map(|r| {
+            let posted: Value = serde_json::from_slice(&r.body).ok()?;
+            posted["body"].as_str().map(str::to_string)
+        })
+        .collect()
+}
+
+async fn patched_comments(mock: &MockServer) -> Vec<String> {
+    mock.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "PATCH" && r.url.path().contains("/issues/comments/"))
         .filter_map(|r| {
             let posted: Value = serde_json::from_slice(&r.body).ok()?;
             posted["body"].as_str().map(str::to_string)
@@ -342,6 +360,32 @@ async fn outdated_pr_skips_push() {
         .unwrap()
         .unwrap();
     assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
+}
+
+#[tokio::test]
+async fn result_edits_challenge_comment_when_id_set() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base).await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    git_fight_server::db::set_challenge_comment_id(&pool, MATCH_ID, 42)
+        .await
+        .unwrap();
+    let ctx = ctx(pool, &mock, bare.clone());
+    git_fight_server::publish_result(&ctx, MATCH_ID)
+        .await
+        .unwrap();
+    let patched = patched_comments(&mock).await;
+    assert!(
+        patched
+            .iter()
+            .any(|c| c.contains("git fight finished") && c.contains("/replay/")),
+        "{patched:?}"
+    );
+    assert!(
+        posted_comments(&mock).await.is_empty(),
+        "should edit the challenge comment instead of posting another"
+    );
 }
 
 #[tokio::test]
