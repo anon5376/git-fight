@@ -6,7 +6,8 @@ RUN rustup target add wasm32-unknown-unknown \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
-RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+COPY scripts/install-wasm-pack.sh /tmp/install-wasm-pack.sh
+RUN sh /tmp/install-wasm-pack.sh
 COPY . .
 RUN cargo build --release -p git-fight-server
 WORKDIR /src/web

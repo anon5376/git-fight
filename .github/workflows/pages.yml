@@ -23,7 +23,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: sh scripts/install-wasm-pack.sh
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

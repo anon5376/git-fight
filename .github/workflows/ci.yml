@@ -22,7 +22,7 @@ jobs:
       - name: Core compiles to wasm
         run: cargo check -p git-fight-core --target wasm32-unknown-unknown
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: sh scripts/install-wasm-pack.sh
       - name: Golden test in WebAssembly (Node)
         run: wasm-pack test --node crates/wasm
       - uses: actions/setup-node@v4
