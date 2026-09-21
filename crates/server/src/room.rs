@@ -128,7 +128,12 @@ async fn run_room(
 ) {
     let seed: u64 = row.seed.parse().unwrap_or(1);
     let delay = u32::try_from(row.input_delay_ticks).unwrap_or(INPUT_DELAY);
-    let mut hunks = db::list_hunks(&pool, &row.id).await.unwrap_or_default();
+    // A busy or empty hunks read must not collapse a GitHub fight into
+    // the local-demo 1-round room. Join gets preparing until rows exist.
+    let Some(mut hunks) = wait_playable_hunks(&pool, &row.id, row.pr_number, &mut rx).await else {
+        drain_late_joins(&mut rx, &pool, &row.id).await;
+        return;
+    };
     let github = db::github_identity(&row, &hunks);
     let total_rounds = u32::try_from(hunks.len()).unwrap_or(0).max(1);
     let mut scored_all = !hunks.is_empty() && hunks.iter().all(|h| h.winner.is_some());
@@ -832,6 +837,48 @@ enum JoinAdmit {
     Unknown,
     ScoredAll,
     Enter,
+}
+
+/// Local demo (`pr_number == 0`) may have no hunk rows. A GitHub
+/// `/fight` row must wait for the clone's hunks — `unwrap_or_default`
+/// plus `len().max(1)` would Hello a 1-round fight and can mark
+/// `finished` before the real conflicts exist.
+fn playable_room_hunks(pr_number: i64, hunks: &[db::HunkRow]) -> bool {
+    pr_number <= 0 || !hunks.is_empty()
+}
+
+async fn wait_playable_hunks(
+    pool: &SqlitePool,
+    id: &str,
+    pr_number: i64,
+    rx: &mut mpsc::Receiver<RoomEvent>,
+) -> Option<Vec<db::HunkRow>> {
+    loop {
+        match db::list_hunks(pool, id).await {
+            Ok(hunks) if playable_room_hunks(pr_number, &hunks) => return Some(hunks),
+            Ok(_) | Err(_) => {}
+        }
+        if match_is_open(pool, id).await == MatchOpen::Closed {
+            return None;
+        }
+        tokio::select! {
+            ev = rx.recv() => {
+                match ev {
+                    None | Some(RoomEvent::Shutdown) => return None,
+                    Some(RoomEvent::Join { tx, .. }) => {
+                        try_send_or_spawn(
+                            &tx,
+                            encode(&ServerMsg::Error {
+                                message: "preparing".into(),
+                            }),
+                        );
+                    }
+                    Some(RoomEvent::Leave { .. }) | Some(RoomEvent::Input { .. }) => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
 }
 
 /// A busy open-status read is not an open fight: do not Hello.
@@ -2246,6 +2293,14 @@ mod tests {
             "preparing",
             "Join must not sit mute while match_inputs replay is still retrying"
         );
+        assert!(
+            playable_room_hunks(0, &[]),
+            "local demo has no hunk row and still ends"
+        );
+        assert!(
+            !playable_room_hunks(7, &[]),
+            "a GitHub /fight row must not Hello as a 1-round demo"
+        );
     }
 
     fn join_replay_followup(replay_ok: bool) -> &'static str {
@@ -2254,6 +2309,166 @@ mod tests {
         } else {
             "preparing"
         }
+    }
+
+    #[tokio::test]
+    async fn github_room_waits_for_hunks_before_hello() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "githunks01githunks01githunks01gi".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "alice".into(),
+                theirs_name: "bob".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "github".into(),
+                ours_login: Some("alice".into()),
+                theirs_login: Some("bob".into()),
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "app".into(),
+                pr_number: 7,
+                pr_head_sha: "a".repeat(40),
+                pr_base_sha: "b".repeat(40),
+            },
+        )
+        .await
+        .unwrap();
+        let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
+        let row = crate::db::get_match(&pool, "githunks01githunks01githunks01gi")
+            .await
+            .unwrap()
+            .unwrap();
+        let tx = spawn_room(row, pool.clone(), RoomSettings::default(), rooms);
+        let (out, mut rx) = mpsc::channel::<String>(8);
+        tx.send(RoomEvent::Join {
+            conn_id: 1,
+            login: Some("alice".into()),
+            token: None,
+            tx: out,
+        })
+        .await
+        .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("preparing while clone hunks are missing")
+            .expect("channel open");
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["type"].as_str(), Some("error"), "{v}");
+        assert_eq!(v["message"].as_str(), Some("preparing"), "{v}");
+
+        crate::db::insert_hunks(
+            &pool,
+            &[
+                crate::db::NewHunk {
+                    match_id: "githunks01githunks01githunks01gi",
+                    round: 0,
+                    path: "a.rs",
+                    hunk_index: 0,
+                    ours: b"a",
+                    theirs: b"b",
+                    base: b"c",
+                    theirs_login: Some("bob"),
+                    theirs_name: Some("bob"),
+                    ours_stats: FighterStats::default(),
+                    theirs_stats: FighterStats::default(),
+                },
+                crate::db::NewHunk {
+                    match_id: "githunks01githunks01githunks01gi",
+                    round: 1,
+                    path: "b.rs",
+                    hunk_index: 0,
+                    ours: b"d",
+                    theirs: b"e",
+                    base: b"f",
+                    theirs_login: Some("carol"),
+                    theirs_name: Some("carol"),
+                    ours_stats: FighterStats::default(),
+                    theirs_stats: FighterStats::default(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let (out2, mut rx2) = mpsc::channel::<String>(8);
+        tx.send(RoomEvent::Join {
+            conn_id: 2,
+            login: Some("alice".into()),
+            token: None,
+            tx: out2,
+        })
+        .await
+        .unwrap();
+        let hello = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg = rx2.recv().await.expect("hello channel");
+                let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if v["type"].as_str() == Some("hello") {
+                    return v;
+                }
+            }
+        })
+        .await
+        .expect("Hello after hunks land");
+        assert_eq!(
+            hello["total_rounds"].as_u64(),
+            Some(2),
+            "must not collapse a 2-conflict PR into one demo round: {hello}"
+        );
+        let row = crate::db::get_match(&pool, "githunks01githunks01githunks01gi")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "pending", "waiting for hunks must not finish");
+    }
+
+    #[tokio::test]
+    async fn local_demo_hellos_without_hunks() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(
+            &pool,
+            "localdemo01localdemo01localdemo0",
+            1,
+            3,
+            "o",
+            "t",
+            60,
+        )
+        .await
+        .unwrap();
+        let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
+        let row = crate::db::get_match(&pool, "localdemo01localdemo01localdemo0")
+            .await
+            .unwrap()
+            .unwrap();
+        let tx = spawn_room(row, pool, RoomSettings::default(), rooms);
+        let (out, mut rx) = mpsc::channel::<String>(8);
+        tx.send(RoomEvent::Join {
+            conn_id: 1,
+            login: None,
+            token: Some("o".into()),
+            tx: out,
+        })
+        .await
+        .unwrap();
+        let hello = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let msg = rx.recv().await.expect("hello channel");
+                let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if v["type"].as_str() == Some("hello") {
+                    return v;
+                }
+            }
+        })
+        .await
+        .expect("local demo Hello");
+        assert_eq!(hello["total_rounds"].as_u64(), Some(1), "{hello}");
     }
 
     #[tokio::test]
