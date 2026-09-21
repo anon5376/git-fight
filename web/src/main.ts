@@ -198,6 +198,7 @@ async function main(): Promise<void> {
   if (await bootOnline()) {
     return;
   }
+  // Menu starts hidden so vs-CPU is not clickable before wasm and listeners exist.
   document.querySelector("[data-testid=demo]")?.addEventListener("click", showDemo);
   document.querySelector("[data-testid=cpu]")?.addEventListener("click", showSidePick);
   document.querySelector("[data-testid=two]")?.addEventListener("click", () => {
@@ -221,6 +222,7 @@ async function main(): Promise<void> {
   });
   document.querySelector("[data-testid=back-demo]")?.addEventListener("click", showMenu);
   document.querySelector("[data-testid=back-side]")?.addEventListener("click", showMenu);
+  showMenu();
 }
 
 void main();
