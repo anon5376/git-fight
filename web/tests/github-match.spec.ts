@@ -35,12 +35,14 @@ function sqlStr(value: string | null): string {
 
 function attachGithubMatch(
   matchId: string,
-  theirs: { kind: "cpu" | "github"; login: string | null },
+  theirs: { kind: "cpu" | "github" | "mirror"; login: string | null },
   hunks?: GithubHunk[],
 ): void {
+  const oursLogin = theirs.kind === "mirror" ? (theirs.login ?? "alice") : "alice";
+  const oursKind = theirs.kind === "mirror" ? "mirror" : "github";
   const rounds = hunks ?? [
-    { path: "a.rs", login: theirs.login, name: "bob" },
-    { path: "b.rs", login: theirs.login, name: "bob" },
+    { path: "a.rs", login: theirs.login, name: theirs.login ?? "bob" },
+    { path: "b.rs", login: theirs.login, name: theirs.login ?? "bob" },
   ];
   const hunkValues = rounds
     .map(
@@ -50,9 +52,9 @@ function attachGithubMatch(
     .join(",\n  ");
   const sql = `
 UPDATE matches SET
-  ours_login = 'alice', theirs_login = ${sqlStr(theirs.login)},
-  ours_name = 'alice', theirs_name = 'bob',
-  ours_kind = 'github', theirs_kind = '${theirs.kind}',
+  ours_login = ${sqlStr(oursLogin)}, theirs_login = ${sqlStr(theirs.login)},
+  ours_name = '${oursLogin}', theirs_name = '${rounds[0]?.name ?? "bob"}',
+  ours_kind = '${oursKind}', theirs_kind = '${theirs.kind}',
   owner = 'acme', repo = 'box', pr_number = 0
 WHERE id = '${matchId}';
 DELETE FROM match_inputs WHERE match_id = '${matchId}';
@@ -71,11 +73,18 @@ INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at) 
   execFileSync("sqlite3", [DB, sql], { stdio: "pipe" });
 }
 
-async function mashUntil(pages: Page[], pred: () => Promise<boolean>, ms: number): Promise<void> {
+async function mashUntil(
+  pages: Page[],
+  pred: () => Promise<boolean>,
+  ms: number,
+  keys: string[] = ["a"],
+): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline && !(await pred())) {
     for (const page of pages) {
-      await page.keyboard.press("a");
+      for (const key of keys) {
+        await page.keyboard.press(key);
+      }
     }
     await pages[0]?.waitForTimeout(30);
   }
@@ -273,4 +282,40 @@ test("theirs slot follows the blamed author each round", async ({ browser, reque
   await aliceCtx.close();
   await bobCtx.close();
   await carolCtx.close();
+});
+
+test("mirror GitHub session plays both slots with 2P keys", async ({ context, page, request }) => {
+  const matchId = await createMatch(request);
+  attachGithubMatch(matchId, { kind: "mirror", login: "alice" }, [
+    { path: "a.rs", login: "alice", name: "alice" },
+    { path: "b.rs", login: "alice", name: "alice" },
+  ]);
+  await context.addCookies([sidCookie("sid-alice")]);
+  await page.goto(`/match/${matchId}`);
+  const stage = page.getByTestId("stage");
+  await expect(stage).toHaveAttribute("data-role", "both", { timeout: 10_000 });
+  await expect(stage).toHaveAttribute("data-you-are", "alice");
+  await expect(stage).toHaveAttribute("data-ours-name", "alice");
+  await expect(stage).toHaveAttribute("data-theirs-name", "alice");
+  await expect(page.getByTestId("wait")).toContainText(/both sides/i);
+  await expect(page.getByTestId("wait")).not.toContainText(/spectating/i);
+  await expect(page.getByTestId("github-login")).toHaveCount(0);
+
+  await stage.click();
+  const resolved = page.getByTestId("resolved");
+  await mashUntil(
+    [page],
+    async () => ((await resolved.textContent()) ?? "").includes("/replay/"),
+    25_000,
+    ["a", "j"],
+  );
+  await expect(resolved).toContainText(`/replay/${matchId}`);
+
+  const replay = await page.request.get(`/api/replays/${matchId}`);
+  expect(replay.ok()).toBeTruthy();
+  const replayBody = (await replay.json()) as { rounds?: Array<{ ticks?: number[][] }> };
+  expect(replayBody.rounds).toHaveLength(2);
+  const ticks = replayBody.rounds?.flatMap((r) => r.ticks ?? []) ?? [];
+  expect(ticks.some((t) => t[0] === 1)).toBeTruthy();
+  expect(ticks.some((t) => t[1] === 1)).toBeTruthy();
 });

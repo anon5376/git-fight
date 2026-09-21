@@ -507,6 +507,190 @@ async fn disconnect_after_grace_period_forfeits_round() {
     }
 }
 
+#[tokio::test]
+async fn forfeit_round_then_return_plays_later_round() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = std::env::temp_dir().join(format!(
+        "gf-forfeit-return-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "forfeit01forfeit01forfeit01forfe";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 5,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    for round in 0..2 {
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: id,
+                round,
+                path: "lib.rs",
+                hunk_index: round,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            pool,
+            Config {
+                instant: true,
+                disconnect: Duration::from_millis(80),
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let ours_url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let theirs_url = format!("ws://{addr}/ws?match={id}&token=theirs-token");
+    let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
+    let (theirs_ws, _) = tokio_tungstenite::connect_async(&theirs_url).await.unwrap();
+    let (mut ours_sink, mut ours_stream) = ours_ws.split();
+    let (mut theirs_sink, mut theirs_stream) = theirs_ws.split();
+    let _ = wait_type(&mut ours_stream, "hello").await;
+    let _ = wait_type(&mut theirs_stream, "hello").await;
+
+    for tick in 0..8u32 {
+        let msg = format!(r#"{{"type":"input","tick":{tick},"buttons":0}}"#);
+        ours_sink
+            .send(Message::Text(msg.clone().into()))
+            .await
+            .unwrap();
+        theirs_sink.send(Message::Text(msg.into())).await.unwrap();
+    }
+
+    drop(ours_sink);
+    drop(ours_stream);
+
+    let mut round1_hello = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let end0 = loop {
+        let msg = tokio::time::timeout_at(deadline, theirs_stream.next())
+            .await
+            .expect("timeout waiting for forfeit")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("end") => {
+                assert_eq!(v["round"].as_u64(), Some(0), "first end should be round 0");
+                break v;
+            }
+            Some("hello") => round1_hello = Some(v),
+            Some("error") => panic!("server error {}", v["message"]),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        end0["result"].as_i64(),
+        Some(1),
+        "ours disconnect => theirs"
+    );
+    assert_eq!(end0["match_over"].as_bool(), Some(false));
+
+    let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
+    let (mut ours_sink, mut ours_stream) = ours_ws.split();
+    let ours_hello = wait_type(&mut ours_stream, "hello").await;
+    assert_eq!(ours_hello["round"].as_u64(), Some(1));
+    assert_eq!(ours_hello["your_role"].as_str(), Some("ours"));
+    let theirs_hello = match round1_hello {
+        Some(v) => v,
+        None => wait_type(&mut theirs_stream, "hello").await,
+    };
+    assert_eq!(theirs_hello["round"].as_u64(), Some(1));
+
+    let mut next_send = 0u32;
+    let mut confirmed: i32 = -1;
+    let play_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let end1 = loop {
+        let horizon = u32::try_from(confirmed.saturating_add(1)).unwrap_or(0) + 24;
+        while next_send <= horizon {
+            let msg = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
+            ours_sink
+                .send(Message::Text(msg.clone().into()))
+                .await
+                .unwrap();
+            theirs_sink.send(Message::Text(msg.into())).await.unwrap();
+            next_send = next_send.saturating_add(1);
+        }
+        let msg = tokio::time::timeout_at(play_deadline, theirs_stream.next())
+            .await
+            .expect("timeout waiting for later round")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("tick") => confirmed = v["n"].as_i64().unwrap_or(0) as i32,
+            Some("end") => {
+                assert_eq!(v["round"].as_u64(), Some(1), "second end should be round 1");
+                break v;
+            }
+            Some("error") => panic!("server error {}", v["message"]),
+            _ => {}
+        }
+    };
+    assert_eq!(end1["match_over"].as_bool(), Some(true));
+
+    let replay: Value = http_get(addr, &format!("/api/replays/{id}")).await.1;
+    let rounds = replay["rounds"].as_array().expect("rounds");
+    assert_eq!(rounds.len(), 2);
+    assert!(
+        !rounds[1]["ticks"].as_array().unwrap().is_empty(),
+        "later round should have been played"
+    );
+}
+
 async fn spawn_server(cfg: Config) -> std::net::SocketAddr {
     let dir =
         std::env::temp_dir().join(format!("git-fight-{}-{}", std::process::id(), uuid_like()));

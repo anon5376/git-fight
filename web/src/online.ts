@@ -190,6 +190,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let nextSend = 0;
   let confirmed = -1;
   let held = 0;
+  let heldTheirs = 0;
   let oursName = "ours";
   let theirsName = "theirs";
   let finished = false;
@@ -344,7 +345,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         }
       } else {
         const who = hello.you_are ? hello.you_are : hello.your_role;
-        ui.wait.textContent = `you are ${who} · waiting for opponent…`;
+        ui.wait.textContent =
+          role === "both"
+            ? `you are ${who} · both sides`
+            : `you are ${who} · waiting for opponent…`;
       }
     } else if (msg.type === "tick") {
       const tick = msg as TickMsg;
@@ -439,10 +443,12 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       if (role === "both") {
         const horizon = Math.max(0, confirmed + 1) + delay;
         if (nextSend <= horizon) {
-          flush(queued.ours || held, queued.theirs);
+          flush(queued.ours || held, queued.theirs || heldTheirs);
           held = 0;
+          heldTheirs = 0;
         } else {
           held = queued.ours || held;
+          heldTheirs = queued.theirs || heldTheirs;
         }
       } else {
         const latest = buttonsForRole(role, queued) || held;

@@ -170,6 +170,62 @@ async fn github_match_roles_follow_session_not_token() {
 }
 
 #[tokio::test]
+async fn github_mirror_match_gives_both_to_that_login() {
+    let (addr, pool) = spawn().await;
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: "match1".into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "alice".into(),
+            ours_kind: "mirror".into(),
+            theirs_kind: "mirror".into(),
+            ours_login: Some("alice".into()),
+            theirs_login: Some("alice".into()),
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: Some(1),
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: 1,
+            pr_head_sha: "h".into(),
+            pr_base_sha: "b".into(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: "match1",
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: Some("alice"),
+            theirs_name: Some("alice"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let alice = session(&pool, "alice").await;
+    let bob = session(&pool, "bob").await;
+    assert_eq!(hello_role(addr, Some(&alice), None).await, "both");
+    assert_eq!(hello_role(addr, Some(&bob), None).await, "spectator");
+    assert_eq!(
+        hello_role(addr, None, Some("ours-token")).await,
+        "spectator"
+    );
+}
+
+#[tokio::test]
 async fn later_round_gives_theirs_slot_to_that_hunk_author() {
     let (addr, pool) = spawn_cfg(Config {
         instant: true,
