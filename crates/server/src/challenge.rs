@@ -1,0 +1,230 @@
+//! Start a match from a conflicted pull request.
+
+use crate::db::{self, NewMatch};
+use crate::gh::GitHub;
+use crate::gitutil;
+use crate::limits::{MAX_HUNKS, MAX_REPO_KB};
+use crate::protocol::INPUT_DELAY;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+pub struct ChallengeCtx {
+    pub gh: GitHub,
+    pub pool: SqlitePool,
+    pub public_url: String,
+    pub test_repos: HashMap<String, PathBuf>,
+    pub expire_secs: i64,
+}
+
+pub async fn start_challenge(
+    ctx: &ChallengeCtx,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<String, String> {
+    if let Some(existing) = db::open_match_for_pr(&ctx.pool, owner, repo, number)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(format!(
+            "a fight is already open: {}/match/{}",
+            ctx.public_url.trim_end_matches('/'),
+            existing
+        ));
+    }
+
+    let repo_info = ctx.gh.get_repo(installation_id, owner, repo).await?;
+    if repo_info.size > MAX_REPO_KB {
+        return Ok("this repo is over 1 GB, so git fight will not clone it".into());
+    }
+
+    let pr = ctx
+        .gh
+        .poll_mergeable(installation_id, owner, repo, number)
+        .await?;
+    match pr.mergeable {
+        Some(true) => return Ok("no conflicts to fight".into()),
+        None => return Ok("could not determine mergeability".into()),
+        Some(false) => {}
+    }
+
+    let work = tempfile::Builder::new()
+        .prefix("git-fight-")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let dest = work.path().join("repo.git");
+    let key = format!("{owner}/{repo}");
+    let (url, bearer) = if let Some(local) = ctx.test_repos.get(&key) {
+        (format!("file://{}", local.display()), None)
+    } else {
+        let token = ctx.gh.installation_token(installation_id).await?;
+        (
+            format!("https://github.com/{owner}/{repo}.git"),
+            Some(token),
+        )
+    };
+    gitutil::clone_bare(&url, &dest, bearer.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = gitutil::fetch_shas(&dest, &[&pr.head.sha, &pr.base.sha], bearer.as_deref()).await;
+
+    let (tree, paths, code) = gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha)
+        .await
+        .map_err(|e| e.to_string())?;
+    if code == 0 {
+        return Ok("no conflicts to fight".into());
+    }
+
+    let hunks = match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths).await {
+        Ok(h) => h,
+        Err(gitutil::GitError::TooMany(n)) => {
+            return Ok(format!(
+                "too many conflicts for one fight ({n}; max {MAX_HUNKS})"
+            ));
+        }
+        Err(gitutil::GitError::NothingToFight) => {
+            return Ok("the conflicts are not the kind git fight can play".into());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if hunks.len() > MAX_HUNKS {
+        return Ok(format!(
+            "too many conflicts for one fight ({}; max {MAX_HUNKS})",
+            hunks.len()
+        ));
+    }
+
+    let ours_login = pr.user.login.clone();
+    let blame_sha = hunks
+        .first()
+        .map(|h| h.blame_sha.clone())
+        .unwrap_or_default();
+    let blame_email = hunks
+        .first()
+        .map(|h| h.blame_email.clone())
+        .unwrap_or_default();
+    let blame_name = hunks
+        .first()
+        .map(|h| h.blame_name.clone())
+        .unwrap_or_else(|| "theirs".into());
+    let mut theirs_login = ctx
+        .gh
+        .login_for_commit(installation_id, owner, repo, &blame_sha)
+        .await;
+    if theirs_login.is_none() {
+        theirs_login = ctx
+            .gh
+            .login_for_email(installation_id, owner, repo, &blame_email)
+            .await;
+    }
+
+    let (theirs_kind, theirs_name, theirs_login) = match theirs_login {
+        Some(login) if login == ours_login => ("mirror", ours_login.clone(), Some(login)),
+        Some(login) => ("github", login.clone(), Some(login)),
+        None => ("cpu", blame_name, None),
+    };
+
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let seed = uuid::Uuid::new_v4().as_u128() as u64;
+    let ours_token = uuid::Uuid::new_v4().simple().to_string();
+    let theirs_token = uuid::Uuid::new_v4().simple().to_string();
+    db::insert_full_match(
+        &ctx.pool,
+        &NewMatch {
+            id: id.clone(),
+            seed,
+            delay: INPUT_DELAY,
+            ours_name: ours_login.clone(),
+            theirs_name: theirs_name.clone(),
+            ours_kind: if theirs_kind == "mirror" {
+                "mirror"
+            } else {
+                "github"
+            }
+            .into(),
+            theirs_kind: theirs_kind.into(),
+            ours_login: Some(ours_login.clone()),
+            theirs_login,
+            ours_token,
+            theirs_token,
+            expire_secs: ctx.expire_secs,
+            installation_id: Some(installation_id as i64),
+            owner: owner.into(),
+            repo: repo.into(),
+            pr_number: number as i64,
+            pr_head_sha: pr.head.sha.clone(),
+            pr_base_sha: pr.base.sha.clone(),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for (round, h) in hunks.iter().enumerate() {
+        db::insert_hunk(
+            &ctx.pool,
+            &db::NewHunk {
+                match_id: &id,
+                round: round as i64,
+                path: &h.path,
+                hunk_index: h.hunk_index as i64,
+                ours: &h.ours,
+                theirs: &h.theirs,
+                base: &h.base,
+                theirs_login: None,
+                theirs_name: Some(&h.blame_name),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    let rounds = hunks.len();
+    let vs = if theirs_kind == "cpu" {
+        format!("{ours_login} vs {theirs_name} (CPU)")
+    } else if theirs_kind == "mirror" {
+        format!("{ours_login} vs {ours_login} (mirror)")
+    } else {
+        format!("{ours_login} vs {theirs_name}")
+    };
+    let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
+    Ok(format!(
+        "git fight: {vs}. {rounds} round{}. {link}",
+        if rounds == 1 { "" } else { "s" }
+    ))
+}
+
+pub fn is_fight_comment(body: &str) -> bool {
+    body.lines()
+        .next()
+        .map(|l| l.trim() == "/fight")
+        .unwrap_or(false)
+}
+
+pub fn is_bot_user(kind: Option<&str>, login: Option<&str>) -> bool {
+    if kind == Some("Bot") {
+        return true;
+    }
+    login.map(|l| l.ends_with("[bot]")).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fight_is_first_line_only() {
+        assert!(is_fight_comment("/fight\nplease"));
+        assert!(is_fight_comment("  /fight  "));
+        assert!(!is_fight_comment("please /fight"));
+        assert!(!is_fight_comment("/fight-me"));
+    }
+
+    #[test]
+    fn bots_are_ignored() {
+        assert!(is_bot_user(Some("Bot"), Some("git-fight[bot]")));
+        assert!(is_bot_user(Some("User"), Some("foo[bot]")));
+        assert!(!is_bot_user(Some("User"), Some("alice")));
+    }
+}

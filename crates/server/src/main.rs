@@ -1,5 +1,7 @@
 use clap::Parser;
+use git_fight_server::gh::GitHub;
 use git_fight_server::Config;
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,7 +53,7 @@ async fn main() {
             eprintln!("database: {e}");
             std::process::exit(1);
         });
-    let config = Config {
+    let mut config = Config {
         lag: Duration::from_millis(args.lag_ms),
         instant: false,
         static_dir: args.r#static.or_else(|| {
@@ -60,6 +62,33 @@ async fn main() {
         }),
         expire_secs: git_fight_server::protocol::EXPIRE_SECS,
         disconnect: Duration::from_secs(git_fight_server::protocol::DISCONNECT_SECS),
+        ..Config::default()
+    };
+    config.auth.public_url =
+        env::var("GIT_FIGHT_PUBLIC_URL").unwrap_or_else(|_| format!("http://{}", args.bind));
+    if let Ok(key) = env::var("SESSION_KEY") {
+        config.auth.session_key = key.into_bytes();
+    }
+    config.webhook_secret = env::var("GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .map(|s| s.into_bytes());
+    config.github = match (
+        env::var("GITHUB_APP_ID"),
+        env::var("GITHUB_APP_PRIVATE_KEY"),
+        env::var("GITHUB_CLIENT_ID"),
+        env::var("GITHUB_CLIENT_SECRET"),
+    ) {
+        (Ok(id), Ok(pem), Ok(cid), Ok(csec)) => id.parse().ok().map(|app_id| {
+            GitHub::new(
+                env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
+                env::var("GITHUB_OAUTH_URL").unwrap_or_else(|_| "https://github.com".into()),
+                app_id,
+                pem.replace("\\n", "\n"),
+                cid,
+                csec,
+            )
+        }),
+        _ => None,
     };
     let listener = TcpListener::bind(args.bind).await.unwrap_or_else(|e| {
         eprintln!("bind: {e}");

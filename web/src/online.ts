@@ -27,6 +27,7 @@ type Hello = {
   ours: string;
   theirs: string;
   round: number;
+  total_rounds?: number;
   confirmed_tick: number;
 };
 
@@ -37,6 +38,8 @@ type EndMsg = {
   hash_hi: number;
   hash_lo: number;
   tick: number;
+  round?: number;
+  match_over?: boolean;
 };
 type ErrMsg = { type: "error"; message: string };
 type ServerMsg = Hello | TickMsg | EndMsg | ErrMsg | { type: string };
@@ -112,6 +115,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let oursName = "ours";
   let theirsName = "theirs";
   let finished = false;
+  let round = 0;
+  let totalRounds = 1;
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
@@ -135,14 +140,23 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
 
   const ws = new WebSocket(wsUrl(matchId, token));
 
-  const flush = (latest: number) => {
+  const flush = (oursBtn: number, theirsBtn: number) => {
     if (role === "spectator" || ws.readyState !== WebSocket.OPEN) {
       return;
     }
     const horizon = Math.max(0, confirmed + 1) + delay;
     while (nextSend <= horizon) {
-      const buttons = nextSend === horizon ? latest : 0;
-      ws.send(JSON.stringify({ type: "input", tick: nextSend, buttons }));
+      const buttons = nextSend === horizon ? oursBtn : 0;
+      const theirs = nextSend === horizon ? theirsBtn : 0;
+      const payload: { type: string; tick: number; buttons: number; theirs?: number } = {
+        type: "input",
+        tick: nextSend,
+        buttons,
+      };
+      if (role === "both") {
+        payload.theirs = theirs;
+      }
+      ws.send(JSON.stringify(payload));
       nextSend += 1;
     }
   };
@@ -170,9 +184,15 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       confirmed = hello.confirmed_tick;
       oursName = hello.ours;
       theirsName = hello.theirs;
+      round = hello.round ?? 0;
+      totalRounds = hello.total_rounds ?? 1;
+      nextSend = Math.max(0, confirmed + 1);
+      finished = false;
+      ui.ko.classList.add("hidden");
       fight = WasmFight.from_seed(hello.seed_lo, hello.seed_hi);
       if (role === "spectator") {
         ui.wait.textContent = "spectating";
+        void offerGithubLogin(matchId, ui);
       }
     } else if (msg.type === "tick") {
       const tick = msg as TickMsg;
@@ -186,10 +206,15 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       }
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
-      finished = true;
+      const matchOver = end.match_over !== false;
       ui.wait.classList.add("hidden");
       showKo(ui.ko, end.result);
-      ui.resolved.textContent = `replay /replay/${matchId}`;
+      if (matchOver) {
+        finished = true;
+        ui.resolved.textContent = `replay /replay/${matchId}`;
+      } else {
+        ui.resolved.textContent = `round ${(end.round ?? round) + 1}/${totalRounds}`;
+      }
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
       ui.wait.classList.remove("hidden");
@@ -206,19 +231,35 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     while (leftover >= tickMs) {
       leftover -= tickMs;
       const queued = keys.poll();
-      const latest = buttonsForRole(role, queued) || held;
-      if (role !== "spectator") {
+      if (role === "both") {
         const horizon = Math.max(0, confirmed + 1) + delay;
         if (nextSend <= horizon) {
-          flush(latest);
+          flush(queued.ours || held, queued.theirs);
           held = 0;
         } else {
-          held = latest;
+          held = queued.ours || held;
+        }
+      } else {
+        const latest = buttonsForRole(role, queued) || held;
+        if (role !== "spectator") {
+          const horizon = Math.max(0, confirmed + 1) + delay;
+          if (nextSend <= horizon) {
+            flush(latest, 0);
+            held = 0;
+          } else {
+            held = latest;
+          }
         }
       }
     }
     if (fight) {
-      paintFight(ui.stage, fight, oursName, theirsName, "online 1/1");
+      paintFight(
+        ui.stage,
+        fight,
+        oursName,
+        theirsName,
+        `online ${round + 1}/${totalRounds}`,
+      );
     }
     requestAnimationFrame(loop);
   };
@@ -300,6 +341,32 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
       keys.unbind();
     },
   };
+}
+
+async function offerGithubLogin(matchId: string, ui: OnlineUi): Promise<void> {
+  try {
+    const info = await fetch(`/api/matches/${matchId}`, { credentials: "include" });
+    if (!info.ok) {
+      return;
+    }
+    const body = (await info.json()) as { ours_login?: string; theirs_login?: string };
+    if (!body.ours_login && !body.theirs_login) {
+      return;
+    }
+    const me = await fetch("/api/me", { credentials: "include" });
+    if (me.ok) {
+      return;
+    }
+    ui.wait.textContent = "";
+    const a = document.createElement("a");
+    a.href = `/auth/github?return=/match/${matchId}`;
+    a.textContent = "log in with GitHub to take a fighter slot";
+    a.dataset.testid = "github-login";
+    ui.wait.appendChild(a);
+    ui.wait.classList.remove("hidden");
+  } catch {
+    /* offline */
+  }
 }
 
 export async function hostMatch(): Promise<void> {
