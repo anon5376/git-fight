@@ -129,11 +129,8 @@ pub(crate) async fn persist_challenge_comment(
     posted: Result<u64, String>,
 ) {
     match persist_posted_followup(posted.as_ref().map(|id| *id).map_err(|e| e.as_str())) {
-        PersistPosted::Hold => return,
-        PersistPosted::Retry => {
-            comments.unmark(match_id);
-            return;
-        }
+        PersistPosted::Hold => {}
+        PersistPosted::Retry => comments.unmark(match_id),
         PersistPosted::Set(posted) => {
             persist_challenge_comment_id(pool, comments, match_id, posted).await;
         }
