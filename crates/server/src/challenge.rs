@@ -321,7 +321,7 @@ pub async fn start_challenge(
     let mut login_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut sides: Vec<(String, String, Option<String>)> = Vec::new();
     for h in &hunks {
-        let login = blame_login(
+        let login = match blame_login(
             &ctx.gh,
             installation_id,
             &owner,
@@ -330,7 +330,11 @@ pub async fn start_challenge(
             &h.blame_email,
             &mut login_cache,
         )
-        .await;
+        .await
+        {
+            Ok(login) => login,
+            Err(()) => return Ok(abort_start_quiet(&ctx.pool, &id, "blame").await),
+        };
         sides.push(side_from_blame(&ours_login, login, &h.blame_name));
     }
     let (theirs_kind, theirs_name, theirs_login) = sides
@@ -417,26 +421,32 @@ async fn blame_login(
     sha: &str,
     email: &str,
     cache: &mut HashMap<String, Option<String>>,
-) -> Option<String> {
+) -> Result<Option<String>, ()> {
     let key = if !sha.is_empty() {
         format!("s:{sha}")
     } else {
         format!("e:{email}")
     };
     if let Some(hit) = cache.get(&key) {
-        return hit.clone();
+        return Ok(hit.clone());
     }
-    let mut login = gh.login_for_commit(installation_id, owner, repo, sha).await;
-    if login.is_none() {
-        login = gh
+    let login = match gh.login_for_commit(installation_id, owner, repo, sha).await {
+        crate::gh::LoginLookup::Found(login) => Some(login),
+        crate::gh::LoginLookup::Unavailable => return Err(()),
+        crate::gh::LoginLookup::None => match gh
             .login_for_email(installation_id, owner, repo, email)
-            .await;
-    }
+            .await
+        {
+            crate::gh::LoginLookup::Found(login) => Some(login),
+            crate::gh::LoginLookup::Unavailable => return Err(()),
+            crate::gh::LoginLookup::None => None,
+        },
+    };
     cache.insert(key, login.clone());
     if !email.is_empty() {
         cache.entry(format!("e:{email}")).or_insert(login.clone());
     }
-    login
+    Ok(login)
 }
 
 fn vs_line(display_login: &str, theirs_kind: &str, theirs_name: &str) -> String {

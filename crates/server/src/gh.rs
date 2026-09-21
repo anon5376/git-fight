@@ -35,6 +35,15 @@ const MAX_API_JSON: usize = 1_048_576;
 /// Installation token, OAuth token, and `GET /user` JSON.
 const MAX_TOKEN_JSON: usize = 16 * 1024;
 
+/// Blame → GitHub login. `None` is “no account” (CPU). `Unavailable` is a
+/// transient HTTP/parse miss and must not be stored as CPU.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoginLookup {
+    Found(String),
+    None,
+    Unavailable,
+}
+
 impl std::fmt::Debug for GitHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHub")
@@ -414,15 +423,15 @@ impl GitHub {
         owner: &str,
         repo: &str,
         sha: &str,
-    ) -> Option<String> {
+    ) -> LoginLookup {
         if !is_safe_github_name(owner)
             || !is_safe_github_name(repo)
             || !crate::gitutil::is_safe_rev(sha)
         {
-            return None;
+            return LoginLookup::None;
         }
         // List API (no `files` patches). GET /commits/{sha} can be many MB.
-        let res = self
+        let Ok(req) = self
             .authed(
                 installation_id,
                 reqwest::Method::GET,
@@ -432,12 +441,16 @@ impl GitHub {
                 ),
             )
             .await
-            .ok()?
-            .send()
-            .await
-            .ok()?;
+        else {
+            return LoginLookup::Unavailable;
+        };
+        let Ok(res) = req.send().await else {
+            return LoginLookup::Unavailable;
+        };
         if !res.status().is_success() {
-            return None;
+            // The blamed SHA should be in the repo we just cloned.
+            // 404/5xx is a miss, not “no GitHub account”.
+            return LoginLookup::Unavailable;
         }
         #[derive(Deserialize)]
         struct Row {
@@ -448,15 +461,23 @@ impl GitHub {
         struct User {
             login: Option<String>,
         }
-        let rows: Vec<Row> = json_capped(res, MAX_COMMITS_JSON).await?;
-        let row = rows.into_iter().next()?;
+        let Some(rows) = json_capped::<Vec<Row>>(res, MAX_COMMITS_JSON).await else {
+            return LoginLookup::Unavailable;
+        };
+        let Some(row) = rows.into_iter().next() else {
+            return LoginLookup::Unavailable;
+        };
         let got = row.sha.as_deref().unwrap_or("");
         if !got.eq_ignore_ascii_case(sha) {
-            return None;
+            return LoginLookup::Unavailable;
         }
-        row.author
-            .and_then(|a| a.login)
-            .and_then(|l| normalize_github_login(&l))
+        match row.author.and_then(|a| a.login) {
+            Some(login) => match normalize_github_login(&login) {
+                Some(stored) => LoginLookup::Found(stored),
+                None => LoginLookup::None,
+            },
+            None => LoginLookup::None,
+        }
     }
 
     pub async fn login_for_email(
@@ -465,11 +486,11 @@ impl GitHub {
         owner: &str,
         repo: &str,
         email: &str,
-    ) -> Option<String> {
+    ) -> LoginLookup {
         if !is_safe_email(email) || !is_safe_github_name(owner) || !is_safe_github_name(repo) {
-            return None;
+            return LoginLookup::None;
         }
-        let res = self
+        let Ok(req) = self
             .authed(
                 installation_id,
                 reqwest::Method::GET,
@@ -479,12 +500,18 @@ impl GitHub {
                 ),
             )
             .await
-            .ok()?
-            .send()
-            .await
-            .ok()?;
-        if !res.status().is_success() {
-            return None;
+        else {
+            return LoginLookup::Unavailable;
+        };
+        let Ok(res) = req.send().await else {
+            return LoginLookup::Unavailable;
+        };
+        let status = res.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            return LoginLookup::None;
+        }
+        if !status.is_success() {
+            return LoginLookup::Unavailable;
         }
         #[derive(Deserialize)]
         struct Row {
@@ -503,7 +530,9 @@ impl GitHub {
         struct GitUser {
             email: Option<String>,
         }
-        let rows: Vec<Row> = json_capped(res, MAX_COMMITS_JSON).await?;
+        let Some(rows) = json_capped::<Vec<Row>>(res, MAX_COMMITS_JSON).await else {
+            return LoginLookup::Unavailable;
+        };
         for row in rows {
             if row
                 .commit
@@ -516,11 +545,11 @@ impl GitHub {
                     .and_then(|a| a.login)
                     .and_then(|l| normalize_github_login(&l))
                 {
-                    return Some(login);
+                    return LoginLookup::Found(login);
                 }
             }
         }
-        None
+        LoginLookup::None
     }
 
     pub async fn oauth_user(

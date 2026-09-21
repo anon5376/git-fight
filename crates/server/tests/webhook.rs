@@ -665,6 +665,20 @@ struct MockOpts {
     auto_challenge: bool,
     commit_authors: Vec<(String, Value)>,
     mergeable: Vec<Value>,
+    commit_status: u16,
+}
+
+impl Default for MockOpts {
+    fn default() -> Self {
+        Self {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![],
+            mergeable: vec![],
+            commit_status: 200,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -703,10 +717,14 @@ impl Match for HasQueryParam {
 struct CommitShaAuthors {
     by_sha: Vec<(String, Value)>,
     default_author: Value,
+    status: u16,
 }
 
 impl Respond for CommitShaAuthors {
     fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self.status != 200 {
+            return ResponseTemplate::new(self.status);
+        }
         let sha = request
             .url
             .query_pairs()
@@ -782,6 +800,7 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
         .respond_with(CommitShaAuthors {
             by_sha: opts.commit_authors,
             default_author: opts.commit_author,
+            status: opts.commit_status,
         })
         .mount(&mock)
         .await;
@@ -799,13 +818,7 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
 }
 
 fn cpu_opts() -> MockOpts {
-    MockOpts {
-        commit_author: Value::Null,
-        size: 12,
-        auto_challenge: false,
-        commit_authors: vec![],
-        mergeable: vec![],
-    }
+    MockOpts::default()
 }
 
 fn cfg_for(mock: &MockServer, bare: PathBuf) -> Config {
@@ -1108,6 +1121,7 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
                 (carol_sha, json!({ "login": "carol" })),
             ],
             mergeable: vec![],
+            ..Default::default()
         },
     )
     .await;
@@ -1378,6 +1392,7 @@ async fn fight_comment_two_authors_mixed_picks_push() {
                 (carol_sha, json!({ "login": "carol" })),
             ],
             mergeable: vec![],
+            ..Default::default()
         },
     )
     .await;
@@ -1580,6 +1595,7 @@ async fn mergeable_pr_comments_nothing_to_fight() {
             auto_challenge: false,
             commit_authors: vec![],
             mergeable: vec![json!(true)],
+            ..Default::default()
         },
     )
     .await;
@@ -1611,6 +1627,7 @@ async fn mergeable_null_then_false_starts_fight() {
             auto_challenge: false,
             commit_authors: vec![],
             mergeable: vec![Value::Null, json!(false)],
+            ..Default::default()
         },
     )
     .await;
@@ -1649,6 +1666,7 @@ async fn mergeable_stays_null_comments_and_skips() {
             auto_challenge: false,
             commit_authors: vec![],
             mergeable: vec![Value::Null],
+            ..Default::default()
         },
     )
     .await;
@@ -1887,6 +1905,7 @@ async fn same_login_is_a_mirror_match() {
             auto_challenge: false,
             commit_authors: vec![],
             mergeable: vec![],
+            ..Default::default()
         },
     )
     .await;
@@ -1911,6 +1930,7 @@ async fn oversized_repo_is_skipped() {
             auto_challenge: false,
             commit_authors: vec![],
             mergeable: vec![],
+            ..Default::default()
         },
     )
     .await;
@@ -2095,6 +2115,7 @@ async fn auto_challenge_starts_when_yaml_set() {
             auto_challenge: true,
             commit_authors: vec![],
             mergeable: vec![],
+            ..Default::default()
         },
     )
     .await;
@@ -2129,6 +2150,43 @@ async fn blame_email_maps_through_commits_api() {
             .iter()
             .any(|t| t.contains("alice vs bob") && !t.contains("CPU")),
         "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn blame_http_failure_does_not_start_a_cpu_fight() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_status: 500,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-blame-5xx", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments.iter().any(|t| t.contains("could not start")),
+        "{comments:?}"
+    );
+    assert!(
+        comments
+            .iter()
+            .all(|t| !t.contains("/match/") && !t.contains("CPU")),
+        "a GitHub blip must not lock the right-side slot to CPU: {comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "failed blame lookup must abort so rematch /fight can start"
     );
 }
 
@@ -2479,6 +2537,7 @@ async fn each_hunk_stores_blamed_author_login() {
                 (carol_sha, json!({ "login": "carol" })),
             ],
             mergeable: vec![],
+            ..Default::default()
         },
     )
     .await;
