@@ -707,6 +707,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 break;
             }
         }
+        // Close after the room drops the join tx (scored-all preparing)
+        // so the canvas gets a close and reconnects. A mute socket would
+        // sit on Error { preparing } forever.
+        let _ = sink.close().await;
     });
 
     let _ = tokio::join!(read, write);

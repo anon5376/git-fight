@@ -692,6 +692,14 @@ async fn scored_all_without_terminal_sim_does_not_fake_hash() {
         Some("preparing"),
         "a scored row with no terminal sim must not write a fake final_hash"
     );
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "preparing must close the socket so the canvas reconnects"
+    );
     let row = git_fight_server::db::get_match(&pool, id)
         .await
         .unwrap()

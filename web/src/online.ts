@@ -445,11 +445,15 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         busy = false;
         ui.wait.textContent = "preparing match…";
         reconnectAttempts = 0;
+        // Reconnect only runs on close. A scored-all preparing Error
+        // used to leave this socket open and mute.
+        ws?.close();
       } else if (err.message === "busy") {
         busy = true;
         preparing = false;
         ui.wait.textContent = "match busy — retrying";
         reconnectAttempts = 0;
+        ws?.close();
       } else if (err.message === "expired") {
         preparing = false;
         busy = false;

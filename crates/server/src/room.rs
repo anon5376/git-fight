@@ -37,6 +37,26 @@ struct Slot {
     kind_cpu: bool,
     seen: bool,
     disconnected_at: Option<Instant>,
+    /// Set when the 30s rejoin timer fires. Reconnect clears
+    /// `disconnected_at` but must not cancel a persist that is still
+    /// retrying — otherwise the forfeit never re-enters.
+    forfeit_due: bool,
+}
+
+impl Slot {
+    fn latch_forfeit(&mut self, disconnect: Duration) -> bool {
+        if self.forfeit_due {
+            return true;
+        }
+        if self
+            .disconnected_at
+            .is_some_and(|at| at.elapsed() >= disconnect)
+        {
+            self.forfeit_due = true;
+            return true;
+        }
+        false
+    }
 }
 
 struct Conn {
@@ -118,11 +138,13 @@ async fn run_room(
         kind_cpu: false,
         seen: false,
         disconnected_at: None,
+        forfeit_due: false,
     };
     let mut theirs = Slot {
         kind_cpu: false,
         seen: false,
         disconnected_at: None,
+        forfeit_due: false,
     };
     let mut conns: BTreeMap<u64, Conn> = BTreeMap::new();
     let mut pending_ours: BTreeMap<u32, u8> = BTreeMap::new();
@@ -218,6 +240,8 @@ async fn run_room(
                             if done {
                                 send_closed(&tx, &pool, &id).await;
                             } else {
+                                // Drop `tx` after send so the WS write task
+                                // closes. Canvas reconnects only on close.
                                 try_send_or_spawn(
                                     &tx,
                                     encode(&ServerMsg::Error {
@@ -496,42 +520,40 @@ async fn advance(a: Advance<'_>) -> bool {
     // after the match started. A fighter who has not shown up yet waits
     // until expires_at (24h), not 30 seconds.
     if a.started_at.is_some() {
-        if let Some(at) = a.ours.disconnected_at {
-            if at.elapsed() >= a.disconnect {
-                // Persist first. Do not set forfeit_pending until the
-                // hunk is durable — a reconnect clears disconnected_at
-                // and a stale flag would tag a later KO as forfeit_*.
-                if !persist_disconnect_forfeit(
-                    a.pool,
-                    a.id,
-                    *a.round,
-                    result::winner_tag(RoundResult::Theirs, true),
-                )
-                .await
-                {
-                    return false;
-                }
-                *a.forfeit_pending = true;
-                a.sim.forfeit(Side::Ours);
-                return finish(a, RoundResult::Theirs).await;
+        // Latch when the timer fires. A reconnect clears
+        // disconnected_at; forfeit_due keeps persist retrying.
+        if a.ours.latch_forfeit(a.disconnect) {
+            // Persist first. Do not set forfeit_pending until the
+            // hunk is durable — a stale flag would tag a later KO
+            // as forfeit_*.
+            if !persist_disconnect_forfeit(
+                a.pool,
+                a.id,
+                *a.round,
+                result::winner_tag(RoundResult::Theirs, true),
+            )
+            .await
+            {
+                return false;
             }
+            *a.forfeit_pending = true;
+            a.sim.forfeit(Side::Ours);
+            return finish(a, RoundResult::Theirs).await;
         }
-        if let Some(at) = a.theirs.disconnected_at {
-            if at.elapsed() >= a.disconnect {
-                if !persist_disconnect_forfeit(
-                    a.pool,
-                    a.id,
-                    *a.round,
-                    result::winner_tag(RoundResult::Ours, true),
-                )
-                .await
-                {
-                    return false;
-                }
-                *a.forfeit_pending = true;
-                a.sim.forfeit(Side::Theirs);
-                return finish(a, RoundResult::Ours).await;
+        if a.theirs.latch_forfeit(a.disconnect) {
+            if !persist_disconnect_forfeit(
+                a.pool,
+                a.id,
+                *a.round,
+                result::winner_tag(RoundResult::Ours, true),
+            )
+            .await
+            {
+                return false;
             }
+            *a.forfeit_pending = true;
+            a.sim.forfeit(Side::Theirs);
+            return finish(a, RoundResult::Ours).await;
         }
     }
 
@@ -647,7 +669,7 @@ fn finish_after_write(tagged: bool, open: MatchOpen, stored: StoredRound) -> Fin
         FinishAfterWrite::Proceed { record: true }
     } else if open == MatchOpen::Closed {
         FinishAfterWrite::Close
-    } else if matches!(stored, StoredRound::Winner | StoredRound::Missing) {
+    } else if matches!(stored, StoredRound::Winner { .. } | StoredRound::Missing) {
         // Winner: write-once resume. Missing: local demo / no hunk row —
         // there is nothing to score; still End. Do not retry forever.
         FinishAfterWrite::Proceed { record: false }
@@ -731,10 +753,22 @@ fn after_non_final(open: MatchOpen) -> AfterNonFinal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoredRound {
-    Winner,
+    Winner { tag: String, ko: bool },
     Empty,
     Missing,
     Unknown,
+}
+
+/// Write-once resume must record the durable hunk, not a later sim KO.
+fn stats_from_stored(
+    stored: &StoredRound,
+    computed_tag: &str,
+    computed_ko: bool,
+) -> (String, bool) {
+    match stored {
+        StoredRound::Winner { tag, ko } => (tag.clone(), *ko),
+        _ => (computed_tag.to_string(), computed_ko),
+    }
 }
 
 async fn persist_disconnect_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &str) -> bool {
@@ -745,7 +779,7 @@ async fn persist_disconnect_forfeit(pool: &SqlitePool, id: &str, round: u32, tag
         return true;
     }
     match stored_round(pool, id, round).await {
-        StoredRound::Winner | StoredRound::Missing => true,
+        StoredRound::Winner { .. } | StoredRound::Missing => true,
         StoredRound::Empty | StoredRound::Unknown => false,
     }
 }
@@ -755,8 +789,10 @@ async fn stored_round(pool: &SqlitePool, id: &str, round: u32) -> StoredRound {
         Err(_) => StoredRound::Unknown,
         Ok(hs) => match hs.into_iter().find(|h| h.round_index == i64::from(round)) {
             None => StoredRound::Missing,
-            Some(h) if h.winner.is_some() => StoredRound::Winner,
-            Some(_) => StoredRound::Empty,
+            Some(h) => match h.winner {
+                Some(tag) => StoredRound::Winner { tag, ko: h.is_ko },
+                None => StoredRound::Empty,
+            },
         },
     }
 }
@@ -779,18 +815,26 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         .unwrap_or(false);
     let open = match_is_open(a.pool, a.id).await;
     let stored = if tagged {
-        StoredRound::Winner
+        StoredRound::Winner {
+            tag: tag.to_string(),
+            ko,
+        }
     } else {
         stored_round(a.pool, a.id, *a.round).await
     };
+    let (stats_tag, stats_ko) = stats_from_stored(&stored, tag, ko);
     match finish_after_write(tagged, open, stored) {
         FinishAfterWrite::Proceed { record: true } => {
             *a.forfeit_pending = false;
-            let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
+            let _ =
+                crate::stats::record_round(a.pool, a.id, i64::from(*a.round), &stats_tag, stats_ko)
+                    .await;
         }
         FinishAfterWrite::Proceed { record: false } => {
             *a.forfeit_pending = false;
-            let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
+            let _ =
+                crate::stats::record_round(a.pool, a.id, i64::from(*a.round), &stats_tag, stats_ko)
+                    .await;
         }
         FinishAfterWrite::Close => {
             *a.forfeit_pending = false;
@@ -1287,14 +1331,18 @@ fn apply_round_identity(
     if ours.kind_cpu {
         ours.seen = true;
         ours.disconnected_at = None;
+        ours.forfeit_due = false;
     } else if !initial {
         ours.disconnected_at = None;
+        ours.forfeit_due = false;
     }
     if theirs.kind_cpu {
         theirs.seen = true;
         theirs.disconnected_at = None;
+        theirs.forfeit_due = false;
     } else if !initial {
         theirs.disconnected_at = None;
+        theirs.forfeit_due = false;
         // A new blamed author has not occupied this slot. Keep `seen`
         // false so apply_presence does not start a disconnect clock.
         if github && round > 0 {
@@ -1340,6 +1388,8 @@ fn apply_presence(slot: &mut Slot, here: bool) {
     if here {
         slot.seen = true;
         slot.disconnected_at = None;
+        // Keep forfeit_due: reconnect after the timer cannot undo a
+        // persist that is still retrying.
         return;
     }
     if slot.kind_cpu {
@@ -1381,6 +1431,7 @@ mod tests {
             kind_cpu: false,
             seen: false,
             disconnected_at: None,
+            forfeit_due: false,
         };
         apply_presence(&mut slot, false);
         assert!(
@@ -1396,10 +1447,58 @@ mod tests {
             kind_cpu: false,
             seen: true,
             disconnected_at: None,
+            forfeit_due: false,
         };
         apply_presence(&mut slot, false);
         assert!(slot.disconnected_at.is_some());
         assert!(slot.seen);
+    }
+
+    #[test]
+    fn reconnect_does_not_clear_forfeit_due() {
+        let mut slot = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: Some(Instant::now()),
+            forfeit_due: true,
+        };
+        apply_presence(&mut slot, true);
+        assert!(slot.seen);
+        assert!(slot.disconnected_at.is_none());
+        assert!(
+            slot.forfeit_due,
+            "reconnect after the 30s timer must not cancel persist retry"
+        );
+        assert!(slot.latch_forfeit(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn latch_forfeit_sets_due_when_timer_elapsed() {
+        let mut slot = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: Some(Instant::now()),
+            forfeit_due: false,
+        };
+        assert!(slot.latch_forfeit(Duration::ZERO));
+        assert!(slot.forfeit_due);
+        slot.disconnected_at = None;
+        assert!(
+            slot.latch_forfeit(Duration::from_secs(30)),
+            "due stays latched after reconnect clears disconnected_at"
+        );
+    }
+
+    #[test]
+    fn latch_forfeit_is_false_before_timer() {
+        let mut slot = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: Some(Instant::now()),
+            forfeit_due: false,
+        };
+        assert!(!slot.latch_forfeit(Duration::from_secs(30)));
+        assert!(!slot.forfeit_due);
     }
 
     #[test]
@@ -1466,11 +1565,13 @@ mod tests {
             kind_cpu: false,
             seen: true,
             disconnected_at: None,
+            forfeit_due: false,
         };
         let mut theirs = Slot {
             kind_cpu: false,
             seen: true,
             disconnected_at: Some(Instant::now()),
+            forfeit_due: false,
         };
         let mut theirs_name = String::from("bob");
         let mut mirror = false;
@@ -1506,7 +1607,14 @@ mod tests {
             FinishAfterWrite::Close
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Open, StoredRound::Winner),
+            finish_after_write(
+                false,
+                MatchOpen::Open,
+                StoredRound::Winner {
+                    tag: "ours".into(),
+                    ko: false,
+                },
+            ),
             FinishAfterWrite::Proceed { record: false },
             "write-once already set: resume End / next round"
         );
@@ -1526,7 +1634,14 @@ mod tests {
             "a successful write still records even if the follow-up status read fails"
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Unknown, StoredRound::Winner),
+            finish_after_write(
+                false,
+                MatchOpen::Unknown,
+                StoredRound::Winner {
+                    tag: "ours".into(),
+                    ko: false,
+                },
+            ),
             FinishAfterWrite::Proceed { record: false },
             "write-once already set: do not expire on a busy status read"
         );
@@ -1539,6 +1654,23 @@ mod tests {
             finish_after_write(false, MatchOpen::Open, StoredRound::Unknown),
             FinishAfterWrite::Retry,
             "cannot tell whether the hunk exists; do not ghost-advance"
+        );
+        assert_eq!(
+            stats_from_stored(
+                &StoredRound::Winner {
+                    tag: "forfeit_ours".into(),
+                    ko: false,
+                },
+                "ours",
+                true,
+            ),
+            ("forfeit_ours".into(), false),
+            "write-once resume must not record a later sim KO"
+        );
+        assert_eq!(
+            stats_from_stored(&StoredRound::Missing, "ours", true),
+            ("ours".into(), true),
+            "local demo has no stored hunk; use the sim tag"
         );
         assert_eq!(
             last_round_followup(true, LastRoundStatus::Open),
