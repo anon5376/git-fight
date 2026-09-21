@@ -76,7 +76,7 @@ Single axum process.
 
 Git work happens in a worker with timeouts (at most two clone/merge-tree/push jobs at once). The webhook returns 200 before that work. Clones are bare, partial (`--filter=blob:none`), and discarded when the match finishes or expires. The server process never `chdir`s into a user repo to run a build or a test.
 
-`--lag-ms` on the server binary holds inbound and outbound WebSocket messages so lockstep can be tested under fake latency.
+`--lag-ms` on the server binary holds inbound and outbound WebSocket messages so lockstep can be tested under fake latency. `--instant` confirms ticks as fast as inputs arrive (browser lockstep tests, not production).
 
 ### web/
 
