@@ -80,6 +80,13 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE matches ADD COLUMN challenge_comment_id INTEGER")
         .execute(pool)
         .await;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS matches_one_open_per_pr
+         ON matches(owner, repo, pr_number)
+         WHERE status IN ('pending', 'in_progress') AND pr_number > 0 AND owner != ''",
+    )
+    .execute(pool)
+    .await?;
     ensure_match_inputs(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS match_hunks (
@@ -423,6 +430,35 @@ pub async fn insert_full_match(pool: &SqlitePool, m: &NewMatch) -> Result<(), sq
     .bind(i64::from(m.delay))
     .bind(now.to_rfc3339())
     .bind(expires.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub fn is_unique_violation(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db) => db.is_unique_violation(),
+        _ => false,
+    }
+}
+
+pub async fn update_match_fighters(
+    pool: &SqlitePool,
+    id: &str,
+    ours_kind: &str,
+    theirs_kind: &str,
+    theirs_name: &str,
+    theirs_login: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE matches SET ours_kind = ?, theirs_kind = ?, theirs_name = ?, theirs_login = ?
+         WHERE id = ?",
+    )
+    .bind(ours_kind)
+    .bind(theirs_kind)
+    .bind(theirs_name)
+    .bind(theirs_login)
+    .bind(id)
     .execute(pool)
     .await?;
     Ok(())
@@ -927,5 +963,43 @@ mod tests {
         set_challenge_comment_id(&pool, "inst1", 99).await.unwrap();
         let stored = get_match(&pool, "inst1").await.unwrap().unwrap();
         assert_eq!(stored.challenge_comment_id, Some(99));
+    }
+
+    #[tokio::test]
+    async fn one_open_match_per_pr_then_abort_frees_the_slot() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let mut m = NewMatch {
+            id: "open1".into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "a".into(),
+            theirs_name: "b".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "o".into(),
+            theirs_token: "t".into(),
+            expire_secs: 3600,
+            installation_id: Some(1),
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: 1,
+            pr_head_sha: "h".into(),
+            pr_base_sha: "b".into(),
+        };
+        insert_full_match(&pool, &m).await.unwrap();
+        m.id = "open2".into();
+        let err = insert_full_match(&pool, &m).await.unwrap_err();
+        assert!(is_unique_violation(&err), "{err}");
+        set_status(&pool, "open1", "aborted", false, true, None, Some("clone"))
+            .await
+            .unwrap();
+        insert_full_match(&pool, &m).await.unwrap();
+        let open = open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(open.id, "open2");
     }
 }

@@ -849,3 +849,53 @@ async fn each_hunk_stores_blamed_author_login() {
     assert!(logins.contains(&Some("bob".into())), "{logins:?}");
     assert!(logins.contains(&Some("carol".into())), "{logins:?}");
 }
+
+#[tokio::test]
+async fn second_fight_while_cloning_gets_open_link() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    let a = post_signed(addr, "issue_comment", "deliv-race-a", &fight_body());
+    let b = post_signed(addr, "issue_comment", "deliv-race-b", &fight_body());
+    let (sa, sb) = tokio::join!(a, b);
+    assert_eq!(sa, 200);
+    assert_eq!(sb, 200);
+    let comments = wait_posted(&mock, 2).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("git fight:") && t.contains("/match/")),
+        "{comments:?}"
+    );
+    assert!(
+        comments.iter().any(|t| t.contains("already open")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_clone_aborts_open_match() {
+    let mock = github_mocks(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        cpu_opts(),
+    )
+    .await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, PathBuf::from("/nope"))).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-clone-fail", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments.iter().any(|t| t.contains("could not start")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "failed clone must not leave a pending match"
+    );
+}

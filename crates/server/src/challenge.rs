@@ -29,6 +29,33 @@ fn note(body: impl Into<String>) -> ChallengeStart {
     }
 }
 
+fn already_open_note(ctx: &ChallengeCtx, id: &str) -> ChallengeStart {
+    note(format!(
+        "a fight is already open: {}/match/{id}",
+        ctx.public_url.trim_end_matches('/')
+    ))
+}
+
+async fn already_open_now(
+    ctx: &ChallengeCtx,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<ChallengeStart, String> {
+    if let Some(existing) = db::open_match_for_pr(&ctx.pool, owner, repo, number)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(already_open_note(ctx, &existing.id));
+    }
+    Ok(note("a fight is already open"))
+}
+
+async fn abort_start(pool: &SqlitePool, id: &str, reason: &str, body: String) -> ChallengeStart {
+    let _ = db::set_status(pool, id, "aborted", false, true, None, Some(reason)).await;
+    note(body)
+}
+
 pub async fn start_challenge(
     ctx: &ChallengeCtx,
     installation_id: u64,
@@ -40,11 +67,7 @@ pub async fn start_challenge(
         .await
         .map_err(|e| e.to_string())?
     {
-        return Ok(note(format!(
-            "a fight is already open: {}/match/{}",
-            ctx.public_url.trim_end_matches('/'),
-            existing.id
-        )));
+        return Ok(already_open_note(ctx, &existing.id));
     }
 
     let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, owner, repo, number, 3600)
@@ -78,10 +101,55 @@ pub async fn start_challenge(
         Some(false) => {}
     }
 
-    let work = tempfile::Builder::new()
-        .prefix("git-fight-")
-        .tempdir()
-        .map_err(|e| e.to_string())?;
+    let ours_login = pr.user.login.clone();
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let seed = uuid::Uuid::new_v4().as_u128() as u64;
+    let ours_token = uuid::Uuid::new_v4().simple().to_string();
+    let theirs_token = uuid::Uuid::new_v4().simple().to_string();
+    match db::insert_full_match(
+        &ctx.pool,
+        &NewMatch {
+            id: id.clone(),
+            seed,
+            delay: INPUT_DELAY,
+            ours_name: ours_login.clone(),
+            theirs_name: "theirs".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: Some(ours_login.clone()),
+            theirs_login: None,
+            ours_token,
+            theirs_token,
+            expire_secs: ctx.expire_secs,
+            installation_id: Some(installation_id as i64),
+            owner: owner.into(),
+            repo: repo.into(),
+            pr_number: number as i64,
+            pr_head_sha: pr.head.sha.clone(),
+            pr_base_sha: pr.base.sha.clone(),
+        },
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(e) if db::is_unique_violation(&e) => {
+            return already_open_now(ctx, owner, repo, number).await;
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+
+    let work = match tempfile::Builder::new().prefix("git-fight-").tempdir() {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(abort_start(
+                &ctx.pool,
+                &id,
+                "clone",
+                format!("git fight could not start: {e}"),
+            )
+            .await);
+        }
+    };
     let dest = work.path().join("repo.git");
     let key = format!("{owner}/{repo}");
     let (url, bearer) = if let Some(local) = ctx.test_repos.get(&key) {
@@ -93,38 +161,82 @@ pub async fn start_challenge(
             Some(token),
         )
     };
-    gitutil::clone_bare(&url, &dest, bearer.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = gitutil::clone_bare(&url, &dest, bearer.as_deref()).await {
+        return Ok(abort_start(
+            &ctx.pool,
+            &id,
+            "clone",
+            format!("git fight could not start: {e}"),
+        )
+        .await);
+    }
     let _ = gitutil::fetch_shas(&dest, &[&pr.head.sha, &pr.base.sha], bearer.as_deref()).await;
 
-    let (tree, paths, code) = gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (tree, paths, code) = match gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(abort_start(
+                &ctx.pool,
+                &id,
+                "clone",
+                format!("git fight could not start: {e}"),
+            )
+            .await);
+        }
+    };
     if code == 0 {
-        return Ok(note("no conflicts to fight"));
+        return Ok(abort_start(
+            &ctx.pool,
+            &id,
+            "no_conflicts",
+            "no conflicts to fight".into(),
+        )
+        .await);
     }
 
     let hunks = match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths).await {
         Ok(h) => h,
         Err(gitutil::GitError::TooMany(n)) => {
-            return Ok(note(format!(
-                "too many conflicts for one fight ({n}; max {MAX_HUNKS})"
-            )));
+            return Ok(abort_start(
+                &ctx.pool,
+                &id,
+                "too_many",
+                format!("too many conflicts for one fight ({n}; max {MAX_HUNKS})"),
+            )
+            .await);
         }
         Err(gitutil::GitError::NothingToFight) => {
-            return Ok(note("the conflicts are not the kind git fight can play"));
+            return Ok(abort_start(
+                &ctx.pool,
+                &id,
+                "nothing",
+                "the conflicts are not the kind git fight can play".into(),
+            )
+            .await);
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => {
+            return Ok(abort_start(
+                &ctx.pool,
+                &id,
+                "clone",
+                format!("git fight could not start: {e}"),
+            )
+            .await);
+        }
     };
     if hunks.len() > MAX_HUNKS {
-        return Ok(note(format!(
-            "too many conflicts for one fight ({}; max {MAX_HUNKS})",
-            hunks.len()
-        )));
+        return Ok(abort_start(
+            &ctx.pool,
+            &id,
+            "too_many",
+            format!(
+                "too many conflicts for one fight ({}; max {MAX_HUNKS})",
+                hunks.len()
+            ),
+        )
+        .await);
     }
 
-    let ours_login = pr.user.login.clone();
     let mut login_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut sides: Vec<(String, String, Option<String>)> = Vec::new();
     for h in &hunks {
@@ -144,41 +256,29 @@ pub async fn start_challenge(
         .first()
         .cloned()
         .unwrap_or_else(|| ("cpu".into(), "theirs".into(), None));
-
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let seed = uuid::Uuid::new_v4().as_u128() as u64;
-    let ours_token = uuid::Uuid::new_v4().simple().to_string();
-    let theirs_token = uuid::Uuid::new_v4().simple().to_string();
-    db::insert_full_match(
+    let ours_kind = if theirs_kind == "mirror" {
+        "mirror"
+    } else {
+        "github"
+    };
+    if let Err(e) = db::update_match_fighters(
         &ctx.pool,
-        &NewMatch {
-            id: id.clone(),
-            seed,
-            delay: INPUT_DELAY,
-            ours_name: ours_login.clone(),
-            theirs_name: theirs_name.clone(),
-            ours_kind: if theirs_kind == "mirror" {
-                "mirror"
-            } else {
-                "github"
-            }
-            .into(),
-            theirs_kind: theirs_kind.clone(),
-            ours_login: Some(ours_login.clone()),
-            theirs_login,
-            ours_token,
-            theirs_token,
-            expire_secs: ctx.expire_secs,
-            installation_id: Some(installation_id as i64),
-            owner: owner.into(),
-            repo: repo.into(),
-            pr_number: number as i64,
-            pr_head_sha: pr.head.sha.clone(),
-            pr_base_sha: pr.base.sha.clone(),
-        },
+        &id,
+        ours_kind,
+        &theirs_kind,
+        &theirs_name,
+        theirs_login.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        return Ok(abort_start(
+            &ctx.pool,
+            &id,
+            "clone",
+            format!("git fight could not start: {e}"),
+        )
+        .await);
+    }
 
     for (round, h) in hunks.iter().enumerate() {
         let ours_author = gitutil::latest_author(&dest, &pr.head.sha, &h.path)
@@ -187,7 +287,7 @@ pub async fn start_challenge(
         let ours_stats = gitutil::fighter_stats(&dest, &pr.head.sha, &h.path, &ours_author).await;
         let theirs_stats =
             gitutil::fighter_stats(&dest, &pr.base.sha, &h.path, &h.blame_name).await;
-        db::insert_hunk(
+        if let Err(e) = db::insert_hunk(
             &ctx.pool,
             &db::NewHunk {
                 match_id: &id,
@@ -204,7 +304,15 @@ pub async fn start_challenge(
             },
         )
         .await
-        .map_err(|e| e.to_string())?;
+        {
+            return Ok(abort_start(
+                &ctx.pool,
+                &id,
+                "clone",
+                format!("git fight could not start: {e}"),
+            )
+            .await);
+        }
     }
 
     let rounds = hunks.len();

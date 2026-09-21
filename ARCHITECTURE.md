@@ -96,10 +96,11 @@ comment /fight
     → verify webhook signature
     → load PR, poll until mergeable is not null
     → refuse if already mergeable, too big, too many conflicts, or a match is already open
+    → insert pending match (frozen SHAs) so later /fight and synchronize see it
     → bare partial clone + merge-tree
     → parse fightable hunks in core
     → name fighters (PR author vs base-side blame)
-    → insert match, comment the link
+    → comment the link (or abort the row if clone/hunks fail)
     → OAuth login, lockstep rounds
     → if all rounds resolved and SHAs unchanged: plumbing commit, push new branch, comment
     → otherwise: comment why nothing was pushed
@@ -139,7 +140,7 @@ For each conflicted path, `git cat-file blob <tree>:<path>` and parse with core.
 
 Count fightable hunks. `0`: comment that the conflicts are not the kind git fight can play. `> 15`: comment that it is too many conflicts for one fight and stop. Otherwise one round per hunk, file path then hunk order, max 15.
 
-Record `pr_head_sha` and `pr_base_sha` on the match. Milestone 5 refuses to push if either has moved.
+Record `pr_head_sha` and `pr_base_sha` on the match **before** clone so a second `/fight` or a `synchronize` during git work still sees the open match. If clone or hunk collection fails, status becomes `aborted` and another `/fight` can start. Milestone 5 refuses to push if either SHA has moved.
 
 ### 5. Fighters
 
