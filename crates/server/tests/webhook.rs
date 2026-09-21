@@ -444,10 +444,14 @@ async fn http(
 }
 
 fn fight_body() -> Vec<u8> {
-    comment_body("created", true, "/fight\n")
+    fight_comment(1)
 }
 
-fn comment_body(action: &str, on_pr: bool, text: &str) -> Vec<u8> {
+fn fight_comment(id: u64) -> Vec<u8> {
+    comment_body(id, "created", true, "/fight\n")
+}
+
+fn comment_body(comment_id: u64, action: &str, on_pr: bool, text: &str) -> Vec<u8> {
     let issue = if on_pr {
         json!({ "number": 1, "pull_request": {} })
     } else {
@@ -462,7 +466,7 @@ fn comment_body(action: &str, on_pr: bool, text: &str) -> Vec<u8> {
             "default_branch": "main"
         },
         "issue": issue,
-        "comment": { "body": text, "user": { "login": "carol", "type": "User" } },
+        "comment": { "id": comment_id, "body": text, "user": { "login": "carol", "type": "User" } },
         "sender": { "login": "carol", "type": "User" }
     }))
     .unwrap()
@@ -1963,7 +1967,7 @@ async fn edited_fight_comment_starts_challenge() {
             addr,
             "issue_comment",
             "deliv-edited",
-            &comment_body("edited", true, "/fight\n")
+            &comment_body(1, "edited", true, "/fight\n")
         )
         .await,
         200
@@ -1987,7 +1991,7 @@ async fn fight_on_plain_issue_is_ignored() {
             addr,
             "issue_comment",
             "deliv-issue",
-            &comment_body("created", false, "/fight\n")
+            &comment_body(1, "created", false, "/fight\n")
         )
         .await,
         200
@@ -2006,7 +2010,7 @@ async fn fight_not_first_line_is_ignored() {
             addr,
             "issue_comment",
             "deliv-not-first",
-            &comment_body("created", true, "please /fight\n")
+            &comment_body(1, "created", true, "please /fight\n")
         )
         .await,
         200
@@ -2025,7 +2029,7 @@ async fn deleted_fight_comment_is_ignored() {
             addr,
             "issue_comment",
             "deliv-deleted",
-            &comment_body("deleted", true, "/fight\n")
+            &comment_body(1, "deleted", true, "/fight\n")
         )
         .await,
         200
@@ -2216,7 +2220,7 @@ async fn pr_synchronize_moved_sha_comments_once() {
     );
 
     assert_eq!(
-        post_signed(addr, "issue_comment", "deliv-rematch", &fight_body()).await,
+        post_signed(addr, "issue_comment", "deliv-rematch", &fight_comment(2)).await,
         200
     );
     let comments = wait_posted(&mock, 2).await;
@@ -2444,8 +2448,8 @@ async fn second_fight_while_cloning_gets_open_link() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
     let addr = spawn(cfg_for(&mock, bare)).await;
-    let body_a = fight_body();
-    let body_b = fight_body();
+    let body_a = fight_comment(1);
+    let body_b = fight_comment(2);
     let a = post_signed(addr, "issue_comment", "deliv-race-a", &body_a);
     let b = post_signed(addr, "issue_comment", "deliv-race-b", &body_b);
     let (sa, sb) = tokio::join!(a, b);
