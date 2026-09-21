@@ -684,9 +684,7 @@ pub fn fold_github_name(s: &str) -> String {
 }
 
 pub fn fold_github_login_opt(s: Option<&str>) -> Option<String> {
-    s.map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(fold_github_name)
+    s.and_then(normalize_github_login)
 }
 
 pub fn same_github_login(a: Option<&str>, b: Option<&str>) -> bool {
@@ -832,6 +830,9 @@ mod tests {
         assert_eq!(fold_github_name("Acme"), "acme");
         assert_eq!(fold_github_name(""), "");
         assert_eq!(fold_github_login_opt(Some("BOB")).as_deref(), Some("bob"));
+        assert!(fold_github_login_opt(Some("../x")).is_none());
+        assert!(fold_github_login_opt(Some("not a login")).is_none());
+        assert!(fold_github_login_opt(Some("")).is_none());
     }
 
     #[test]

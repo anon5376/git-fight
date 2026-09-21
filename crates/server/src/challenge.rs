@@ -456,18 +456,19 @@ fn side_from_blame(
     login: Option<String>,
     blame_name: &str,
 ) -> (String, String, Option<String>) {
-    match login {
-        Some(l) if l.eq_ignore_ascii_case(ours_login) => {
-            let stored = crate::gh::normalize_github_login(&l)
-                .unwrap_or_else(|| ours_login.to_ascii_lowercase());
-            ("mirror".into(), ours_login.to_string(), Some(stored))
-        }
-        Some(l) => {
-            let stored =
-                crate::gh::normalize_github_login(&l).unwrap_or_else(|| l.to_ascii_lowercase());
-            ("github".into(), l, Some(stored))
-        }
-        None => ("cpu".into(), blame_name.to_string(), None),
+    // A login that is not a GitHub name cannot occupy a slot (OAuth
+    // already dropped it). Treat that as no account: CPU under the
+    // git author name, not a 24h wait for a fighter who can never join.
+    let Some(raw) = login else {
+        return ("cpu".into(), blame_name.to_string(), None);
+    };
+    let Some(stored) = crate::gh::normalize_github_login(&raw) else {
+        return ("cpu".into(), blame_name.to_string(), None);
+    };
+    if stored.eq_ignore_ascii_case(ours_login) {
+        ("mirror".into(), ours_login.to_string(), Some(stored))
+    } else {
+        ("github".into(), raw, Some(stored))
     }
 }
 
@@ -515,6 +516,14 @@ mod tests {
         assert_eq!(kind, "github");
         assert_eq!(name, "Bob");
         assert_eq!(login.as_deref(), Some("bob"));
+        let (kind, name, login) = side_from_blame("alice", Some("../x".into()), "Eve");
+        assert_eq!(kind, "cpu");
+        assert_eq!(name, "Eve");
+        assert!(login.is_none());
+        let (kind, name, login) = side_from_blame("alice", Some("not a login".into()), "Eve");
+        assert_eq!(kind, "cpu");
+        assert_eq!(name, "Eve");
+        assert!(login.is_none());
     }
 
     #[tokio::test]

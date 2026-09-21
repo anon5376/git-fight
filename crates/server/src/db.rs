@@ -956,7 +956,7 @@ pub async fn insert_session(
     let now = Utc::now();
     let expires = now + Duration::seconds(crate::limits::SESSION_TTL_SECS);
     let login = crate::gh::normalize_github_login(login)
-        .unwrap_or_else(|| login.trim().to_ascii_lowercase());
+        .ok_or_else(|| sqlx::Error::Protocol("login".into()))?;
     sqlx::query(
         "INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?)",
@@ -1139,8 +1139,9 @@ pub async fn add_player_stats(
     repo: &str,
     stat: &PlayerStat,
 ) -> Result<(), sqlx::Error> {
-    let login = crate::gh::normalize_github_login(&stat.github_login)
-        .unwrap_or_else(|| stat.github_login.trim().to_ascii_lowercase());
+    let Some(login) = crate::gh::normalize_github_login(&stat.github_login) else {
+        return Ok(());
+    };
     let owner = crate::gh::fold_github_name(owner);
     let repo = crate::gh::fold_github_name(repo);
     sqlx::query(
@@ -2084,6 +2085,7 @@ mod tests {
             session_login(&pool, "s1").await.unwrap().as_deref(),
             Some("alice")
         );
+        assert!(insert_session(&pool, "s-bad", 2, "../x").await.is_err());
         add_player_stats(
             &pool,
             "acme",
@@ -2239,6 +2241,30 @@ mod tests {
         assert!(try_hunk(&pool, 0, "../x.rs", 0).await.is_err());
         assert!(try_hunk(&pool, 0, "-opt.rs", 0).await.is_err());
         try_hunk(&pool, 0, "lib.rs", 0).await.unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "m1",
+                round: 1,
+                path: "a.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: Some("../x"),
+                theirs_name: Some("Eve"),
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let hunks = list_hunks(&pool, "m1").await.unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert!(
+            hunks[1].theirs_login.is_none(),
+            "unsafe blamed login must not become a human slot"
+        );
     }
 
     #[tokio::test]
