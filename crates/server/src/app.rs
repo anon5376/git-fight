@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -545,13 +546,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 let Some(ev) = join.take() else {
                     break;
                 };
-                match tx.send(ev).await {
-                    Ok(()) => {
-                        live = Some(tx);
-                        break;
+                // Fighter Join may wait. Spectator Join is try_send so a
+                // connect flood cannot fill the 512-slot room queue.
+                if enqueue_input {
+                    match tx.send(ev).await {
+                        Ok(()) => {
+                            live = Some(tx);
+                            break;
+                        }
+                        Err(sent) => {
+                            join = Some(sent.0);
+                        }
                     }
-                    Err(sent) => {
-                        join = Some(sent.0);
+                } else {
+                    match tx.try_send(ev) {
+                        Ok(()) => {
+                            live = Some(tx);
+                            break;
+                        }
+                        Err(TrySendError::Closed(ev)) => {
+                            join = Some(ev);
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            reject_socket(socket, "busy").await;
+                            return;
+                        }
                     }
                 }
             }
@@ -605,7 +624,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 round,
             });
         }
-        let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
+        if enqueue_input {
+            let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
+        } else if leave_tx.try_send(RoomEvent::Leave { conn_id }).is_err() {
+            tokio::spawn(async move {
+                let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
+            });
+        }
     });
 
     let write = tokio::spawn(async move {

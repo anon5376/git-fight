@@ -326,6 +326,34 @@ async fn login_for_email_queries_author() {
 }
 
 #[tokio::test]
+async fn login_for_email_matches_ignore_case() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "author": { "login": "Bob" },
+            "commit": { "author": { "email": "Bob@Example.COM" } }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "bob@example.com")
+            .await
+            .as_deref(),
+        Some("bob")
+    );
+}
+
+#[tokio::test]
 async fn login_for_commit_uses_list_api_not_files_payload() {
     let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let mock = MockServer::start().await;

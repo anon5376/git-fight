@@ -499,7 +499,12 @@ impl GitHub {
         }
         let rows: Vec<Row> = json_capped(res, MAX_COMMITS_JSON).await?;
         for row in rows {
-            if row.commit.author.and_then(|a| a.email).as_deref() == Some(email) {
+            if row
+                .commit
+                .author
+                .and_then(|a| a.email)
+                .is_some_and(|got| got.eq_ignore_ascii_case(email))
+            {
                 if let Some(login) = row
                     .author
                     .and_then(|a| a.login)
