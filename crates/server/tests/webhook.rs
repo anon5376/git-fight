@@ -208,6 +208,45 @@ fn modify_delete_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String)
     (tmp, bare, head, base)
 }
 
+fn symlink_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::os::unix::fs::symlink("a.txt", work.join("link")).unwrap();
+    git(&work, &["add", "link"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::remove_file(work.join("link")).unwrap();
+    std::os::unix::fs::symlink("b.txt", work.join("link")).unwrap();
+    git(&work, &["add", "link"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::remove_file(work.join("link")).unwrap();
+    std::os::unix::fs::symlink("c.txt", work.join("link")).unwrap();
+    git(&work, &["add", "link"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 fn write_hunk_fns(work: &Path, n: usize, body: i32) {
     let mut src = String::new();
     for i in 0..n {
@@ -939,6 +978,8 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
         let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
         alice_sink.send(Message::Text(ours.into())).await.unwrap();
         bob_sink.send(Message::Text(idle.into())).await.unwrap();
+        let kick = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+        carol_sink.send(Message::Text(kick.into())).await.unwrap();
         next_send += 1;
     }
     let mut ends = 0u32;
@@ -964,6 +1005,8 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
                         carol_sink.send(Message::Text(idle.into())).await.unwrap();
                     } else {
                         bob_sink.send(Message::Text(idle.into())).await.unwrap();
+                        let kick = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                        carol_sink.send(Message::Text(kick.into())).await.unwrap();
                     }
                     next_send += 1;
                 }
@@ -978,6 +1021,8 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
                         carol_sink.send(Message::Text(idle.into())).await.unwrap();
                     } else {
                         bob_sink.send(Message::Text(idle.into())).await.unwrap();
+                        let kick = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                        carol_sink.send(Message::Text(kick.into())).await.unwrap();
                     }
                     next_send += 1;
                 }
@@ -1059,6 +1104,11 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
     assert_eq!(parts.len(), 3, "{parents}");
     assert!(parts.contains(&head.as_str()), "{parents}");
     assert!(parts.contains(&base.as_str()), "{parents}");
+    let ident = git_dir(&bare, &["log", "-1", "--format=%an <%ae>", &branch]);
+    assert_eq!(
+        ident, "git-fight <git-fight@users.noreply.github.com>",
+        "{ident}"
+    );
     let msg = git_dir(&bare, &["log", "-1", "--format=%B", &branch]);
     assert!(msg.contains("round 1: a.rs"), "{msg}");
     assert!(msg.contains("round 2: b.rs"), "{msg}");
@@ -1472,6 +1522,32 @@ async fn modify_delete_conflict_is_not_fightable() {
             .unwrap()
             .is_none(),
         "modify-delete must not leave a pending match"
+    );
+}
+
+#[tokio::test]
+async fn symlink_conflict_is_not_fightable() {
+    let (_keep, bare, head, base) = symlink_conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-symlink", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("not the kind git fight can play")
+                || t.contains("no conflicts to fight")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "symlink conflicts must not leave a pending match"
     );
 }
 
