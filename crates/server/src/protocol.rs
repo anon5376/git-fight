@@ -72,14 +72,13 @@ pub fn role_for(
 }
 
 /// Whether this socket may put `Input` on the room queue.
-/// GitHub: session login is ours, match theirs, or any hunk theirs (later rounds).
+/// GitHub: session login is ours or the **current-round** theirs.
+/// A later-round blamed author is a spectator until that conflict starts.
 /// Local: a non-empty share token that owns a slot. Spectators never enqueue.
-#[allow(clippy::too_many_arguments)]
 pub fn can_enqueue_input(
     github: bool,
     ours_login: Option<&str>,
-    match_theirs_login: Option<&str>,
-    hunk_theirs_logins: &[&str],
+    current_theirs_login: Option<&str>,
     login: Option<&str>,
     token: Option<&str>,
     ours_token: Option<&str>,
@@ -89,14 +88,8 @@ pub fn can_enqueue_input(
         let Some(login) = login.filter(|s| !s.is_empty()) else {
             return false;
         };
-        if ours_login.is_some_and(|o| o.eq_ignore_ascii_case(login))
-            || match_theirs_login.is_some_and(|t| t.eq_ignore_ascii_case(login))
-        {
-            return true;
-        }
-        return hunk_theirs_logins
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case(login));
+        return ours_login.is_some_and(|o| o.eq_ignore_ascii_case(login))
+            || current_theirs_login.is_some_and(|t| t.eq_ignore_ascii_case(login));
     }
     role_for(false, None, None, login, token, ours_token, theirs_token) != Role::Spectator
 }
@@ -191,7 +184,6 @@ mod tests {
                 true,
                 Some("alice"),
                 Some("bob"),
-                &[],
                 Some("alice"),
                 None,
                 None,
@@ -203,21 +195,43 @@ mod tests {
             can_enqueue_input(
                 true,
                 Some("alice"),
-                Some("bob"),
-                &["carol"],
+                Some("carol"),
                 Some("carol"),
                 None,
                 None,
                 None
             ),
-            "later-round theirs may enqueue"
+            "current-round theirs may enqueue"
         );
         assert!(
             !can_enqueue_input(
                 true,
                 Some("alice"),
                 Some("bob"),
-                &["carol"],
+                Some("carol"),
+                None,
+                None,
+                None
+            ),
+            "later-round theirs must not fill the queue before their conflict"
+        );
+        assert!(
+            !can_enqueue_input(
+                true,
+                Some("alice"),
+                Some("carol"),
+                Some("bob"),
+                None,
+                None,
+                None
+            ),
+            "previous-round theirs is a spectator after their conflict"
+        );
+        assert!(
+            !can_enqueue_input(
+                true,
+                Some("alice"),
+                Some("bob"),
                 Some("dave"),
                 Some("ours-token"),
                 Some("o"),
@@ -226,27 +240,17 @@ mod tests {
             "GitHub spectator Input never reaches the room queue"
         );
         assert!(
-            !can_enqueue_input(
-                true,
-                Some("alice"),
-                Some("bob"),
-                &[],
-                None,
-                None,
-                None,
-                None
-            ),
+            !can_enqueue_input(true, Some("alice"), Some("bob"), None, None, None, None),
             "anonymous GitHub socket cannot enqueue"
         );
         assert!(
-            !can_enqueue_input(false, None, None, &[], None, Some(""), Some(""), Some("")),
+            !can_enqueue_input(false, None, None, None, Some(""), Some(""), Some("")),
             "empty local token cannot enqueue"
         );
         assert!(can_enqueue_input(
             false,
             None,
             None,
-            &[],
             None,
             Some("ours-token"),
             Some("ours-token"),
@@ -293,14 +297,13 @@ mod tests {
             can_enqueue_input(
                 true,
                 Some("Alice"),
-                Some("Bob"),
-                &["Carol"],
+                Some("Carol"),
                 Some("carol"),
                 None,
                 None,
                 None
             ),
-            "later-round theirs matches regardless of case"
+            "current-round theirs matches regardless of case"
         );
         assert_eq!(round_seed(7, 0), 7);
         assert_eq!(round_seed(7, 1), 14);

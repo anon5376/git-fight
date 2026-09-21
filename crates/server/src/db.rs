@@ -1201,6 +1201,24 @@ pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
         .unwrap_or_else(|| (String::new(), 0))
 }
 
+/// Theirs login for the first unscored hunk. `None` if every hunk is scored
+/// or the match has no hunks yet (local demo).
+pub async fn current_theirs_login(
+    pool: &SqlitePool,
+    match_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let login: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT theirs_login FROM match_hunks
+         WHERE match_id = ? AND winner IS NULL
+         ORDER BY round_index ASC
+         LIMIT 1",
+    )
+    .bind(match_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(login.flatten())
+}
+
 pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
     sqlx::query_as::<_, HunkRow>(
         "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login,
@@ -2266,6 +2284,60 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(blob_len, 0, "conflict bytes must not sit in SQLite");
+    }
+
+    #[tokio::test]
+    async fn current_theirs_login_is_the_first_unscored_hunk() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m-cur", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        for (round, login) in [(0, "bob"), (1, "carol")] {
+            insert_hunk(
+                &pool,
+                &NewHunk {
+                    match_id: "m-cur",
+                    round,
+                    path: "lib.rs",
+                    hunk_index: round,
+                    ours: b"a",
+                    theirs: b"b",
+                    base: b"c",
+                    theirs_login: Some(login),
+                    theirs_name: Some(login),
+                    ours_stats: git_fight_core::FighterStats::default(),
+                    theirs_stats: git_fight_core::FighterStats::default(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            current_theirs_login(&pool, "m-cur")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bob")
+        );
+        assert!(set_hunk_winner(&pool, "m-cur", 0, "ours", true)
+            .await
+            .unwrap());
+        assert_eq!(
+            current_theirs_login(&pool, "m-cur")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("carol"),
+            "after round 0 is scored, carol is the current theirs"
+        );
+        assert!(set_hunk_winner(&pool, "m-cur", 1, "theirs", false)
+            .await
+            .unwrap());
+        assert_eq!(
+            current_theirs_login(&pool, "m-cur").await.unwrap(),
+            None,
+            "a fully scored match has no current theirs"
+        );
     }
 
     #[tokio::test]

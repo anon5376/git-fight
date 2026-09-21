@@ -560,15 +560,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         return;
     }
     let github = db::github_identity(&row, &hunks);
-    let hunk_theirs: Vec<&str> = hunks
-        .iter()
-        .filter_map(|h| h.theirs_login.as_deref())
-        .collect();
-    let enqueue_input = can_enqueue_input(
+    let current_theirs = db::current_theirs_login(&state.pool, &row.id)
+        .await
+        .ok()
+        .flatten();
+    let enqueue_join = can_enqueue_input(
         github,
         row.ours_login.as_deref(),
-        row.theirs_login.as_deref(),
-        &hunk_theirs,
+        current_theirs.as_deref(),
         login.as_deref(),
         q.token.as_deref(),
         row.ours_token.as_deref(),
@@ -576,6 +575,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     );
     let conn_id = uuid::Uuid::new_v4().as_u128() as u64;
     let (out_tx, mut out_rx) = mpsc::channel::<String>(512);
+    let login_for_input = login.clone();
+    let token_for_input = q.token.clone();
+    let ours_login = row.ours_login.clone();
+    let ours_token = row.ours_token.clone();
+    let theirs_token = row.theirs_token.clone();
+    let match_id = row.id.clone();
+    let pool = state.pool.clone();
     let mut join = Some(RoomEvent::Join {
         conn_id,
         login,
@@ -591,7 +597,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 };
                 // Fighter Join may wait. Spectator Join is try_send so a
                 // connect flood cannot fill the 512-slot room queue.
-                if enqueue_input {
+                if enqueue_join {
                     match tx.send(ev).await {
                         Ok(()) => {
                             live = Some(tx);
@@ -656,7 +662,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
             else {
                 continue;
             };
-            if !enqueue_input {
+            let current = if github {
+                db::current_theirs_login(&pool, &match_id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            if !can_enqueue_input(
+                github,
+                ours_login.as_deref(),
+                current.as_deref(),
+                login_for_input.as_deref(),
+                token_for_input.as_deref(),
+                ours_token.as_deref(),
+                theirs_token.as_deref(),
+            ) {
                 continue;
             }
             let _ = tx.try_send(RoomEvent::Input {
@@ -667,7 +689,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 round,
             });
         }
-        if enqueue_input {
+        if enqueue_join {
             let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
         } else if leave_tx.try_send(RoomEvent::Leave { conn_id }).is_err() {
             tokio::spawn(async move {
