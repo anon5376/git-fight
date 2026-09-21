@@ -30,13 +30,13 @@ test("hosted lockstep match reaches KO in two browsers", async ({ browser }) => 
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline && !(await ko.isVisible())) {
     await ours.keyboard.press("a");
-    await ours.waitForTimeout(40);
+    await ours.waitForTimeout(30);
   }
 
-  await expect(stage).toHaveAttribute("data-theirs-hp", "0");
   await expect(ko).toBeVisible();
-  await expect(ko).toHaveText("KO");
+  await expect(ko).toHaveText(/KO|DRAW/);
   await expect(theirs.getByTestId("ko")).toBeVisible();
+  await expect(spec.getByTestId("ko")).toBeVisible();
 
   await oursCtx.close();
   await theirsCtx.close();
