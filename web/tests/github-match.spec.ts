@@ -320,6 +320,27 @@ test("mirror GitHub session plays both slots with 2P keys", async ({ context, pa
   expect(ticks.some((t) => t[1] === 1)).toBeTruthy();
 });
 
+test("preparing PR match stays on preparing, not reconnecting", async ({ page, request }) => {
+  const matchId = await createMatch(request);
+  execFileSync(
+    "sqlite3",
+    [
+      DB,
+      `UPDATE matches SET owner = 'prep', repo = '${matchId}', pr_number = 1, status = 'pending' WHERE id = '${matchId}';
+       DELETE FROM match_hunks WHERE match_id = '${matchId}';`,
+    ],
+    { stdio: "pipe" },
+  );
+  await page.goto(`/match/${matchId}`);
+  const wait = page.getByTestId("wait");
+  await expect(wait).toContainText(/preparing match/i, { timeout: 10_000 });
+  await page.waitForTimeout(900);
+  await expect(wait).toContainText(/preparing match/i);
+  await expect(wait).not.toContainText(/reconnecting/i);
+  await expect(wait).not.toContainText(/reloading/i);
+  await expect(wait).not.toContainText(/waiting for opponent/i);
+});
+
 test("expired match shows expiry and does not reconnect", async ({ page, request }) => {
   const matchId = await createMatch(request);
   execFileSync(

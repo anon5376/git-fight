@@ -65,6 +65,7 @@ async fn lag_holds_outbound_hello() {
 
 #[tokio::test]
 async fn closed_match_socket_sends_error() {
+    use git_fight_server::db::{NewHunk, NewMatch};
     let dir = std::env::temp_dir().join(format!(
         "gf-closed-ws-{}-{}",
         std::process::id(),
@@ -85,10 +86,36 @@ async fn closed_match_socket_sends_error() {
     git_fight_server::db::set_status(&pool, "ab1", "aborted", false, true, None, Some("too_many"))
         .await
         .unwrap();
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: "prep1".into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: Some("alice".into()),
+            theirs_login: None,
+            ours_token: "ours".into(),
+            theirs_token: "theirs".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: 1,
+            pr_head_sha: "a".into(),
+            pr_base_sha: "b".into(),
+        },
+    )
+    .await
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
     tokio::spawn(async move {
-        git_fight_server::serve(listener, pool, Config::default())
+        git_fight_server::serve(listener, serve_pool, Config::default())
             .await
             .unwrap();
     });
@@ -103,6 +130,7 @@ async fn closed_match_socket_sends_error() {
         ("exp1", "expired"),
         ("ab1", "aborted"),
         ("missing", "not found"),
+        ("prep1", "preparing"),
     ] {
         let url = format!("ws://{addr}/ws?match={id}");
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -110,6 +138,31 @@ async fn closed_match_socket_sends_error() {
         let err = wait_type(&mut stream, "error").await;
         assert_eq!(err["message"].as_str(), Some(want), "{err}");
     }
+
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: "prep1",
+            round: 0,
+            path: "a.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let url = format!("ws://{addr}/ws?match=prep1");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let hello = wait_type(&mut stream, "hello").await;
+    assert_eq!(hello["type"].as_str(), Some("hello"), "{hello}");
+    assert_eq!(hello["path"].as_str(), Some("a.rs"));
 }
 
 #[tokio::test]

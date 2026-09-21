@@ -258,6 +258,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let gen = 0;
   let reconnectTimer: number | null = null;
   let reconnectAttempts = 0;
+  let preparing = false;
   const maxReconnects = 8;
 
   const clearReconnect = () => {
@@ -292,14 +293,22 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     if (stopped || finished) {
       return;
     }
+    ui.wait.classList.remove("hidden");
+    if (preparing) {
+      ui.wait.textContent = "preparing match…";
+      reconnectAttempts = 0;
+      clearReconnect();
+      reconnectTimer = window.setTimeout(() => {
+        openSocket();
+      }, 400);
+      return;
+    }
     reconnectAttempts += 1;
     if (reconnectAttempts > maxReconnects) {
-      ui.wait.classList.remove("hidden");
       ui.wait.textContent = "desync — reloading";
       window.location.reload();
       return;
     }
-    ui.wait.classList.remove("hidden");
     ui.wait.textContent = why;
     clearReconnect();
     reconnectTimer = window.setTimeout(() => {
@@ -323,6 +332,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       youAre = hello.you_are ?? "";
       nextSend = Math.max(0, confirmed + 1);
       finished = false;
+      preparing = false;
       reconnectAttempts = 0;
       ui.ko.classList.add("hidden");
       fight = fightFromWire(
@@ -397,15 +407,20 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       ui.wait.classList.remove("hidden");
       const terminal = err.message === "expired" || err.message === "aborted" || err.message === "not found";
       if (err.message === "preparing") {
+        preparing = true;
         ui.wait.textContent = "preparing match…";
         reconnectAttempts = 0;
       } else if (err.message === "expired") {
+        preparing = false;
         ui.wait.textContent = "this match expired";
       } else if (err.message === "aborted") {
+        preparing = false;
         ui.wait.textContent = "this match could not start";
       } else if (err.message === "not found") {
+        preparing = false;
         ui.wait.textContent = "match not found";
       } else {
+        preparing = false;
         ui.wait.textContent = err.message;
       }
       if (terminal) {
@@ -425,6 +440,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     ws = socket;
     socket.addEventListener("open", () => {
       if (myGen !== gen || finished) {
+        return;
+      }
+      if (preparing) {
+        ui.wait.textContent = "preparing match…";
         return;
       }
       if (ui.wait.textContent === "connecting…" || ui.wait.textContent === "disconnected — reconnecting") {
