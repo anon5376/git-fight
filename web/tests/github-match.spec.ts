@@ -52,6 +52,10 @@ function attachGithubMatch(
     )
     .join(",\n  ");
   const sql = `
+UPDATE matches SET status = 'aborted', abort_reason = 'test'
+  WHERE owner = 'acme' AND repo = 'box' AND pr_number = ${prNumber}
+    AND status IN ('pending', 'in_progress') AND id != '${matchId}'
+    AND ${prNumber} > 0;
 UPDATE matches SET
   ours_login = ${sqlStr(oursLogin)}, theirs_login = ${sqlStr(theirs.login)},
   ours_name = '${oursLogin}', theirs_name = '${rounds[0]?.name ?? "bob"}',
