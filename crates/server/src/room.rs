@@ -126,19 +126,18 @@ async fn run_room(
     let mut pending_ours: BTreeMap<u32, u8> = BTreeMap::new();
     let mut pending_theirs: BTreeMap<u32, u8> = BTreeMap::new();
     let mut started_at: Option<Instant> = None;
+    let mut forfeit_pending = false;
     let id = row.id.clone();
     let mut done = matches!(row.status.as_str(), "finished" | "expired" | "aborted");
     if !done && scored_all {
-        if db::is_open_match(&pool, &id).await.unwrap_or(false) {
-            let last = total_rounds.saturating_sub(1);
-            let hash = hash_from_stored_round(&pool, &id, seed, &hunks, last).await;
-            if db::finish_open_match(&pool, &id, &hash)
-                .await
-                .unwrap_or(false)
-            {
-                if let Some(ctx) = settings.result.as_ref() {
-                    ctx.spawn_publish(id.clone());
-                }
+        let last = total_rounds.saturating_sub(1);
+        let hash = hash_from_stored_round(&pool, &id, seed, &hunks, last).await;
+        if db::finish_open_match(&pool, &id, &hash)
+            .await
+            .unwrap_or(false)
+        {
+            if let Some(ctx) = settings.result.as_ref() {
+                ctx.spawn_publish(id.clone());
             }
         }
         done = true;
@@ -200,7 +199,7 @@ async fn run_room(
                     RoomEvent::Join { conn_id, login, token, tx } => {
                         if done {
                             send_closed(&tx, &pool, &id).await;
-                        } else if !db::is_open_match(&pool, &id).await.unwrap_or(false) {
+                        } else if match_is_open(&pool, &id).await == MatchOpen::Closed {
                             send_closed(&tx, &pool, &id).await;
                             expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
                             done = true;
@@ -357,6 +356,7 @@ async fn run_room(
             mirror: &mut mirror,
             row: &row,
             github,
+            forfeit_pending: &mut forfeit_pending,
         })
         .await;
     }
@@ -389,15 +389,20 @@ struct Advance<'a> {
     mirror: &'a mut bool,
     row: &'a MatchRow,
     github: bool,
+    forfeit_pending: &'a mut bool,
 }
 
 async fn advance(a: Advance<'_>) -> bool {
-    if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
-        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-        return true;
+    match match_is_open(a.pool, a.id).await {
+        MatchOpen::Closed => {
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            return true;
+        }
+        MatchOpen::Unknown => return false,
+        MatchOpen::Open => {}
     }
     if let Some(result) = a.sim.result {
-        return finish(a, result, false).await;
+        return finish(a, result).await;
     }
 
     // Disconnect forfeit is only for someone who already occupied a slot
@@ -407,13 +412,15 @@ async fn advance(a: Advance<'_>) -> bool {
         if let Some(at) = a.ours.disconnected_at {
             if at.elapsed() >= a.disconnect {
                 a.sim.forfeit(Side::Ours);
-                return finish(a, RoundResult::Theirs, true).await;
+                *a.forfeit_pending = true;
+                return finish(a, RoundResult::Theirs).await;
             }
         }
         if let Some(at) = a.theirs.disconnected_at {
             if at.elapsed() >= a.disconnect {
                 a.sim.forfeit(Side::Theirs);
-                return finish(a, RoundResult::Ours, true).await;
+                *a.forfeit_pending = true;
+                return finish(a, RoundResult::Ours).await;
             }
         }
     }
@@ -454,9 +461,13 @@ async fn advance(a: Advance<'_>) -> bool {
                 break;
             }
         }
-        if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
-            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-            return true;
+        match match_is_open(a.pool, a.id).await {
+            MatchOpen::Closed => {
+                expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                return true;
+            }
+            MatchOpen::Unknown => return false,
+            MatchOpen::Open => {}
         }
         let ours_btn = if a.ours.kind_cpu {
             a.sim.cpu_input(Side::Ours).as_u8()
@@ -491,27 +502,93 @@ async fn advance(a: Advance<'_>) -> bool {
         }
     }
     if let Some(result) = a.sim.result {
-        return finish(a, result, false).await;
+        return finish(a, result).await;
     }
     false
 }
 
-async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
-    if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
-        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-        return true;
+/// What to do after `set_hunk_winner`. A failed write with no stored
+/// winner must retry — do not broadcast End or start the next conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinishAfterWrite {
+    Proceed { record: bool },
+    Close,
+    Retry,
+}
+
+fn finish_after_write(tagged: bool, open: MatchOpen, stored: bool) -> FinishAfterWrite {
+    if tagged {
+        FinishAfterWrite::Proceed { record: true }
+    } else if open == MatchOpen::Closed {
+        FinishAfterWrite::Close
+    } else if stored {
+        FinishAfterWrite::Proceed { record: false }
+    } else {
+        FinishAfterWrite::Retry
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatchOpen {
+    Open,
+    Closed,
+    Unknown,
+}
+
+async fn match_is_open(pool: &SqlitePool, id: &str) -> MatchOpen {
+    match db::is_open_match(pool, id).await {
+        Ok(true) => MatchOpen::Open,
+        Ok(false) => MatchOpen::Closed,
+        Err(_) => MatchOpen::Unknown,
+    }
+}
+
+async fn stored_round_has_winner(pool: &SqlitePool, id: &str, round: u32) -> bool {
+    db::list_hunks(pool, id)
+        .await
+        .ok()
+        .and_then(|hs| {
+            hs.into_iter()
+                .find(|h| h.round_index == i64::from(round))
+                .and_then(|h| h.winner)
+        })
+        .is_some()
+}
+
+async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
+    match match_is_open(a.pool, a.id).await {
+        MatchOpen::Closed => {
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            return true;
+        }
+        MatchOpen::Unknown => return false,
+        MatchOpen::Open => {}
+    }
+    let forfeit = *a.forfeit_pending;
     let tag = result::winner_tag(result, forfeit);
     let ko =
         !forfeit && result != RoundResult::Draw && (a.sim.ours.hp <= 0 || a.sim.theirs.hp <= 0);
     let tagged = db::set_hunk_winner(a.pool, a.id, i64::from(*a.round), tag)
         .await
         .unwrap_or(false);
-    if tagged {
-        let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
-    } else if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
-        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-        return true;
+    let open = match_is_open(a.pool, a.id).await;
+    let stored = !tagged
+        && open != MatchOpen::Closed
+        && stored_round_has_winner(a.pool, a.id, *a.round).await;
+    match finish_after_write(tagged, open, stored) {
+        FinishAfterWrite::Proceed { record: true } => {
+            *a.forfeit_pending = false;
+            let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
+        }
+        FinishAfterWrite::Proceed { record: false } => {
+            *a.forfeit_pending = false;
+        }
+        FinishAfterWrite::Close => {
+            *a.forfeit_pending = false;
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            return true;
+        }
+        FinishAfterWrite::Retry => return false,
     }
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
@@ -530,9 +607,13 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     if match_over {
         return true;
     }
-    if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
-        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
-        return true;
+    match match_is_open(a.pool, a.id).await {
+        MatchOpen::Closed => {
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            return true;
+        }
+        MatchOpen::Unknown => return false,
+        MatchOpen::Open => {}
     }
     *a.round += 1;
     let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
@@ -1015,6 +1096,43 @@ mod tests {
         assert!(
             theirs.disconnected_at.is_none(),
             "carol must not be forfeited before she joins"
+        );
+    }
+
+    #[test]
+    fn finish_retries_when_winner_write_fails_and_nothing_is_stored() {
+        assert_eq!(
+            finish_after_write(true, MatchOpen::Open, false),
+            FinishAfterWrite::Proceed { record: true }
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Closed, false),
+            FinishAfterWrite::Close
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Open, true),
+            FinishAfterWrite::Proceed { record: false },
+            "write-once already set: resume End / next round"
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Open, false),
+            FinishAfterWrite::Retry,
+            "SQLite miss must not advance as if the hunk was scored"
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Unknown, false),
+            FinishAfterWrite::Retry,
+            "a busy status read is not a closed match"
+        );
+        assert_eq!(
+            finish_after_write(true, MatchOpen::Unknown, false),
+            FinishAfterWrite::Proceed { record: true },
+            "a successful write still records even if the follow-up status read fails"
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Unknown, true),
+            FinishAfterWrite::Proceed { record: false },
+            "write-once already set: do not expire on a busy status read"
         );
     }
 }
