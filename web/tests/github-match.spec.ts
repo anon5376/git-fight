@@ -319,3 +319,21 @@ test("mirror GitHub session plays both slots with 2P keys", async ({ context, pa
   expect(ticks.some((t) => t[0] === 1)).toBeTruthy();
   expect(ticks.some((t) => t[1] === 1)).toBeTruthy();
 });
+
+test("expired match shows expiry and does not reconnect", async ({ page, request }) => {
+  const matchId = await createMatch(request);
+  execFileSync(
+    "sqlite3",
+    [
+      DB,
+      `UPDATE matches SET status = 'expired', abort_reason = 'expired' WHERE id = '${matchId}';`,
+    ],
+    { stdio: "pipe" },
+  );
+  await page.goto(`/match/${matchId}`);
+  await expect(page.getByTestId("wait")).toContainText(/this match expired/i, { timeout: 10_000 });
+  await page.waitForTimeout(900);
+  await expect(page.getByTestId("wait")).toContainText(/this match expired/i);
+  await expect(page.getByTestId("wait")).not.toContainText(/reconnecting/i);
+  await expect(page.getByTestId("wait")).not.toContainText(/reloading/i);
+});

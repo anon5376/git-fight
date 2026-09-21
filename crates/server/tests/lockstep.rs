@@ -64,6 +64,55 @@ async fn lag_holds_outbound_hello() {
 }
 
 #[tokio::test]
+async fn closed_match_socket_sends_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "gf-closed-ws-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    git_fight_server::db::insert_match(&pool, "exp1", 1, 3, "o", "t", 3600)
+        .await
+        .unwrap();
+    git_fight_server::db::set_status(&pool, "exp1", "expired", false, true, None, Some("expired"))
+        .await
+        .unwrap();
+    git_fight_server::db::insert_match(&pool, "ab1", 1, 3, "o", "t", 3600)
+        .await
+        .unwrap();
+    git_fight_server::db::set_status(&pool, "ab1", "aborted", false, true, None, Some("too_many"))
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(listener, pool, Config::default())
+            .await
+            .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    for (id, want) in [
+        ("exp1", "expired"),
+        ("ab1", "aborted"),
+        ("missing", "not found"),
+    ] {
+        let url = format!("ws://{addr}/ws?match={id}");
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (_, mut stream) = ws.split();
+        let err = wait_type(&mut stream, "error").await;
+        assert_eq!(err["message"].as_str(), Some(want), "{err}");
+    }
+}
+
+#[tokio::test]
 async fn cpu_lockstep_hashes_agree_with_client() {
     use git_fight_server::db::{NewHunk, NewMatch};
     let dir = std::env::temp_dir().join(format!(

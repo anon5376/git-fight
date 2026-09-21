@@ -2,7 +2,7 @@ use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
 use crate::protocol::{
-    round_seed, split_seed, ClientMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY,
+    round_seed, split_seed, ClientMsg, ServerMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY,
 };
 use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
@@ -376,11 +376,21 @@ async fn ws_upgrade(
     ws.on_upgrade(move |socket| handle_socket(socket, state, q, login))
 }
 
+async fn reject_socket(mut socket: WebSocket, message: &str) {
+    let body = serde_json::to_string(&ServerMsg::Error {
+        message: message.to_string(),
+    })
+    .unwrap_or_else(|_| r#"{"type":"error","message":"error"}"#.into());
+    let _ = socket.send(Message::Text(body.into())).await;
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Option<String>) {
     let Ok(Some(row)) = db::get_match(&state.pool, &q.match_id).await else {
+        reject_socket(socket, "not found").await;
         return;
     };
     if matches!(row.status.as_str(), "expired" | "aborted") {
+        reject_socket(socket, &row.status).await;
         return;
     }
     if row.pr_number > 0 {
@@ -388,6 +398,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
             .await
             .unwrap_or_default();
         if hunks.is_empty() {
+            reject_socket(socket, "preparing").await;
             return;
         }
     }

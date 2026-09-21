@@ -395,7 +395,23 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
       ui.wait.classList.remove("hidden");
-      ui.wait.textContent = err.message;
+      const terminal = err.message === "expired" || err.message === "aborted" || err.message === "not found";
+      if (err.message === "preparing") {
+        ui.wait.textContent = "preparing match…";
+        reconnectAttempts = 0;
+      } else if (err.message === "expired") {
+        ui.wait.textContent = "this match expired";
+      } else if (err.message === "aborted") {
+        ui.wait.textContent = "this match could not start";
+      } else if (err.message === "not found") {
+        ui.wait.textContent = "match not found";
+      } else {
+        ui.wait.textContent = err.message;
+      }
+      if (terminal) {
+        finished = true;
+        clearReconnect();
+      }
     }
   };
 
@@ -408,10 +424,12 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     const socket = new WebSocket(wsUrl(matchId, token));
     ws = socket;
     socket.addEventListener("open", () => {
-      if (myGen !== gen) {
+      if (myGen !== gen || finished) {
         return;
       }
-      ui.wait.textContent = "waiting for opponent…";
+      if (ui.wait.textContent === "connecting…" || ui.wait.textContent === "disconnected — reconnecting") {
+        ui.wait.textContent = "waiting for opponent…";
+      }
     });
     socket.addEventListener("close", () => {
       if (myGen !== gen) {
