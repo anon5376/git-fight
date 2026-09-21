@@ -96,19 +96,31 @@ fn two_hunk_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     git(&work, &["init", "-q"]);
     git(&work, &["config", "user.email", "alice@example.com"]);
     git(&work, &["config", "user.name", "alice"]);
-    std::fs::write(work.join("lib.rs"), "fn a() { 0 }\nfn b() { 0 }\n").unwrap();
+    std::fs::write(
+        work.join("lib.rs"),
+        "fn a() { 0 }\n\n// pad1\n// pad2\n// pad3\n// pad4\n// pad5\n\nfn b() { 0 }\n",
+    )
+    .unwrap();
     git(&work, &["add", "lib.rs"]);
     git(&work, &["commit", "-q", "-m", "base"]);
     git(&work, &["branch", "base"]);
     git(&work, &["checkout", "-q", "-b", "pr"]);
-    std::fs::write(work.join("lib.rs"), "fn a() { 1 }\nfn b() { 3 }\n").unwrap();
+    std::fs::write(
+        work.join("lib.rs"),
+        "fn a() { 1 }\n\n// pad1\n// pad2\n// pad3\n// pad4\n// pad5\n\nfn b() { 3 }\n",
+    )
+    .unwrap();
     git(&work, &["add", "lib.rs"]);
     git(&work, &["commit", "-q", "-m", "pr"]);
     let head = git(&work, &["rev-parse", "HEAD"]);
     git(&work, &["checkout", "-q", "base"]);
     git(&work, &["config", "user.email", "bob@example.com"]);
     git(&work, &["config", "user.name", "bob"]);
-    std::fs::write(work.join("lib.rs"), "fn a() { 2 }\nfn b() { 4 }\n").unwrap();
+    std::fs::write(
+        work.join("lib.rs"),
+        "fn a() { 2 }\n\n// pad1\n// pad2\n// pad3\n// pad4\n// pad5\n\nfn b() { 4 }\n",
+    )
+    .unwrap();
     git(&work, &["add", "lib.rs"]);
     git(&work, &["commit", "-q", "-m", "base2"]);
     let base = git(&work, &["rev-parse", "HEAD"]);
