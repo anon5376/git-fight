@@ -377,6 +377,25 @@ test("expired match shows expiry and does not reconnect", async ({ page, request
   await expect(page.getByTestId("wait")).not.toContainText(/reloading/i);
 });
 
+test("finished match is not a room and points at replay", async ({ page, request }) => {
+  const matchId = await createMatch(request);
+  execFileSync(
+    "sqlite3",
+    [
+      DB,
+      `UPDATE matches SET status = 'finished', abort_reason = NULL WHERE id = '${matchId}';`,
+    ],
+    { stdio: "pipe" },
+  );
+  await page.goto(`/match/${matchId}`);
+  await expect(page.getByTestId("wait")).toContainText(/this match is over/i, { timeout: 10_000 });
+  await expect(page.getByTestId("resolved")).toContainText(`/replay/${matchId}`);
+  await page.waitForTimeout(900);
+  await expect(page.getByTestId("wait")).toContainText(/this match is over/i);
+  await expect(page.getByTestId("wait")).not.toContainText(/reconnecting/i);
+  await expect(page.getByTestId("wait")).not.toContainText(/reloading/i);
+});
+
 test("outdated match shows rematch and does not reconnect", async ({ page, request }) => {
   const matchId = await createMatch(request);
   execFileSync(

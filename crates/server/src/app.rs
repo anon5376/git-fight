@@ -161,6 +161,7 @@ impl AppState {
                             test_repos: self.test_repos.clone(),
                         }),
                     },
+                    self.rooms.clone(),
                 )
             })
             .clone()
@@ -469,7 +470,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         reject_socket(socket, "not found").await;
         return;
     };
-    if matches!(row.status.as_str(), "expired" | "aborted") {
+    if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
         let message = if row.abort_reason.as_deref() == Some("outdated") {
             "outdated"
         } else {

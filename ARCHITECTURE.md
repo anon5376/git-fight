@@ -229,7 +229,7 @@ to every client, including spectators. Everyone, server included, applies those 
 
 ### Replay
 
-A finished match already has `seed` and the full input log. `GET /replay/<id>` serves the client, which runs WASM locally feeding the log. No room, no inputs. Unfinished matches are not replayable.
+A finished match already has `seed` and the full input log. `GET /replay/<id>` serves the client, which runs WASM locally feeding the log. No room, no inputs. `GET /ws?match=` on a finished match returns `Error { message: "finished" }` and does not spawn a room. Unfinished matches are not replayable.
 
 ## Database tables
 

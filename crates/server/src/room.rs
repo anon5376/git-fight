@@ -7,9 +7,10 @@ use crate::result::{self, ResultCtx};
 use chrono::{DateTime, Utc};
 use git_fight_core::{FightState, FighterStats, Input, RoundResult, Side};
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::MissedTickBehavior;
 
 pub enum RoomEvent {
@@ -63,9 +64,14 @@ pub fn spawn_room(
     row: MatchRow,
     pool: SqlitePool,
     settings: RoomSettings,
+    rooms: Arc<Mutex<HashMap<String, mpsc::Sender<RoomEvent>>>>,
 ) -> mpsc::Sender<RoomEvent> {
     let (tx, rx) = mpsc::channel(512);
-    tokio::spawn(run_room(row, pool, settings, rx));
+    let id = row.id.clone();
+    tokio::spawn(async move {
+        run_room(row, pool, settings, rx).await;
+        rooms.lock().await.remove(&id);
+    });
     tx
 }
 
@@ -259,7 +265,7 @@ async fn run_room(
         }
 
         if done {
-            continue;
+            break;
         }
 
         done = advance(Advance {

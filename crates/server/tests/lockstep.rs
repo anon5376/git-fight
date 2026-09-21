@@ -100,6 +100,20 @@ async fn closed_match_socket_sends_error() {
     )
     .await
     .unwrap();
+    git_fight_server::db::insert_match(&pool, "fin1", 1, 3, "o", "t", 3600)
+        .await
+        .unwrap();
+    git_fight_server::db::set_status(
+        &pool,
+        "fin1",
+        "finished",
+        true,
+        true,
+        Some("deadbeef"),
+        None,
+    )
+    .await
+    .unwrap();
     git_fight_server::db::insert_full_match(
         &pool,
         &NewMatch {
@@ -144,6 +158,7 @@ async fn closed_match_socket_sends_error() {
         ("exp1", "expired"),
         ("ab1", "aborted"),
         ("old1", "outdated"),
+        ("fin1", "finished"),
         ("missing", "not found"),
         ("prep1", "preparing"),
     ] {

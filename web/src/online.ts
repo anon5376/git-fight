@@ -405,7 +405,12 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
       ui.wait.classList.remove("hidden");
-      const terminal = err.message === "expired" || err.message === "aborted" || err.message === "not found" || err.message === "outdated";
+      const terminal =
+        err.message === "expired" ||
+        err.message === "aborted" ||
+        err.message === "not found" ||
+        err.message === "outdated" ||
+        err.message === "finished";
       if (err.message === "preparing") {
         preparing = true;
         ui.wait.textContent = "preparing match…";
@@ -422,6 +427,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       } else if (err.message === "not found") {
         preparing = false;
         ui.wait.textContent = "match not found";
+      } else if (err.message === "finished") {
+        preparing = false;
+        ui.wait.textContent = "this match is over";
+        ui.resolved.textContent = `replay /replay/${matchId}`;
       } else {
         preparing = false;
         ui.wait.textContent = err.message;
