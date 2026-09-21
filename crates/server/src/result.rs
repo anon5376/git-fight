@@ -317,21 +317,19 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     };
     match git {
         Ok(()) => {
-            if db::set_result_branch(&ctx.pool, match_id, Some(&branch), None)
+            let public = ctx.public_url.trim_end_matches('/');
+            let compare = format!(
+                "https://github.com/{}/{}/compare/{}...{}",
+                row.owner, row.repo, row.pr_head_sha, branch
+            );
+            let body = format!(
+                "git fight finished.\n{}\nbranch: `{branch}`\ncompare: {compare}\nreplay: {public}/replay/{match_id}",
+                round_lines(&hunks)
+            );
+            comment(ctx, &row, &body).await?;
+            db::set_result_branch(&ctx.pool, match_id, Some(&branch), None)
                 .await
-                .unwrap_or(false)
-            {
-                let public = ctx.public_url.trim_end_matches('/');
-                let compare = format!(
-                    "https://github.com/{}/{}/compare/{}...{}",
-                    row.owner, row.repo, row.pr_head_sha, branch
-                );
-                let body = format!(
-                    "git fight finished.\n{}\nbranch: `{branch}`\ncompare: {compare}\nreplay: {public}/replay/{match_id}",
-                    round_lines(&hunks)
-                );
-                comment(ctx, &row, &body).await;
-            }
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
         Err((reason, body)) => {
@@ -546,12 +544,10 @@ async fn skip_push(
     reason: &str,
     body: String,
 ) -> Result<(), String> {
-    if db::set_result_branch(&ctx.pool, match_id, None, Some(reason))
+    comment(ctx, row, &body).await?;
+    db::set_result_branch(&ctx.pool, match_id, None, Some(reason))
         .await
-        .unwrap_or(false)
-    {
-        comment(ctx, row, &body).await;
-    }
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -586,48 +582,65 @@ fn grouped_picks(hunks: &[HunkRow]) -> BTreeMap<String, Vec<Option<Pick>>> {
     out
 }
 
-async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) {
+async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) -> Result<(), String> {
     let Some(gh) = &ctx.gh else {
-        return;
+        return Ok(());
     };
     let Some(inst) = row.installation_id.map(|i| i as u64) else {
-        return;
+        return Ok(());
     };
     if row.pr_number <= 0 || row.owner.is_empty() {
-        return;
+        return Ok(());
     }
     if !crate::gh::is_safe_github_name(&row.owner) || !crate::gh::is_safe_github_name(&row.repo) {
-        return;
+        return Ok(());
     }
-    let _ = gh
-        .issue_comment(
-            inst,
-            &row.owner,
-            &row.repo,
-            row.pr_number as u64,
-            row.challenge_comment_id,
-            body,
-        )
-        .await;
+    gh.issue_comment(
+        inst,
+        &row.owner,
+        &row.repo,
+        row.pr_number as u64,
+        row.challenge_comment_id,
+        body,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) {
     let body = "git fight: this match expired before anyone finished. Nothing was pushed. Comment `/fight` for a rematch.".to_string();
-    comment(ctx, row, &body).await;
+    let _ = comment(ctx, row, &body).await;
 }
 
-pub(crate) async fn comment_outdated(ctx: &ResultCtx, row: &MatchRow) {
+pub(crate) async fn comment_outdated(ctx: &ResultCtx, row: &MatchRow) -> Result<(), String> {
     let public = ctx.public_url.trim_end_matches('/');
     let body = format!(
         "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch.\nopen match: {public}/match/{}",
         row.id
     );
-    comment(ctx, row, &body).await;
+    comment(ctx, row, &body).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_is_recorded_only_after_comment() {
+        assert_eq!(outcome_record_followup(Ok(())), "set");
+        assert_eq!(
+            outcome_record_followup(Err(())),
+            "retry",
+            "a failed outcome comment must stay unpublished"
+        );
+    }
+
+    fn outcome_record_followup(comment: Result<(), ()>) -> &'static str {
+        match comment {
+            Ok(()) => "set",
+            Err(()) => "retry",
+        }
+    }
 
     #[test]
     fn comment_paths_are_length_capped() {

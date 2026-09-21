@@ -10,7 +10,79 @@ use axum::http::StatusCode as HttpStatus;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// `synchronize` lookups that exhausted the short retry loop. Restart loses
+/// this map; the next webhook or 24h expiry covers leftover rows.
+#[derive(Clone, Default)]
+pub(crate) struct LookupTrack {
+    pending: Arc<std::sync::Mutex<HashMap<String, PendingPull>>>,
+}
+
+#[derive(Clone)]
+struct PendingPull {
+    owner: String,
+    repo: String,
+    pr: Pr,
+}
+
+fn lookup_key(owner: &str, repo: &str, number: u64) -> String {
+    format!(
+        "{}/{}/{}",
+        crate::gh::fold_github_name(owner),
+        crate::gh::fold_github_name(repo),
+        number
+    )
+}
+
+impl LookupTrack {
+    fn queue(&self, owner: String, repo: String, pr: Pr) {
+        if let Ok(mut g) = self.pending.lock() {
+            let key = lookup_key(&owner, &repo, pr.number);
+            g.insert(key, PendingPull { owner, repo, pr });
+        }
+    }
+
+    fn snapshot(&self) -> Vec<PendingPull> {
+        self.pending
+            .lock()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn dequeue(&self, owner: &str, repo: &str, number: u64) {
+        if let Ok(mut g) = self.pending.lock() {
+            g.remove(&lookup_key(owner, repo, number));
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.lock().map(|g| g.is_empty()).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn enqueue_lookup_for_test(
+    state: &crate::app::AppState,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    head: &str,
+    base: &str,
+) {
+    state.lookups.queue(
+        owner.into(),
+        repo.into(),
+        Pr {
+            number,
+            head: Some(Sha { sha: head.into() }),
+            base: Some(Sha { sha: base.into() }),
+            updated_at: None,
+        },
+    );
+}
 
 /// GitHub's `X-GitHub-Delivery` is a UUID. Reject junk so the PK cannot be a path.
 fn is_delivery_id(s: &str) -> bool {
@@ -239,7 +311,12 @@ fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
 
 async fn close_and_comment_outdated(state: &crate::app::AppState, row: &db::MatchRow) {
     state.close_room(&row.id).await;
-    crate::result::comment_outdated(&state.result_ctx(), row).await;
+    if crate::result::comment_outdated(&state.result_ctx(), row)
+        .await
+        .is_err()
+    {
+        state.queue_abort(row.id.clone(), "outdated".into());
+    }
 }
 
 async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64) -> HttpStatus {
@@ -318,7 +395,29 @@ fn schedule_open_lookup(state: crate::app::AppState, owner: String, repo: String
                 Err(_) => {}
             }
         }
+        // Short retry exhausted. The 5s expirer keeps looking so SHA-drift
+        // cannot sit silent until 24h.
+        state.lookups.queue(owner, repo, pr);
     });
+}
+
+pub(crate) async fn retry_pending_lookups(state: &crate::app::AppState) {
+    for item in state.lookups.snapshot() {
+        match db::open_match_for_pr(&state.pool, &item.owner, &item.repo, item.pr.number).await {
+            Ok(Some(row)) => {
+                state
+                    .lookups
+                    .dequeue(&item.owner, &item.repo, item.pr.number);
+                notice_if_outdated(state, &row, &item.pr).await;
+            }
+            Ok(None) => {
+                state
+                    .lookups
+                    .dequeue(&item.owner, &item.repo, item.pr.number);
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Retry once. `Ok(false)` means the row is already closed — do not post
@@ -482,6 +581,25 @@ mod tests {
             Ok(Some(())) => "notice",
             Ok(None) => "maybe_challenge",
             Err(()) => "retry",
+        }
+    }
+
+    #[test]
+    fn lookup_exhaust_is_queued_for_expirer() {
+        assert_eq!(lookup_exhaust_followup(Ok(Some(()))), "notice");
+        assert_eq!(lookup_exhaust_followup(Ok(None)), "stop");
+        assert_eq!(
+            lookup_exhaust_followup(Err(())),
+            "queue",
+            "busy open_match_for_pr after the short loop must not go silent"
+        );
+    }
+
+    fn lookup_exhaust_followup(result: Result<Option<()>, ()>) -> &'static str {
+        match result {
+            Ok(Some(())) => "notice",
+            Ok(None) => "stop",
+            Err(()) => "queue",
         }
     }
 

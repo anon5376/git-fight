@@ -336,13 +336,9 @@ impl GitHub {
         body: &str,
     ) -> Result<u64, String> {
         if let Some(id) = existing_id.filter(|i| *i > 0) {
-            if self
-                .edit_comment(installation_id, owner, repo, id as u64, body)
-                .await
-                .is_ok()
-            {
-                return Ok(id as u64);
-            }
+            self.edit_comment(installation_id, owner, repo, id as u64, body)
+                .await?;
+            return Ok(id as u64);
         }
         self.comment(installation_id, owner, repo, number, body)
             .await
@@ -866,6 +862,28 @@ mod tests {
         assert!(fold_github_login_opt(Some("../x")).is_none());
         assert!(fold_github_login_opt(Some("not a login")).is_none());
         assert!(fold_github_login_opt(Some("")).is_none());
+    }
+
+    #[test]
+    fn issue_comment_with_id_retries_edit_only() {
+        assert_eq!(issue_comment_followup(true, Ok(())), "edit");
+        assert_eq!(
+            issue_comment_followup(true, Err(())),
+            "retry",
+            "a failed PATCH must not POST a second outcome thread"
+        );
+        assert_eq!(issue_comment_followup(false, Err(())), "post");
+    }
+
+    fn issue_comment_followup(existing: bool, edit: Result<(), ()>) -> &'static str {
+        if existing {
+            match edit {
+                Ok(()) => "edit",
+                Err(()) => "retry",
+            }
+        } else {
+            "post"
+        }
     }
 
     #[test]

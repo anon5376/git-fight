@@ -119,6 +119,8 @@ pub struct AppState {
     pending_aborts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// SHA-drift close-before-abort. Join must not respawn lockstep.
     closing: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Busy `synchronize` lookups that exhausted the short retry loop.
+    pub(crate) lookups: crate::webhook::LookupTrack,
     pub(crate) comments: crate::challenge::CommentTrack,
     pub github: Option<GitHub>,
     pub auth: Auth,
@@ -251,21 +253,37 @@ impl AppState {
         for (id, reason) in pending {
             match db::abort_open_match(&self.pool, &id, &reason).await {
                 Ok(true) => {
-                    self.dequeue_abort(&id);
                     self.unmark_closing(&id);
                     self.close_room(&id).await;
-                    if let Ok(Some(row)) = db::get_match(&self.pool, &id).await {
-                        crate::result::comment_outdated(&self.result_ctx(), &row).await;
+                    if self.comment_abort_outcome(&id, &reason).await {
+                        self.dequeue_abort(&id);
                     }
                 }
                 Ok(false) => {
-                    self.dequeue_abort(&id);
                     self.unmark_closing(&id);
                     self.close_room(&id).await;
+                    if self.comment_abort_outcome(&id, &reason).await {
+                        self.dequeue_abort(&id);
+                    }
                 }
                 Err(_) => {}
             }
         }
+    }
+
+    async fn comment_abort_outcome(&self, id: &str, reason: &str) -> bool {
+        if reason != "outdated" {
+            return true;
+        }
+        let Ok(row) = db::get_match(&self.pool, id).await else {
+            return false;
+        };
+        let Some(row) = row else {
+            return true;
+        };
+        crate::result::comment_outdated(&self.result_ctx(), &row)
+            .await
+            .is_ok()
     }
 
     async fn abort_stale_preparing(&self) {
@@ -427,6 +445,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         publishing: Arc::new(Mutex::new(HashSet::new())),
         pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        lookups: crate::webhook::LookupTrack::default(),
         comments: crate::challenge::CommentTrack::default(),
     };
     if let Ok(rows) = db::list_live_matches(&state.pool).await {
@@ -445,6 +464,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
             expirer.finish_scored_open(allow_unhashed).await;
             allow_unhashed = true;
             expirer.retry_pending_aborts().await;
+            crate::webhook::retry_pending_lookups(&expirer).await;
             expirer.abort_stale_preparing().await;
             expirer.retry_pending_comment_ids().await;
             expirer.post_uncommented_challenges().await;
@@ -1043,6 +1063,7 @@ mod tests {
             publishing: Arc::new(Mutex::new(HashSet::new())),
             pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            lookups: crate::webhook::LookupTrack::default(),
             comments: crate::challenge::CommentTrack::default(),
             github: None,
             auth: Auth::default(),
@@ -1062,6 +1083,7 @@ mod tests {
             publishing: Arc::new(Mutex::new(HashSet::new())),
             pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            lookups: crate::webhook::LookupTrack::default(),
             comments: crate::challenge::CommentTrack::default(),
             github: None,
             auth: Auth::default(),
@@ -1212,5 +1234,48 @@ mod tests {
         let row = crate::db::get_match(&pool, "cl1").await.unwrap().unwrap();
         assert_eq!(row.status, "pending", "Shutdown must not expire");
         assert!(row.abort_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_pending_lookups_aborts_drifted_open_match() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let moved = "cccccccccccccccccccccccccccccccccccccccc";
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "look1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: head.into(),
+                pr_base_sha: base.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let state = test_state(pool.clone());
+        crate::webhook::enqueue_lookup_for_test(&state, "acme", "box", 1, moved, base);
+        crate::webhook::retry_pending_lookups(&state).await;
+        let row = crate::db::get_match(&pool, "look1").await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
+        assert!(
+            state.lookups.is_empty(),
+            "a resolved lookup must leave the expirer queue"
+        );
     }
 }
