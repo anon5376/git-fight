@@ -610,6 +610,32 @@ pub async fn finish_open_match(
     Ok(res.rows_affected() > 0)
 }
 
+/// pending → in_progress. True if the match is still playable.
+/// Join cannot un-expire, un-abort, or un-finish a row.
+pub async fn start_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query(
+        "UPDATE matches SET status = 'in_progress',
+            started_at = COALESCE(started_at, ?)
+         WHERE id = ? AND status = 'pending'",
+    )
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() > 0 {
+        return Ok(true);
+    }
+    is_open_match(pool, id).await
+}
+
+pub async fn is_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    Ok(get_match(pool, id)
+        .await?
+        .map(|row| matches!(row.status.as_str(), "pending" | "in_progress"))
+        .unwrap_or(false))
+}
+
 pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     // One statement: a match that `finish_open_match` wins on the 24h line
@@ -1469,6 +1495,38 @@ mod tests {
         assert_eq!(row.status, "finished");
         assert_eq!(row.final_hash.as_deref(), Some("deadbeef"));
         assert!(row.abort_reason.is_none());
+        assert!(!start_open_match(&pool, "fin1").await.unwrap());
+        let row = get_match(&pool, "fin1").await.unwrap().unwrap();
+        assert_eq!(row.status, "finished");
+        assert_eq!(row.final_hash.as_deref(), Some("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn start_open_match_cannot_unexpire_or_unabort() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "pend", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(start_open_match(&pool, "pend").await.unwrap());
+        let live = get_match(&pool, "pend").await.unwrap().unwrap();
+        assert_eq!(live.status, "in_progress");
+        assert!(start_open_match(&pool, "pend").await.unwrap());
+        insert_match(&pool, "dead", 1, 3, "o", "t", 0)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let _ = expire_pending(&pool).await.unwrap();
+        assert!(!start_open_match(&pool, "dead").await.unwrap());
+        let dead = get_match(&pool, "dead").await.unwrap().unwrap();
+        assert_eq!(dead.status, "expired");
+        insert_match(&pool, "old", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(abort_open_match(&pool, "old", "outdated").await.unwrap());
+        assert!(!start_open_match(&pool, "old").await.unwrap());
+        let old = get_match(&pool, "old").await.unwrap().unwrap();
+        assert_eq!(old.status, "aborted");
+        assert_eq!(old.abort_reason.as_deref(), Some("outdated"));
     }
 
     #[tokio::test]

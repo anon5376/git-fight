@@ -53,7 +53,7 @@ async fn already_open_now(
 }
 
 async fn abort_start(pool: &SqlitePool, id: &str, reason: &str, body: String) -> ChallengeStart {
-    let _ = db::set_status(pool, id, "aborted", false, true, None, Some(reason)).await;
+    let _ = db::abort_open_match(pool, id, reason).await;
     note(body)
 }
 

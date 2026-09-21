@@ -183,38 +183,14 @@ async fn run_room(
                     RoomEvent::Join { conn_id, login, token, tx } => {
                         if done {
                             send_closed(&tx, &pool, &id).await;
+                        } else if !db::is_open_match(&pool, &id).await.unwrap_or(false) {
+                            send_closed(&tx, &pool, &id).await;
+                            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+                            done = true;
                         } else {
                             let conn = Conn { login, token, tx: tx.clone() };
                             let role = conn_role(&conn, &row, &hunks, round, github);
                             let confirmed = if next_tick == 0 { -1 } else { next_tick as i32 - 1 };
-                            let hello = hello_msg(
-                                &id,
-                                round_seed(seed, round),
-                                delay,
-                                role.as_str(),
-                                conn.login.as_deref().unwrap_or(""),
-                                &ours_name,
-                                &theirs_name,
-                                round,
-                                total_rounds,
-                                confirmed,
-                                db::stats_for_round(&hunks, round),
-                                &hunks,
-                            );
-                            let _ = tx.send(encode(&hello)).await;
-                            let snap = snapshot_msg(
-                                round_seed(seed, round),
-                                round,
-                                confirmed,
-                                db::stats_for_round(&hunks, round),
-                                &log,
-                                &hunks,
-                            );
-                            let _ = tx.send(encode(&snap)).await;
-                            if let Some(result) = sim.result {
-                                let match_over = round + 1 >= total_rounds;
-                                let _ = tx.send(encode(&end_msg(&sim, result, round, match_over))).await;
-                            }
                             conns.insert(conn_id, conn);
                             refresh_slots(
                                 &conns,
@@ -226,12 +202,51 @@ async fn run_room(
                                 &mut theirs,
                                 started_at.is_some(),
                             );
-                            if !done && ours.seen && theirs.seen && started_at.is_none() {
-                                started_at = Some(Instant::now());
-                                let _ = db::set_status(
-                                    &pool, &id, "in_progress", true, false, None, None,
-                                )
-                                .await;
+                            if ours.seen && theirs.seen && started_at.is_none() {
+                                if db::start_open_match(&pool, &id).await.unwrap_or(false) {
+                                    started_at = Some(Instant::now());
+                                } else {
+                                    send_closed(&tx, &pool, &id).await;
+                                    expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+                                    done = true;
+                                }
+                            }
+                            if !done {
+                                let hello = hello_msg(
+                                    &id,
+                                    round_seed(seed, round),
+                                    delay,
+                                    role.as_str(),
+                                    conns
+                                        .get(&conn_id)
+                                        .and_then(|c| c.login.as_deref())
+                                        .unwrap_or(""),
+                                    &ours_name,
+                                    &theirs_name,
+                                    round,
+                                    total_rounds,
+                                    confirmed,
+                                    db::stats_for_round(&hunks, round),
+                                    &hunks,
+                                );
+                                let _ = tx.send(encode(&hello)).await;
+                                let snap = snapshot_msg(
+                                    round_seed(seed, round),
+                                    round,
+                                    confirmed,
+                                    db::stats_for_round(&hunks, round),
+                                    &log,
+                                    &hunks,
+                                );
+                                let _ = tx.send(encode(&snap)).await;
+                                if let Some(result) = sim.result {
+                                    let match_over = round + 1 >= total_rounds;
+                                    let _ = tx
+                                        .send(encode(&end_msg(
+                                            &sim, result, round, match_over,
+                                        )))
+                                        .await;
+                                }
                             }
                         }
                     }
