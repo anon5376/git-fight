@@ -76,10 +76,11 @@ function startFight(mode: Mode, fromDemo: boolean): void {
     let theirs = queued.theirs;
     if (mode.kind === "cpu") {
       if (mode.human === "ours") {
-        theirs = fight.cpu_input(1);
+        // `?smoke=1` stands the CPU still so a mashed punch can KO the dummy HP.
+        theirs = smoke ? 0 : fight.cpu_input(1);
       } else {
         theirs = ours;
-        ours = fight.cpu_input(0);
+        ours = smoke ? 0 : fight.cpu_input(0);
       }
     }
     fight.step(ours, theirs);

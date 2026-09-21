@@ -3,8 +3,9 @@ use crate::protocol::{ClientMsg, Role, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY
 use crate::room::{self, RoomEvent, RoomSettings};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
@@ -53,6 +54,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/matches/{id}", get(get_match))
         .route("/api/replays/{id}", get(get_replay))
         .route("/ws", get(ws_upgrade))
+        .route("/match/{id}", get(spa))
+        .route("/replay/{id}", get(spa))
         .with_state(state.clone());
 
     if let Some(dir) = &state.config.static_dir {
@@ -102,6 +105,16 @@ struct CreateOut {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn spa(State(state): State<AppState>) -> Response {
+    let Some(dir) = &state.config.static_dir else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(dir.join("index.html")).await {
+        Ok(bytes) => ([(CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn create_match(
