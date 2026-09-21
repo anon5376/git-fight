@@ -212,6 +212,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
                 }
             }
             let _ = db::prune_deliveries(&expirer.pool, crate::limits::WEBHOOK_MAX_AGE_SECS).await;
+            let _ = db::prune_sessions(&expirer.pool).await;
         }
     });
     let app = router(state);

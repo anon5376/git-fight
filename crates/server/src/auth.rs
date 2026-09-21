@@ -1,6 +1,7 @@
 //! GitHub user authorization. Token is dropped after GET /user.
 
 use crate::db;
+use crate::limits::SESSION_TTL_SECS;
 use axum::extract::{Query, State};
 use axum::http::header::{HeaderMap, HeaderValue, LOCATION, SET_COOKIE};
 use axum::http::StatusCode;
@@ -137,6 +138,9 @@ pub async fn auth_callback(
     let Some(code) = q.code else {
         return (StatusCode::BAD_REQUEST, "missing code").into_response();
     };
+    if !crate::gh::is_safe_oauth_code(&code) {
+        return (StatusCode::BAD_REQUEST, "bad code").into_response();
+    }
     let stored = parse_cookie(&headers, STATE_COOKIE)
         .and_then(|c| verify_signed(&state.auth.session_key, c));
     let Some(stored) = stored else {
@@ -166,7 +170,7 @@ pub async fn auth_callback(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let signed = sign(&state.auth.session_key, &sid);
-    let attrs = cookie_attrs(&state.auth.public_url, 1_209_600);
+    let attrs = cookie_attrs(&state.auth.public_url, SESSION_TTL_SECS);
     let cookie = format!("{COOKIE}={signed}; {attrs}");
     let clear = format!("{STATE_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     let dest = sanitize_return(Some(ret));

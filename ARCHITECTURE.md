@@ -293,9 +293,9 @@ Primary key `(match_id, round_index, tick)`. Append-only (`INSERT OR IGNORE`; th
 | `id` | `TEXT` PK | Random. HttpOnly cookie, signed with `SESSION_KEY`. |
 | `github_user_id` | `INTEGER` | |
 | `github_login` | `TEXT` | |
-| `created_at`, `expires_at` | `TEXT` | |
+| `created_at`, `expires_at` | `TEXT` | 14-day TTL. Expired rows are pruned. |
 
-No GitHub access tokens here. Login exchanges the OAuth `code`, calls `GET /user`, stores id + login, discards the token.
+No GitHub access tokens here. Login exchanges the OAuth `code`, calls `GET /user`, stores id + login, discards the token. The `code` is length-capped before the token exchange.
 
 ### `player_stats`
 
@@ -309,9 +309,9 @@ Primary key `(owner, repo, github_login)`.
 |---|---|---|
 | `delivery_id` | `TEXT` PK | `X-GitHub-Delivery`. |
 | `received_at` | `TEXT` | |
-| `body_hash` | `TEXT` unique | SHA-256 of the raw body. A captured payload replayed with a new delivery id is ignored. |
+| `body_hash` | `TEXT NOT NULL` unique | SHA-256 of the raw body. A captured payload replayed with a new delivery id is ignored. Rows without a hash are dropped on migrate. |
 
-Installation tokens: process memory only, keyed by `installation_id`, refreshed before expiry. OAuth `state` / PKCE verifier: memory or a short-lived signed cookie, not this database.
+Installation tokens: process memory only, keyed by `installation_id`, cached until they expire, then dropped. OAuth `state` / PKCE verifier: memory or a short-lived signed cookie, not this database. GitHub `/fight` matches do not store local-demo share tokens; role is the session cookie only.
 
 ## GitHub App
 
@@ -347,7 +347,7 @@ Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like 
 
 A spectator (or a stranger who found the match URL) sends `Input` for a fighter slot, or spoofs a query param `role=ours`.
 
-**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped. CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides.
+**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped. CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned.
 
 ### Hostile repos
 

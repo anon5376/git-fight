@@ -137,24 +137,7 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS webhook_deliveries (
-            delivery_id TEXT PRIMARY KEY,
-            received_at TEXT NOT NULL,
-            body_hash TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
-    let _ = sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN body_hash TEXT")
-        .execute(pool)
-        .await;
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS webhook_deliveries_body_hash
-         ON webhook_deliveries(body_hash)",
-    )
-    .execute(pool)
-    .await?;
+    ensure_webhook_deliveries(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS player_stats (
             owner TEXT NOT NULL,
@@ -212,6 +195,61 @@ async fn ensure_match_inputs(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         return Ok(());
     }
     ensure_match_inputs_fk(pool).await
+}
+
+const WEBHOOK_DELIVERIES_DDL: &str = "CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            received_at TEXT NOT NULL,
+            body_hash TEXT NOT NULL
+        )";
+
+async fn webhook_body_hash_not_null(pool: &Pool<Sqlite>) -> Result<bool, sqlx::Error> {
+    let cols: Vec<(String, i64)> =
+        sqlx::query_as("SELECT name, \"notnull\" FROM pragma_table_info('webhook_deliveries')")
+            .fetch_all(pool)
+            .await?;
+    Ok(cols.iter().any(|(n, nn)| n == "body_hash" && *nn != 0))
+}
+
+async fn ensure_webhook_deliveries(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    sqlx::query(WEBHOOK_DELIVERIES_DDL).execute(pool).await?;
+    let _ = sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN body_hash TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query("DELETE FROM webhook_deliveries WHERE body_hash IS NULL OR body_hash = ''")
+        .execute(pool)
+        .await?;
+    if !webhook_body_hash_not_null(pool).await? {
+        sqlx::query(
+            "CREATE TABLE webhook_deliveries_nn (
+                delivery_id TEXT PRIMARY KEY,
+                received_at TEXT NOT NULL,
+                body_hash TEXT NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO webhook_deliveries_nn (delivery_id, received_at, body_hash)
+             SELECT delivery_id, received_at, body_hash FROM webhook_deliveries
+             WHERE body_hash IS NOT NULL AND body_hash != ''",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("DROP TABLE webhook_deliveries")
+            .execute(pool)
+            .await?;
+        sqlx::query("ALTER TABLE webhook_deliveries_nn RENAME TO webhook_deliveries")
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS webhook_deliveries_body_hash
+         ON webhook_deliveries(body_hash)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 const MATCH_INPUTS_DDL: &str = "CREATE TABLE match_inputs (
@@ -780,6 +818,15 @@ pub async fn prune_deliveries(pool: &SqlitePool, max_age_secs: i64) -> Result<u6
     Ok(res.rows_affected())
 }
 
+pub async fn prune_sessions(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let res = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn insert_session(
     pool: &SqlitePool,
     id: &str,
@@ -787,7 +834,7 @@ pub async fn insert_session(
     login: &str,
 ) -> Result<(), sqlx::Error> {
     let now = Utc::now();
-    let expires = now + Duration::days(14);
+    let expires = now + Duration::seconds(crate::limits::SESSION_TTL_SECS);
     sqlx::query(
         "INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at)
          VALUES (?, ?, ?, ?, ?)",
@@ -1434,5 +1481,67 @@ mod tests {
             .unwrap();
         assert_eq!(prune_deliveries(&pool, 24 * 60 * 60).await.unwrap(), 2);
         assert!(record_delivery(&pool, "d1", "hash-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prune_sessions_drops_expired_rows() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_session(&pool, "live", 1, "alice").await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at)
+             VALUES ('dead', 2, 'bob', '2000-01-01T00:00:00+00:00', '2000-01-02T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            session_login(&pool, "live").await.unwrap().as_deref(),
+            Some("alice")
+        );
+        assert!(session_login(&pool, "dead").await.unwrap().is_none());
+        assert_eq!(prune_sessions(&pool).await.unwrap(), 1);
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            session_login(&pool, "live").await.unwrap().as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn old_delivery_rows_without_hash_are_dropped() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        sqlx::query("DROP TABLE webhook_deliveries")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE webhook_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                received_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO webhook_deliveries (delivery_id, received_at) VALUES ('old', '2000-01-01T00:00:00+00:00')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "NULL body_hash cannot participate in replay protection"
+        );
+        assert!(webhook_body_hash_not_null(&pool).await.unwrap());
+        assert!(record_delivery(&pool, "d1", "hash-a").await.unwrap());
+        assert!(!record_delivery(&pool, "d2", "hash-a").await.unwrap());
     }
 }

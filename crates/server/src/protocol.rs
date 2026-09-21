@@ -60,10 +60,13 @@ pub fn role_for(
             (false, false) => Role::Spectator,
         };
     }
-    match token {
-        Some(t) if ours_token == Some(t) && theirs_token == Some(t) => Role::Both,
-        Some(t) if ours_token == Some(t) => Role::Ours,
-        Some(t) if theirs_token == Some(t) => Role::Theirs,
+    fn share(t: Option<&str>) -> Option<&str> {
+        t.filter(|s| !s.is_empty())
+    }
+    match share(token) {
+        Some(t) if share(ours_token) == Some(t) && share(theirs_token) == Some(t) => Role::Both,
+        Some(t) if share(ours_token) == Some(t) => Role::Ours,
+        Some(t) if share(theirs_token) == Some(t) => Role::Theirs,
         _ => Role::Spectator,
     }
 }
@@ -121,6 +124,23 @@ mod tests {
                 Some("t")
             ),
             Role::Spectator
+        );
+        assert_eq!(
+            role_for(false, None, None, None, Some(""), Some(""), Some("")),
+            Role::Spectator,
+            "empty share tokens cannot claim a slot"
+        );
+        assert_eq!(
+            role_for(
+                false,
+                None,
+                None,
+                None,
+                Some("ours-token"),
+                Some("ours-token"),
+                Some("theirs-token")
+            ),
+            Role::Ours
         );
         assert_eq!(round_seed(7, 0), 7);
         assert_eq!(round_seed(7, 1), 14);

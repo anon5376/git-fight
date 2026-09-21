@@ -1768,12 +1768,15 @@ async fn fifteen_hunks_starts_a_match() {
         "{:?}",
         hunks.iter().map(|h| &h.path).collect::<Vec<_>>()
     );
+    let row = git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+        .await
+        .unwrap()
+        .expect("fifteen hunks should start a match");
     assert!(
-        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
-            .await
-            .unwrap()
-            .is_some()
+        row.ours_token.as_deref().unwrap_or("").is_empty(),
+        "GitHub matches must not store local share tokens"
     );
+    assert!(row.theirs_token.as_deref().unwrap_or("").is_empty());
 }
 
 #[tokio::test]

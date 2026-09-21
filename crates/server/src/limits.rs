@@ -23,6 +23,8 @@ pub const MAX_CONCURRENT_GIT: usize = 2;
 pub const MAX_FIGHT_YML_BYTES: usize = 4096;
 /// Drop webhook deliveries (and reject GitHub event timestamps) older than a match.
 pub const WEBHOOK_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+/// Signed session cookie and `sessions.expires_at`. Expired rows are pruned.
+pub const SESSION_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 
 pub fn git_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -47,5 +49,6 @@ mod tests {
         assert_eq!(MAX_FIGHT_YML_BYTES, 4096);
         assert_eq!(WEBHOOK_MAX_AGE_SECS, 24 * 60 * 60);
         assert_eq!(WEBHOOK_MAX_AGE_SECS, crate::protocol::EXPIRE_SECS);
+        assert_eq!(SESSION_TTL_SECS, 14 * 24 * 60 * 60);
     }
 }

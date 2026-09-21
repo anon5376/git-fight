@@ -115,11 +115,10 @@ impl GitHub {
 
     pub async fn installation_token(&self, installation_id: u64) -> Result<String, String> {
         {
-            let cache = self.tokens.lock().await;
-            if let Some((tok, exp)) = cache.get(&installation_id) {
-                if Instant::now() + Duration::from_secs(30) < *exp {
-                    return Ok(tok.clone());
-                }
+            let mut cache = self.tokens.lock().await;
+            drop_expired_tokens(&mut cache, Instant::now());
+            if let Some((tok, _)) = cache.get(&installation_id) {
+                return Ok(tok.clone());
             }
         }
         let jwt = self.app_jwt()?;
@@ -150,10 +149,11 @@ impl GitHub {
             .ok_or_else(|| "access_tokens json".to_string())?;
         let expires = parse_expires(&body.expires_at);
         let token = body.token;
-        self.tokens
-            .lock()
-            .await
-            .insert(installation_id, (token.clone(), expires));
+        {
+            let mut cache = self.tokens.lock().await;
+            drop_expired_tokens(&mut cache, Instant::now());
+            cache.insert(installation_id, (token.clone(), expires));
+        }
         Ok(token)
     }
 
@@ -518,6 +518,9 @@ impl GitHub {
         redirect_uri: &str,
         code_verifier: &str,
     ) -> Result<(i64, String), String> {
+        if !is_safe_oauth_code(code) || !is_safe_oauth_code(code_verifier) {
+            return Err("bad oauth".into());
+        }
         #[derive(Deserialize)]
         struct Token {
             access_token: Option<String>,
@@ -686,6 +689,19 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
+fn drop_expired_tokens(cache: &mut HashMap<u64, (String, Instant)>, now: Instant) {
+    cache.retain(|_, (_, exp)| now + Duration::from_secs(30) < *exp);
+}
+
+/// Authorization `code` / PKCE verifier. Cap so a junk callback cannot POST megabytes.
+pub(crate) fn is_safe_oauth_code(s: &str) -> bool {
+    let n = s.len();
+    (1..=128).contains(&n)
+        && s.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'?' | b'&' | b'#' | b'\\' | b'"' | b'\'')
+        })
+}
+
 fn parse_expires(rfc: &str) -> Instant {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc) {
         let secs = (dt.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
@@ -725,6 +741,8 @@ pub struct UserInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn live_mergeable_poll_waits_for_github() {
@@ -748,5 +766,26 @@ mod tests {
         assert!(!is_github_dot_com_api("https://evil.example"));
         assert!(!is_github_dot_com_oauth("https://api.github.com"));
         assert!(!is_github_dot_com_api("http://api.github.com"));
+    }
+
+    #[test]
+    fn expired_install_tokens_leave_the_cache() {
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        cache.insert(1, ("live".into(), now + Duration::from_secs(3600)));
+        cache.insert(2, ("dead".into(), now));
+        drop_expired_tokens(&mut cache, now);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&1).map(|(t, _)| t.as_str()), Some("live"));
+    }
+
+    #[test]
+    fn oauth_code_is_short_and_printable() {
+        assert!(is_safe_oauth_code("abc"));
+        assert!(is_safe_oauth_code(&"a".repeat(64)));
+        assert!(!is_safe_oauth_code(""));
+        assert!(!is_safe_oauth_code(&"a".repeat(129)));
+        assert!(!is_safe_oauth_code("code with space"));
+        assert!(!is_safe_oauth_code("x&redirect=https://evil"));
     }
 }

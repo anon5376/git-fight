@@ -118,8 +118,7 @@ pub async fn start_challenge(
     let ours_login = pr.user.login.clone();
     let id = uuid::Uuid::new_v4().simple().to_string();
     let seed = uuid::Uuid::new_v4().as_u128() as u64;
-    let ours_token = uuid::Uuid::new_v4().simple().to_string();
-    let theirs_token = uuid::Uuid::new_v4().simple().to_string();
+    // Share tokens are local-demo only. GitHub matches assign roles from the session.
     match db::insert_full_match(
         &ctx.pool,
         &NewMatch {
@@ -132,8 +131,8 @@ pub async fn start_challenge(
             theirs_kind: "cpu".into(),
             ours_login: Some(ours_login.clone()),
             theirs_login: None,
-            ours_token,
-            theirs_token,
+            ours_token: String::new(),
+            theirs_token: String::new(),
             expire_secs: ctx.expire_secs,
             installation_id: Some(installation_id as i64),
             owner: owner.into(),
