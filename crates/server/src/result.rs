@@ -271,6 +271,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_result_git(
     dest: &Path,
     url: &str,
