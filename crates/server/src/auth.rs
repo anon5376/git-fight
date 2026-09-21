@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 const COOKIE: &str = "git_fight_sid";
@@ -95,11 +95,16 @@ pub async fn start_auth(
         state.auth.public_url.trim_end_matches('/')
     );
     let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
     let ret = sanitize_return(q.r#return.as_deref());
-    let state_val = format!("{nonce}:{ret}");
+    let state_val = format!("{nonce}:{verifier}:{ret}");
     let signed = sign(&state.auth.session_key, &state_val);
-    let url = gh.authorize_url(&redirect, &nonce);
-    let cookie = format!("{STATE_COOKIE}={signed}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600");
+    let url = gh.authorize_url(&redirect, &nonce, &challenge);
+    let cookie = format!(
+        "{STATE_COOKIE}={signed}; {}",
+        cookie_attrs(&state.auth.public_url, 600)
+    );
     let mut headers = HeaderMap::new();
     headers.insert(
         LOCATION,
@@ -137,7 +142,9 @@ pub async fn auth_callback(
     let Some(stored) = stored else {
         return (StatusCode::BAD_REQUEST, "bad state").into_response();
     };
-    let Some((nonce, ret)) = stored.split_once(':') else {
+    let mut parts = stored.splitn(3, ':');
+    let (Some(nonce), Some(verifier), Some(ret)) = (parts.next(), parts.next(), parts.next())
+    else {
         return (StatusCode::BAD_REQUEST, "bad state").into_response();
     };
     if q.state.as_deref() != Some(nonce) {
@@ -147,7 +154,7 @@ pub async fn auth_callback(
         "{}/auth/github/callback",
         state.auth.public_url.trim_end_matches('/')
     );
-    let (user_id, login) = match gh.oauth_user(&code, &redirect).await {
+    let (user_id, login) = match gh.oauth_user(&code, &redirect, verifier).await {
         Ok(v) => v,
         Err(_) => return (StatusCode::BAD_GATEWAY, "oauth failed").into_response(),
     };
@@ -159,7 +166,9 @@ pub async fn auth_callback(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let signed = sign(&state.auth.session_key, &sid);
-    let cookie = format!("{COOKIE}={signed}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600");
+    let attrs = cookie_attrs(&state.auth.public_url, 1_209_600);
+    let cookie = format!("{COOKIE}={signed}; {attrs}");
+    let clear = format!("{STATE_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     let dest = sanitize_return(Some(ret));
     let mut out = HeaderMap::new();
     out.insert(
@@ -167,7 +176,10 @@ pub async fn auth_callback(
         HeaderValue::from_str(&dest).unwrap_or(HeaderValue::from_static("/")),
     );
     if let Ok(v) = HeaderValue::from_str(&cookie) {
-        out.insert(SET_COOKIE, v);
+        out.append(SET_COOKIE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&clear) {
+        out.append(SET_COOKIE, v);
     }
     (StatusCode::FOUND, out).into_response()
 }
@@ -179,9 +191,54 @@ fn sanitize_return(r: Option<&str>) -> String {
     }
 }
 
+fn cookie_attrs(public_url: &str, max_age: i64) -> String {
+    let mut s = format!("Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+    if public_url.starts_with("https://") {
+        s.push_str("; Secure");
+    }
+    s
+}
+
+fn pkce_verifier() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, digest)
+}
+
 pub async fn me(State(state): State<crate::app::AppState>, headers: HeaderMap) -> Response {
     match login_from_headers(&state.pool, &state.auth.session_key, &headers).await {
         Some(login) => axum::Json(serde_json::json!({ "login": login })).into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_s256_matches_rfc7636() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn https_cookies_are_secure() {
+        let https = cookie_attrs("https://fight.example", 60);
+        assert!(https.contains("Secure"), "{https}");
+        assert!(https.contains("HttpOnly"), "{https}");
+        assert!(https.contains("SameSite=Lax"), "{https}");
+        let http = cookie_attrs("http://127.0.0.1:8080", 60);
+        assert!(!http.contains("Secure"), "{http}");
     }
 }

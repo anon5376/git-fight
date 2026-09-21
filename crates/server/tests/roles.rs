@@ -389,6 +389,8 @@ async fn github_oauth_callback_sets_session() {
         .map(|(_, v)| v.clone())
         .unwrap();
     assert!(loc.contains("/login/oauth/authorize"), "{loc}");
+    assert!(loc.contains("code_challenge="), "{loc}");
+    assert!(loc.contains("code_challenge_method=S256"), "{loc}");
     let nonce = loc
         .split("state=")
         .nth(1)
@@ -424,4 +426,12 @@ async fn github_oauth_callback_sets_session() {
     .await;
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&body).contains("alice"));
+    let rec = mock.received_requests().await.unwrap();
+    let token = rec
+        .iter()
+        .find(|r| r.url.path().ends_with("/access_token"))
+        .expect("token exchange");
+    let posted: Value = serde_json::from_slice(&token.body).unwrap();
+    let verifier = posted["code_verifier"].as_str().unwrap_or("");
+    assert!(verifier.len() >= 43, "pkce verifier too short: {posted}");
 }

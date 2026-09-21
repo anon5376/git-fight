@@ -368,6 +368,7 @@ impl GitHub {
         &self,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<(i64, String), String> {
         #[derive(Deserialize)]
         struct Token {
@@ -384,6 +385,7 @@ impl GitHub {
                 "client_secret": self.client_secret,
                 "code": code,
                 "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
             }))
             .send()
             .await
@@ -414,13 +416,14 @@ impl GitHub {
         Ok((user.id, user.login))
     }
 
-    pub fn authorize_url(&self, redirect_uri: &str, state: &str) -> String {
+    pub fn authorize_url(&self, redirect_uri: &str, state: &str, code_challenge: &str) -> String {
         format!(
-            "{}/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&allow_signup=false",
+            "{}/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&allow_signup=false&code_challenge={}&code_challenge_method=S256",
             self.oauth_base,
             urlencoding(&self.client_id),
             urlencoding(redirect_uri),
             urlencoding(state),
+            urlencoding(code_challenge),
         )
     }
 }
