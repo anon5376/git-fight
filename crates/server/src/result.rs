@@ -660,13 +660,12 @@ pub(crate) async fn comment_decision(
     comment(ctx, row, body).await
 }
 
+fn outdated_live_body() -> &'static str {
+    "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch."
+}
+
 pub(crate) async fn comment_outdated(ctx: &ResultCtx, row: &MatchRow) -> Result<(), String> {
-    let public = ctx.public_url.trim_end_matches('/');
-    let body = format!(
-        "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch.\nopen match: {public}/match/{}",
-        row.id
-    );
-    comment(ctx, row, &body).await
+    comment(ctx, row, outdated_live_body()).await
 }
 
 #[cfg(test)]
@@ -680,6 +679,16 @@ mod tests {
             outcome_record_followup(Err(())),
             "retry",
             "a failed outcome comment must stay unpublished"
+        );
+    }
+
+    #[test]
+    fn outdated_live_comment_is_not_a_fight_link() {
+        let body = outdated_live_body();
+        assert!(body.contains("/fight"));
+        assert!(
+            !body.contains("/match/"),
+            "SHA-drift abort is not a live room"
         );
     }
 

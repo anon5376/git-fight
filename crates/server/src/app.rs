@@ -875,15 +875,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         }
     }
     let Some(tx) = live else {
-        if let Some(message) = db::get_match(&state.pool, &q.match_id)
-            .await
-            .ok()
-            .flatten()
+        let row = db::get_match(&state.pool, &q.match_id).await.ok().flatten();
+        let message = row
             .as_ref()
             .and_then(|r| closed_ws_message(&r.status, r.abort_reason.as_deref()))
-        {
-            reject_socket(socket, message).await;
-        }
+            .unwrap_or("preparing");
+        reject_socket(socket, message).await;
         return;
     };
 
@@ -1053,6 +1050,21 @@ mod tests {
             "every hunk scored: no current theirs"
         );
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn join_enqueue_miss_is_not_a_mute_socket() {
+        assert_eq!(join_miss_followup(Some("finished")), "finished");
+        assert_eq!(join_miss_followup(Some("outdated")), "outdated");
+        assert_eq!(
+            join_miss_followup(None),
+            "preparing",
+            "a still-open row must Error so the canvas reconnects"
+        );
+    }
+
+    fn join_miss_followup(closed: Option<&'static str>) -> &'static str {
+        closed.unwrap_or("preparing")
     }
 
     #[tokio::test]
