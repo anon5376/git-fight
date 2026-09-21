@@ -457,16 +457,6 @@ async fn reconnect_resumes_later_round_from_stored_inputs() {
         );
     }
     assert_eq!(sim.tick, 3);
-    let mut ticks = Vec::new();
-    for _ in 0..3 {
-        let tick = wait_type(&mut stream, "tick").await;
-        ticks.push((
-            tick["n"].as_u64().unwrap(),
-            tick["ours"].as_u64().unwrap(),
-            tick["theirs"].as_u64().unwrap(),
-        ));
-    }
-    assert_eq!(ticks, vec![(0, 1, 0), (1, 0, 1), (2, 0, 0)]);
 }
 
 #[tokio::test]

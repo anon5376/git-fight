@@ -175,15 +175,6 @@ async fn run_room(
                             &hunks,
                         );
                         let _ = tx.send(encode(&snap)).await;
-                        for &(n, o, t) in &log {
-                            let _ = tx
-                                .send(encode(&ServerMsg::Tick {
-                                    n,
-                                    ours: o,
-                                    theirs: t,
-                                }))
-                                .await;
-                        }
                         if let Some(result) = sim.result {
                             let match_over = round + 1 >= total_rounds;
                             let _ = tx.send(encode(&end_msg(&sim, result, round, match_over))).await;
