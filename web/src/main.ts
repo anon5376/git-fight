@@ -2,13 +2,18 @@ import init, {
   WasmFight,
   demo_conflict,
   demo_resolve,
-  round_ticks,
-  sprite_row,
-  sprite_rows,
   ticks_per_second,
 } from "../pkg/git_fight_wasm.js";
 import { bindKeys } from "./input";
-import { drawDotTitle, drawFrame } from "./render";
+import { drawDotTitle } from "./render";
+import {
+  hostMatch,
+  paintFight,
+  routeFromPath,
+  showKo,
+  startOnline,
+  startReplay,
+} from "./online";
 
 type Mode = { kind: "cpu"; human: "ours" | "theirs" } | { kind: "two" };
 
@@ -26,15 +31,6 @@ function show(id: string, on: boolean): void {
   $(id).classList.toggle("hidden", !on);
 }
 
-function sprite(side: number, pose: number): string[] {
-  const rows = sprite_rows();
-  const out: string[] = [];
-  for (let r = 0; r < rows; r += 1) {
-    out.push(sprite_row(side, pose, r));
-  }
-  return out;
-}
-
 function makeFight(): WasmFight {
   if (smoke) {
     return WasmFight.with_hp(1, 100, 10);
@@ -50,6 +46,8 @@ function startFight(mode: Mode, fromDemo: boolean): void {
   show("demo-panel", false);
   show("side-pick", false);
   show("arena", true);
+  $("wait").classList.add("hidden");
+  $("share").classList.add("hidden");
   const ko = $("ko");
   ko.classList.add("hidden");
   ko.textContent = "KO";
@@ -58,7 +56,6 @@ function startFight(mode: Mode, fromDemo: boolean): void {
   const fight = makeFight();
   const stage = $("stage") as HTMLCanvasElement;
   const tps = ticks_per_second();
-  const round = round_ticks();
   const tickMs = 1000 / tps;
   let last = performance.now();
   let leftover = 0;
@@ -79,34 +76,14 @@ function startFight(mode: Mode, fromDemo: boolean): void {
     let theirs = queued.theirs;
     if (mode.kind === "cpu") {
       if (mode.human === "ours") {
-        theirs = fight.cpu_input(1);
+        // `?smoke=1` stands the CPU still so a mashed punch can KO the dummy HP.
+        theirs = smoke ? 0 : fight.cpu_input(1);
       } else {
         theirs = ours;
-        ours = fight.cpu_input(0);
+        ours = smoke ? 0 : fight.cpu_input(0);
       }
     }
     fight.step(ours, theirs);
-  };
-
-  const paint = () => {
-    const left = round - fight.tick();
-            const secs = tps === 0 ? 0 : (left - (left % tps)) / tps;
-    drawFrame(stage, {
-      oursName: "ours",
-      theirsName: "theirs",
-      oursHp: fight.ours_hp(),
-      theirsHp: fight.theirs_hp(),
-      oursMax: fight.ours_max_hp(),
-      theirsMax: fight.theirs_max_hp(),
-      oursX: fight.ours_x(),
-      theirsX: fight.theirs_x(),
-      oursSprite: sprite(0, fight.ours_pose()),
-      theirsSprite: sprite(1, fight.theirs_pose()),
-      timer: String(secs).padStart(2, " "),
-      roundLabel: fromDemo ? "demo  1/1" : "round 1/1",
-    });
-    stage.dataset.oursHp = String(fight.ours_hp());
-    stage.dataset.theirsHp = String(fight.theirs_hp());
   };
 
   const finish = () => {
@@ -115,21 +92,13 @@ function startFight(mode: Mode, fromDemo: boolean): void {
     }
     finished = true;
     const result = fight.result();
-    ko.classList.remove("hidden", "ours");
-    if (result === 0) {
-      ko.textContent = "KO";
-      ko.classList.add("ours");
-      if (fromDemo) {
+    showKo(ko, result);
+    if (fromDemo) {
+      if (result === 0) {
         $("resolved").textContent = demo_resolve(0);
-      }
-    } else if (result === 1) {
-      ko.textContent = "KO";
-      if (fromDemo) {
+      } else if (result === 1) {
         $("resolved").textContent = demo_resolve(1);
-      }
-    } else {
-      ko.textContent = "DRAW";
-      if (fromDemo) {
+      } else {
         $("resolved").textContent = "draw — conflict left unresolved";
       }
     }
@@ -145,14 +114,14 @@ function startFight(mode: Mode, fromDemo: boolean): void {
       leftover -= tickMs;
       stepOnce();
     }
-    paint();
+    paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
     if (fight.result() !== -1) {
       finish();
     }
     requestAnimationFrame(loop);
   };
 
-  paint();
+  paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
   requestAnimationFrame(loop);
   running = {
     stop: () => {
@@ -190,13 +159,54 @@ function showSidePick(): void {
   show("side-pick", true);
 }
 
+function arenaUi() {
+  return {
+    stage: $("stage") as HTMLCanvasElement,
+    ko: $("ko"),
+    wait: $("wait"),
+    share: $("share"),
+    resolved: $("resolved"),
+    onQuit: () => {
+      window.location.assign("/");
+    },
+  };
+}
+
+async function bootOnline(): Promise<boolean> {
+  const route = routeFromPath();
+  if (!route) {
+    return false;
+  }
+  show("menu", false);
+  show("demo-panel", false);
+  show("side-pick", false);
+  show("arena", true);
+  $("resolved").textContent = "";
+  if (route.kind === "match") {
+    running = startOnline(route.id, route.token, arenaUi());
+  } else {
+    running = await startReplay(route.id, arenaUi());
+  }
+  return true;
+}
+
 async function main(): Promise<void> {
   await init();
   drawDotTitle($("title") as HTMLCanvasElement, "GIT FIGHT");
+  if (await bootOnline()) {
+    return;
+  }
   document.querySelector("[data-testid=demo]")?.addEventListener("click", showDemo);
   document.querySelector("[data-testid=cpu]")?.addEventListener("click", showSidePick);
   document.querySelector("[data-testid=two]")?.addEventListener("click", () => {
     startFight({ kind: "two" }, false);
+  });
+  document.querySelector("[data-testid=host]")?.addEventListener("click", () => {
+    void hostMatch().catch((err: unknown) => {
+      const flash = $("flash");
+      flash.classList.remove("hidden");
+      flash.textContent = err instanceof Error ? err.message : "server is not running";
+    });
   });
   document.querySelector("[data-testid=demo-fight]")?.addEventListener("click", () => {
     startFight({ kind: "cpu", human: "ours" }, true);

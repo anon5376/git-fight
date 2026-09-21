@@ -299,6 +299,25 @@ impl FightState {
         self.finish_if_needed();
     }
 
+    /// The disconnected side loses the current round immediately.
+    pub fn forfeit(&mut self, side: Side) {
+        if self.result.is_some() {
+            return;
+        }
+        match side {
+            Side::Ours => {
+                self.ours.hp = 0;
+                self.ours.anim = Anim::Ko;
+                self.result = Some(RoundResult::Theirs);
+            }
+            Side::Theirs => {
+                self.theirs.hp = 0;
+                self.theirs.anim = Anim::Ko;
+                self.result = Some(RoundResult::Ours);
+            }
+        }
+    }
+
     fn finish_if_needed(&mut self) {
         let ours_dead = self.ours.hp <= 0;
         let theirs_dead = self.theirs.hp <= 0;
@@ -646,5 +665,13 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn forfeit_awards_the_other_side() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.forfeit(Side::Ours);
+        assert_eq!(f.result, Some(RoundResult::Theirs));
+        assert_eq!(f.ours.hp, 0);
     }
 }

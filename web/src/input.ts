@@ -33,6 +33,17 @@ export function bindKeys(onQuit: () => void): { poll: () => Queued; unbind: () =
   };
 }
 
+/** Fighter slots use P1 keys; P2 keys still work for the right side. */
+export function buttonsForRole(role: string, queued: Queued): number {
+  if (role === "theirs") {
+    return queued.theirs !== 0 ? queued.theirs : queued.ours;
+  }
+  if (role === "ours" || role === "both") {
+    return queued.ours;
+  }
+  return 0;
+}
+
 function mapKey(key: string): Queued | null {
   switch (key) {
     case "a":
