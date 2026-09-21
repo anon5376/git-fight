@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::time::timeout;
 
+#[derive(Clone)]
 pub struct ChallengeCtx {
     pub gh: GitHub,
     pub pool: SqlitePool,

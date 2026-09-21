@@ -138,11 +138,23 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     {
         return HttpStatus::OK;
     }
-    if let Ok(Some(row)) =
-        db::open_match_for_pr(&state.pool, &repo.owner.login, &repo.name, pr.number).await
-    {
-        notice_if_outdated(state, &row, pr).await;
-        return HttpStatus::OK;
+    match open_match_lookup_retry(&state.pool, &repo.owner.login, &repo.name, pr.number).await {
+        Ok(Some(row)) => {
+            notice_if_outdated(state, &row, pr).await;
+            return HttpStatus::OK;
+        }
+        Ok(None) => {}
+        Err(_) => {
+            // Busy lookup is not "no open match": retry notice, do not
+            // auto_challenge while an open row may still exist.
+            schedule_open_lookup(
+                state.clone(),
+                repo.owner.login.clone(),
+                repo.name.clone(),
+                pr.clone(),
+            );
+            return HttpStatus::OK;
+        }
     }
     if !matches!(action, "opened" | "reopened" | "synchronize") {
         return HttpStatus::OK;
@@ -189,6 +201,9 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
         Ok(true) => {}
         Ok(false) => return,
         Err(_) => {
+            // Drift is known. Stop lockstep now; keep retrying abort so
+            // rematch `/fight` is not stuck on a leftover open row.
+            state.close_room(&row.id).await;
             schedule_outdated_abort(state.clone(), row.clone());
             return;
         }
@@ -211,7 +226,8 @@ async fn abort_open_retry(
 
 fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
     tokio::spawn(async move {
-        for delay_ms in [25_u64, 50, 100, 200] {
+        state.close_room(&row.id).await;
+        for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             match db::abort_open_match(&state.pool, &row.id, "outdated").await {
                 Ok(true) => {
@@ -284,18 +300,103 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         if start.body.is_empty() {
             return;
         }
-        let posted = ctx
-            .gh
-            .comment(inst, &owner, &name, number, &start.body)
-            .await
-            .unwrap_or(0);
-        if let Some(match_id) = start.match_id {
-            if posted > 0 {
-                let _ = db::set_challenge_comment_id(&ctx.pool, &match_id, posted as i64).await;
+        if let Some(ref match_id) = start.match_id {
+            match open_for_comment_retry(&ctx.pool, match_id).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(_) => {
+                    schedule_challenge_comment(ctx, inst, owner, name, number, start);
+                    return;
+                }
+            }
+        }
+        post_challenge_comment(&ctx, inst, &owner, &name, number, &start).await;
+    });
+    HttpStatus::OK
+}
+
+/// Retry once. `Err` is still unknown — not "no open match".
+async fn open_match_lookup_retry(
+    pool: &sqlx::SqlitePool,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Option<db::MatchRow>, sqlx::Error> {
+    match db::open_match_for_pr(pool, owner, repo, number).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::open_match_for_pr(pool, owner, repo, number).await,
+    }
+}
+
+fn schedule_open_lookup(state: crate::app::AppState, owner: String, repo: String, pr: Pr) {
+    tokio::spawn(async move {
+        for delay_ms in [25_u64, 50, 100, 200] {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            match db::open_match_for_pr(&state.pool, &owner, &repo, pr.number).await {
+                Ok(Some(row)) => {
+                    notice_if_outdated(&state, &row, &pr).await;
+                    return;
+                }
+                Ok(None) => return,
+                Err(_) => {}
             }
         }
     });
-    HttpStatus::OK
+}
+
+/// Retry once. `Ok(false)` means the row is already closed — do not post
+/// a fight link. `Err` is still unknown.
+async fn open_for_comment_retry(pool: &sqlx::SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    match db::is_open_match(pool, id).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::is_open_match(pool, id).await,
+    }
+}
+
+fn schedule_challenge_comment(
+    ctx: ChallengeCtx,
+    inst: u64,
+    owner: String,
+    name: String,
+    number: u64,
+    start: challenge::ChallengeStart,
+) {
+    tokio::spawn(async move {
+        for delay_ms in [25_u64, 50, 100, 200] {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let Some(ref match_id) = start.match_id else {
+                return;
+            };
+            match db::is_open_match(&ctx.pool, match_id).await {
+                Ok(true) => {
+                    post_challenge_comment(&ctx, inst, &owner, &name, number, &start).await;
+                    return;
+                }
+                Ok(false) => return,
+                Err(_) => {}
+            }
+        }
+    });
+}
+
+async fn post_challenge_comment(
+    ctx: &ChallengeCtx,
+    inst: u64,
+    owner: &str,
+    name: &str,
+    number: u64,
+    start: &challenge::ChallengeStart,
+) {
+    let posted = ctx
+        .gh
+        .comment(inst, owner, name, number, &start.body)
+        .await
+        .unwrap_or(0);
+    if let Some(match_id) = start.match_id.as_deref() {
+        if posted > 0 {
+            let _ = db::set_challenge_comment_id(&ctx.pool, match_id, posted as i64).await;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -345,7 +446,7 @@ struct Comment {
     updated_at: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Pr {
     number: u64,
     #[serde(default)]
@@ -356,7 +457,7 @@ struct Pr {
     updated_at: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Sha {
     sha: String,
 }
@@ -378,6 +479,67 @@ mod tests {
 
     fn first_or_retry(first: Result<bool, ()>, retry: Result<bool, ()>) -> Result<bool, ()> {
         first.or(retry)
+    }
+
+    #[test]
+    fn pull_lookup_err_does_not_auto_challenge() {
+        assert_eq!(pull_lookup_followup(Ok(Some(()))), "notice");
+        assert_eq!(pull_lookup_followup(Ok(None)), "maybe_challenge");
+        assert_eq!(
+            pull_lookup_followup(Err(())),
+            "retry",
+            "busy open_match_for_pr must not fall through to spawn_challenge"
+        );
+    }
+
+    fn pull_lookup_followup(result: Result<Option<()>, ()>) -> &'static str {
+        match result {
+            Ok(Some(())) => "notice",
+            Ok(None) => "maybe_challenge",
+            Err(()) => "retry",
+        }
+    }
+
+    #[test]
+    fn fight_link_is_not_posted_after_the_row_closes() {
+        assert_eq!(fight_link_followup(false, Err(())), "post");
+        assert_eq!(fight_link_followup(true, Ok(true)), "post");
+        assert_eq!(fight_link_followup(true, Ok(false)), "skip");
+        assert_eq!(
+            fight_link_followup(true, Err(())),
+            "retry",
+            "busy open-status must not post a fight link we cannot confirm"
+        );
+    }
+
+    fn fight_link_followup(has_match: bool, open: Result<bool, ()>) -> &'static str {
+        if !has_match {
+            return "post";
+        }
+        match open {
+            Ok(true) => "post",
+            Ok(false) => "skip",
+            Err(()) => "retry",
+        }
+    }
+
+    #[test]
+    fn drift_known_closes_room_while_abort_retries() {
+        assert_eq!(drift_abort_followup(Ok(true)), "close_and_comment");
+        assert_eq!(drift_abort_followup(Ok(false)), "stop");
+        assert_eq!(
+            drift_abort_followup(Err(())),
+            "close_room_and_retry",
+            "persistent abort Err must still stop lockstep"
+        );
+    }
+
+    fn drift_abort_followup(result: Result<bool, ()>) -> &'static str {
+        match result {
+            Ok(true) => "close_and_comment",
+            Ok(false) => "stop",
+            Err(()) => "close_room_and_retry",
+        }
     }
 
     #[test]
