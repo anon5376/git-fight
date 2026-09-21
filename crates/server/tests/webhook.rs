@@ -5,12 +5,13 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const SECRET: &[u8] = b"webhook-secret-for-tests";
 const APP_PEM: &str = include_str!("fixtures/app_key.txt");
@@ -381,11 +382,44 @@ fn spawn_hello_drain(mut stream: WsStream) -> tokio::sync::mpsc::Receiver<Value>
     rx
 }
 
+async fn send_buttons(alice: &mut WsSink, other: &mut WsSink, tick: u32, ours: u8, theirs: u8) {
+    let o = format!(r#"{{"type":"input","tick":{tick},"buttons":{ours}}}"#);
+    let t = format!(r#"{{"type":"input","tick":{tick},"buttons":{theirs}}}"#);
+    alice.send(Message::Text(o.into())).await.unwrap();
+    other.send(Message::Text(t.into())).await.unwrap();
+}
+
 struct MockOpts {
     commit_author: Value,
     size: u64,
     auto_challenge: bool,
     commit_authors: Vec<(String, Value)>,
+    mergeable: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct PullMergeable {
+    head: String,
+    base: String,
+    mergeable: Mutex<Vec<Value>>,
+}
+
+impl Respond for PullMergeable {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let mut seq = self.mergeable.lock().unwrap();
+        let mergeable = if seq.len() > 1 {
+            seq.remove(0)
+        } else {
+            seq.first().cloned().unwrap_or(json!(false))
+        };
+        ResponseTemplate::new(200).set_body_json(json!({
+            "number": 1,
+            "mergeable": mergeable,
+            "head": { "sha": self.head, "ref": "pr" },
+            "base": { "sha": self.base, "ref": "main" },
+            "user": { "login": "alice" }
+        }))
+    }
 }
 
 async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
@@ -406,15 +440,18 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
         })))
         .mount(&mock)
         .await;
+    let mergeable = if opts.mergeable.is_empty() {
+        vec![json!(false)]
+    } else {
+        opts.mergeable
+    };
     Mock::given(method("GET"))
         .and(path("/repos/acme/box/pulls/1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "number": 1,
-            "mergeable": false,
-            "head": { "sha": head, "ref": "pr" },
-            "base": { "sha": base, "ref": "main" },
-            "user": { "login": "alice" }
-        })))
+        .respond_with(PullMergeable {
+            head: head.to_string(),
+            base: base.to_string(),
+            mergeable: Mutex::new(mergeable),
+        })
         .mount(&mock)
         .await;
     if opts.auto_challenge {
@@ -471,6 +508,7 @@ fn cpu_opts() -> MockOpts {
         size: 12,
         auto_challenge: false,
         commit_authors: vec![],
+        mergeable: vec![],
     }
 }
 
@@ -715,6 +753,7 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
                 (bob_sha, json!({ "login": "bob" })),
                 (carol_sha, json!({ "login": "carol" })),
             ],
+            mergeable: vec![],
         },
     )
     .await;
@@ -898,6 +937,252 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
 }
 
 #[tokio::test]
+async fn fight_comment_two_authors_mixed_picks_push() {
+    let (_keep, bare, head, base, bob_sha, carol_sha) = conflict_two_authors();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![
+                (bob_sha, json!({ "login": "bob" })),
+                (carol_sha, json!({ "login": "carol" })),
+            ],
+            mergeable: vec![],
+        },
+    )
+    .await;
+    let mut cfg = cfg_for(&mock, bare.clone());
+    cfg.instant = true;
+    let (addr, pool) = spawn_with_pool(cfg).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-mixed-authors", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    let id = match_id_from(&comments);
+    git_fight_server::db::insert_session(&pool, "sid-alice", 1, "alice")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-bob", 2, "bob")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-carol", 3, "carol")
+        .await
+        .unwrap();
+    let alice_c = git_fight_server::sign_session(SESSION_KEY, "sid-alice");
+    let bob_c = git_fight_server::sign_session(SESSION_KEY, "sid-bob");
+    let carol_c = git_fight_server::sign_session(SESSION_KEY, "sid-carol");
+
+    let (mut alice_sink, mut alice_stream) = connect_cookie(addr, &id, &alice_c).await;
+    let (mut bob_sink, mut bob_stream) = connect_cookie(addr, &id, &bob_c).await;
+    let (mut carol_sink, mut carol_stream) = connect_cookie(addr, &id, &carol_c).await;
+    let _ = wait_ws_type(&mut alice_stream, "hello").await;
+    let _ = wait_ws_type(&mut bob_stream, "hello").await;
+    let _ = wait_ws_type(&mut carol_stream, "hello").await;
+    let _bob_rx = spawn_hello_drain(bob_stream);
+    let _carol_rx = spawn_hello_drain(carol_stream);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut next_send = 0u32;
+    let mut ours_btn = 2u8;
+    let mut theirs_btn = 0u8;
+    let mut theirs_is_carol = false;
+    while next_send < 16 {
+        send_buttons(
+            &mut alice_sink,
+            &mut bob_sink,
+            next_send,
+            ours_btn,
+            theirs_btn,
+        )
+        .await;
+        next_send += 1;
+    }
+    let mut ends = 0u32;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, alice_stream.next())
+            .await
+            .expect("timeout waiting for mixed-pick match")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("hello") => {
+                next_send = 0;
+                while next_send < 16 {
+                    let other = if theirs_is_carol {
+                        &mut carol_sink
+                    } else {
+                        &mut bob_sink
+                    };
+                    send_buttons(&mut alice_sink, other, next_send, ours_btn, theirs_btn).await;
+                    next_send += 1;
+                }
+            }
+            Some("tick") => {
+                let n = v["n"].as_u64().unwrap() as u32;
+                while next_send <= n + 8 {
+                    let other = if theirs_is_carol {
+                        &mut carol_sink
+                    } else {
+                        &mut bob_sink
+                    };
+                    send_buttons(&mut alice_sink, other, next_send, ours_btn, theirs_btn).await;
+                    next_send += 1;
+                }
+            }
+            Some("end") => {
+                ends += 1;
+                if v["match_over"].as_bool() == Some(true) {
+                    assert_eq!(ends, 2, "{v}");
+                    break;
+                }
+                assert_eq!(v["round"].as_u64(), Some(0), "{v}");
+                theirs_is_carol = true;
+                ours_btn = 0;
+                theirs_btn = 2;
+            }
+            Some("error") => panic!("{}", v["message"]),
+            _ => {}
+        }
+    }
+    assert_eq!(ends, 2);
+
+    let mut branch = None;
+    for _ in 0..80 {
+        let row = git_fight_server::db::get_match(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.result_branch.is_some() || row.abort_reason.is_some() {
+            assert!(row.abort_reason.is_none(), "unexpected abort {row:?}");
+            branch = row.result_branch;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let hunks = git_fight_server::db::list_hunks(&pool, &id).await.unwrap();
+    let winners: Vec<Option<String>> = hunks.iter().map(|h| h.winner.clone()).collect();
+    assert_eq!(winners[0].as_deref(), Some("ours"), "{winners:?}");
+    assert_eq!(winners[1].as_deref(), Some("theirs"), "{winners:?}");
+    let branch = branch.expect("result branch after mixed picks");
+    assert_eq!(
+        git_dir(&bare, &["show", &format!("{branch}:a.rs")]),
+        "fn a() { 2 }",
+        "alice win on a.rs is the PR side"
+    );
+    assert_eq!(
+        git_dir(&bare, &["show", &format!("{branch}:b.rs")]),
+        "fn b() { 3 }",
+        "carol win on b.rs is the base side"
+    );
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
+}
+
+#[tokio::test]
+async fn duplicate_delivery_is_ignored() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    let body = fight_body();
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-dup", &body).await,
+        200
+    );
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-dup", &body).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let later = posted_comments(&mock.received_requests().await.unwrap_or_default());
+    assert_eq!(
+        later.len(),
+        1,
+        "replayed delivery started a second fight: {later:?}"
+    );
+    assert!(
+        comments.iter().any(|t| t.contains("/match/")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn mergeable_pr_comments_nothing_to_fight() {
+    let mock = github_mocks(
+        "dead",
+        "beef",
+        MockOpts {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![],
+            mergeable: vec![json!(true)],
+        },
+    )
+    .await;
+    let addr = spawn(cfg_for(&mock, PathBuf::from("/nope"))).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-mergeable", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments.iter().any(|t| t.contains("no conflicts to fight")),
+        "{comments:?}"
+    );
+    assert!(
+        comments.iter().all(|t| !t.contains("/match/")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn mergeable_null_then_false_starts_fight() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![],
+            mergeable: vec![Value::Null, json!(false)],
+        },
+    )
+    .await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-poll-mergeable", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments.iter().any(|t| t.contains("/match/")),
+        "{comments:?}"
+    );
+    let pulls = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/repos/acme/box/pulls/1")
+        .count();
+    assert!(
+        pulls >= 2,
+        "expected mergeable poll, got {pulls} GET /pulls/1"
+    );
+}
+
+#[tokio::test]
 async fn same_login_is_a_mirror_match() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(
@@ -908,6 +1193,7 @@ async fn same_login_is_a_mirror_match() {
             size: 12,
             auto_challenge: false,
             commit_authors: vec![],
+            mergeable: vec![],
         },
     )
     .await;
@@ -931,6 +1217,7 @@ async fn oversized_repo_is_skipped() {
             size: 1_048_577,
             auto_challenge: false,
             commit_authors: vec![],
+            mergeable: vec![],
         },
     )
     .await;
@@ -987,6 +1274,7 @@ async fn auto_challenge_starts_when_yaml_set() {
             size: 12,
             auto_challenge: true,
             commit_authors: vec![],
+            mergeable: vec![],
         },
     )
     .await;
@@ -1220,6 +1508,7 @@ async fn each_hunk_stores_blamed_author_login() {
                 (bob_sha, json!({ "login": "bob" })),
                 (carol_sha, json!({ "login": "carol" })),
             ],
+            mergeable: vec![],
         },
     )
     .await;
