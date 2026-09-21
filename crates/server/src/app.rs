@@ -772,6 +772,22 @@ fn coalesce_theirs_login(
     }
 }
 
+/// After a later-round advance, a double scalar miss can leave the
+/// cache on the previous hunk's login. Reload hunks before last-good.
+fn refresh_theirs_after_busy(
+    cached: &mut Option<String>,
+    hunks: Result<Vec<db::HunkRow>, sqlx::Error>,
+) -> Option<String> {
+    match hunks {
+        Ok(hunks) => {
+            let from = db::current_theirs_from_hunks(&hunks);
+            *cached = from.clone();
+            from
+        }
+        Err(_) => cached.clone(),
+    }
+}
+
 async fn reject_socket(mut socket: WebSocket, message: &str) {
     let body = serde_json::to_string(&ServerMsg::Error {
         message: message.to_string(),
@@ -909,7 +925,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                     Ok(v) => Ok(v),
                     Err(_) => db::current_theirs_login(&pool, &match_id).await,
                 };
-                coalesce_theirs_login(looked, &mut current_theirs)
+                match looked {
+                    Ok(v) => coalesce_theirs_login(Ok(v), &mut current_theirs),
+                    Err(_) => refresh_theirs_after_busy(
+                        &mut current_theirs,
+                        db::list_hunks(&pool, &match_id).await,
+                    ),
+                }
             } else {
                 None
             };
@@ -1029,6 +1051,24 @@ mod tests {
         assert!(!is_live_public_url(""));
     }
 
+    fn hunk(round: i64, winner: Option<&str>, login: &str) -> db::HunkRow {
+        db::HunkRow {
+            round_index: round,
+            path: "a.rs".into(),
+            hunk_index: 0,
+            winner: winner.map(str::to_string),
+            theirs_name: Some(login.into()),
+            theirs_login: Some(login.into()),
+            ours_hp: 100,
+            ours_armor: false,
+            ours_special: false,
+            theirs_hp: 100,
+            theirs_armor: false,
+            theirs_special: false,
+            is_ko: false,
+        }
+    }
+
     #[test]
     fn coalesce_theirs_login_keeps_cache_on_error() {
         let mut cached = Some("bob".into());
@@ -1046,6 +1086,39 @@ mod tests {
         assert_eq!(cached.as_deref(), Some("carol"));
         assert_eq!(
             coalesce_theirs_login(Ok(None), &mut cached).as_deref(),
+            None,
+            "every hunk scored: no current theirs"
+        );
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn later_round_theirs_reloads_hunks_after_busy_scalar() {
+        let mut cached = Some("bob".into());
+        let hunks = Ok(vec![hunk(0, Some("ours"), "bob"), hunk(1, None, "carol")]);
+        assert_eq!(
+            refresh_theirs_after_busy(&mut cached, hunks).as_deref(),
+            Some("carol"),
+            "after round 0 is scored, hunks must replace last-good bob"
+        );
+        assert_eq!(cached.as_deref(), Some("carol"));
+
+        let mut cached = Some("bob".into());
+        assert_eq!(
+            refresh_theirs_after_busy(&mut cached, Err(sqlx::Error::Protocol("busy".into())))
+                .as_deref(),
+            Some("bob"),
+            "a busy hunks read must keep last-good"
+        );
+        assert_eq!(cached.as_deref(), Some("bob"));
+
+        let mut cached = Some("bob".into());
+        let scored = Ok(vec![
+            hunk(0, Some("ours"), "bob"),
+            hunk(1, Some("theirs"), "carol"),
+        ]);
+        assert_eq!(
+            refresh_theirs_after_busy(&mut cached, scored).as_deref(),
             None,
             "every hunk scored: no current theirs"
         );
