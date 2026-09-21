@@ -372,10 +372,8 @@ fn spawn_hello_drain(mut stream: WsStream) -> tokio::sync::mpsc::Receiver<Value>
             let Ok(v) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
-            if matches!(v["type"].as_str(), Some("hello" | "end")) {
-                if tx.send(v).await.is_err() {
-                    break;
-                }
+            if matches!(v["type"].as_str(), Some("hello" | "end")) && tx.send(v).await.is_err() {
+                break;
             }
         }
     });
