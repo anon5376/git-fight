@@ -69,10 +69,17 @@ async fn seed(
     .unwrap();
 }
 
+async fn score(pool: &sqlx::SqlitePool, id: &str, winner: &str) {
+    assert!(git_fight_server::db::set_hunk_winner(pool, id, 0, winner)
+        .await
+        .unwrap());
+}
+
 #[tokio::test]
 async fn ko_win_updates_wins_losses_kos_and_conflicts_caused() {
     let pool = pool().await;
     seed(&pool, "m1", Some("alice"), Some("bob"), "acme", "box").await;
+    score(&pool, "m1", "ours").await;
     git_fight_server::record_round(&pool, "m1", 0, "ours", true)
         .await
         .unwrap();
@@ -101,9 +108,28 @@ async fn ko_win_updates_wins_losses_kos_and_conflicts_caused() {
 }
 
 #[tokio::test]
+async fn record_round_is_write_once() {
+    let pool = pool().await;
+    seed(&pool, "m-once", Some("alice"), Some("bob"), "acme", "box").await;
+    score(&pool, "m-once", "ours").await;
+    git_fight_server::record_round(&pool, "m-once", 0, "ours", true)
+        .await
+        .unwrap();
+    git_fight_server::record_round(&pool, "m-once", 0, "ours", true)
+        .await
+        .unwrap();
+    let alice = git_fight_server::db::get_player_stats(&pool, "acme", "box", "alice")
+        .await
+        .unwrap();
+    assert_eq!(alice.wins, 1);
+    assert_eq!(alice.kos, 1);
+}
+
+#[tokio::test]
 async fn login_case_does_not_split_the_leaderboard() {
     let pool = pool().await;
     seed(&pool, "m-case", Some("Alice"), Some("BOB"), "acme", "box").await;
+    score(&pool, "m-case", "ours").await;
     git_fight_server::record_round(&pool, "m-case", 0, "ours", true)
         .await
         .unwrap();
@@ -150,6 +176,7 @@ async fn login_case_does_not_split_the_leaderboard() {
     )
     .await
     .unwrap();
+    score(&pool, "m-case-2", "ours").await;
     git_fight_server::record_round(&pool, "m-case-2", 0, "ours", false)
         .await
         .unwrap();
@@ -204,6 +231,7 @@ async fn aborted_match_does_not_record_stats() {
 async fn draw_skips_wins_but_counts_conflicts_caused() {
     let pool = pool().await;
     seed(&pool, "m2", Some("alice"), Some("bob"), "acme", "box").await;
+    score(&pool, "m2", "draw").await;
     git_fight_server::record_round(&pool, "m2", 0, "draw", false)
         .await
         .unwrap();
@@ -224,6 +252,7 @@ async fn draw_skips_wins_but_counts_conflicts_caused() {
 async fn forfeit_is_a_win_without_a_ko() {
     let pool = pool().await;
     seed(&pool, "m3", Some("alice"), Some("bob"), "acme", "box").await;
+    score(&pool, "m3", "forfeit_ours").await;
     git_fight_server::record_round(&pool, "m3", 0, "forfeit_ours", false)
         .await
         .unwrap();
@@ -243,6 +272,7 @@ async fn forfeit_is_a_win_without_a_ko() {
 async fn timeout_win_is_not_a_ko() {
     let pool = pool().await;
     seed(&pool, "m4", Some("alice"), Some("bob"), "acme", "box").await;
+    score(&pool, "m4", "theirs").await;
     git_fight_server::record_round(&pool, "m4", 0, "theirs", false)
         .await
         .unwrap();
@@ -270,6 +300,7 @@ async fn local_match_without_repo_does_not_record() {
 async fn cpu_side_without_login_is_skipped() {
     let pool = pool().await;
     seed(&pool, "m6", Some("alice"), None, "acme", "box").await;
+    score(&pool, "m6", "ours").await;
     git_fight_server::record_round(&pool, "m6", 0, "ours", true)
         .await
         .unwrap();
@@ -288,6 +319,7 @@ async fn leaderboard_and_badge_http() {
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     seed(&pool, "m7", Some("alice"), Some("bob"), "acme", "box").await;
+    score(&pool, "m7", "ours").await;
     git_fight_server::record_round(&pool, "m7", 0, "ours", true)
         .await
         .unwrap();

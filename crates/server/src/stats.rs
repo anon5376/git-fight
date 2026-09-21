@@ -27,6 +27,9 @@ pub async fn record_round(
     if !matches!(row.status.as_str(), "pending" | "in_progress") {
         return Ok(());
     }
+    if !db::claim_round_stats(pool, match_id, round).await? {
+        return Ok(());
+    }
     let hunks = db::list_hunks(pool, match_id).await?;
     let theirs_login = hunks
         .iter()
@@ -81,6 +84,17 @@ pub async fn record_round(
         .await?;
     }
     Ok(())
+}
+
+/// Record any stored winners that were never claimed (crash after the
+/// hunk write, before the leaderboard write). Write-once per round.
+pub async fn record_stored_winners(pool: &SqlitePool, match_id: &str, hunks: &[db::HunkRow]) {
+    for h in hunks {
+        let Some(winner) = h.winner.as_deref() else {
+            continue;
+        };
+        let _ = record_round(pool, match_id, h.round_index, winner, false).await;
+    }
 }
 
 pub async fn leaderboard_response(

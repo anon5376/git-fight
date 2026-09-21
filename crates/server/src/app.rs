@@ -167,6 +167,7 @@ impl AppState {
             if hunks.is_empty() || hunks.iter().any(|h| h.winner.is_none()) {
                 continue;
             }
+            crate::stats::record_stored_winners(&self.pool, &id, &hunks).await;
             let seed: u64 = row.seed.parse().unwrap_or(1);
             let last = u32::try_from(hunks.len().saturating_sub(1)).unwrap_or(0);
             let hash = room::hash_from_stored_round(&self.pool, &id, seed, &hunks, last).await;

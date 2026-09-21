@@ -130,6 +130,7 @@ async fn run_room(
     let id = row.id.clone();
     let mut done = matches!(row.status.as_str(), "finished" | "expired" | "aborted");
     if !done && scored_all {
+        crate::stats::record_stored_winners(&pool, &id, &hunks).await;
         let last = total_rounds.saturating_sub(1);
         let hash = hash_from_stored_round(&pool, &id, seed, &hunks, last).await;
         if db::finish_open_match(&pool, &id, &hash)
@@ -617,6 +618,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         }
         FinishAfterWrite::Proceed { record: false } => {
             *a.forfeit_pending = false;
+            let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
         }
         FinishAfterWrite::Close => {
             *a.forfeit_pending = false;

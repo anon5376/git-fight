@@ -119,6 +119,7 @@ async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
             theirs_hp INTEGER NOT NULL DEFAULT 100,
             theirs_armor INTEGER NOT NULL DEFAULT 0,
             theirs_special INTEGER NOT NULL DEFAULT 0,
+            stats_recorded INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (match_id, round_index),
             FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
@@ -132,10 +133,19 @@ async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
         ("theirs_hp", "INTEGER NOT NULL DEFAULT 100"),
         ("theirs_armor", "INTEGER NOT NULL DEFAULT 0"),
         ("theirs_special", "INTEGER NOT NULL DEFAULT 0"),
+        ("stats_recorded", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let q = format!("ALTER TABLE match_hunks ADD COLUMN {col} {ty}");
         let _ = sqlx::query(&q).execute(&mut *conn).await;
     }
+    // Already-scored rows from before this column were recorded in-process.
+    // Mark them so a resume cannot double-count. New winners stay 0 until claim.
+    let _ = sqlx::query(
+        "UPDATE match_hunks SET stats_recorded = 1
+         WHERE winner IS NOT NULL AND stats_recorded = 0",
+    )
+    .execute(&mut *conn)
+    .await;
     ensure_match_hunks_fk(conn).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -392,6 +402,7 @@ async fn ensure_match_hunks_fk(conn: &mut SqliteConnection) -> Result<(), sqlx::
             theirs_hp INTEGER NOT NULL DEFAULT 100,
             theirs_armor INTEGER NOT NULL DEFAULT 0,
             theirs_special INTEGER NOT NULL DEFAULT 0,
+            stats_recorded INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (match_id, round_index),
             FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
@@ -402,11 +413,13 @@ async fn ensure_match_hunks_fk(conn: &mut SqliteConnection) -> Result<(), sqlx::
         "INSERT INTO match_hunks_fk (
             match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
             theirs_login, theirs_name, winner,
-            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
+            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special,
+            stats_recorded
          )
          SELECT match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
             theirs_login, theirs_name, winner,
-            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
+            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special,
+            stats_recorded
          FROM match_hunks",
     )
     .execute(&mut *conn)
@@ -1024,6 +1037,29 @@ pub async fn set_hunk_winner(
     Ok(res.rows_affected() > 0)
 }
 
+/// Write-once: true if this open round still needed a leaderboard write.
+pub async fn claim_round_stats(
+    pool: &SqlitePool,
+    match_id: &str,
+    round: i64,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE match_hunks SET stats_recorded = 1
+         WHERE match_id = ? AND round_index = ? AND winner IS NOT NULL
+           AND stats_recorded = 0
+           AND EXISTS (
+             SELECT 1 FROM matches
+             WHERE id = match_hunks.match_id
+               AND status IN ('pending', 'in_progress')
+           )",
+    )
+    .bind(match_id)
+    .bind(round)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 pub struct HunkRow {
     pub round_index: i64,
     pub path: String,
@@ -1457,6 +1493,60 @@ mod tests {
             list_unpublished_results(&pool).await.unwrap(),
             vec!["won1".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn claim_round_stats_is_write_once_on_an_open_scored_hunk() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "st1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "st1",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!claim_round_stats(&pool, "st1", 0).await.unwrap());
+        assert!(set_hunk_winner(&pool, "st1", 0, "ours").await.unwrap());
+        assert!(claim_round_stats(&pool, "st1", 0).await.unwrap());
+        assert!(!claim_round_stats(&pool, "st1", 0).await.unwrap());
+        assert!(finish_open_match(&pool, "st1", "deadbeef").await.unwrap());
+        assert!(!claim_round_stats(&pool, "st1", 0).await.unwrap());
     }
 
     #[tokio::test]
