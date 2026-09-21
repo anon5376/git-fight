@@ -348,65 +348,76 @@ async fn run_room(
                                     }
                                 }
                                 JoinAdmit::Enter => {
-                                    let conn = Conn {
-                                        login,
-                                        token,
-                                        tx: tx.clone(),
-                                    };
-                                    let role = conn_role(&conn, &row, &hunks, round, github);
-                                    let confirmed = if next_tick == 0 {
-                                        -1
-                                    } else {
-                                        next_tick as i32 - 1
-                                    };
-                                    conns.insert(conn_id, conn);
-                                    refresh_slots(
-                                        &conns,
-                                        &row,
-                                        &hunks,
-                                        round,
-                                        github,
-                                        &mut ours,
-                                        &mut theirs,
-                                    );
-                                    if ours.seen && theirs.seen && started_at.is_none() {
-                                        match db::start_open_match(&pool, &id).await {
-                                            Ok(true) => started_at = Some(Instant::now()),
-                                            Ok(false) => {
-                                                send_closed(&tx, &pool, &id).await;
-                                                expire_now(
-                                                    &pool,
-                                                    &id,
-                                                    &conns,
-                                                    settings.result.as_ref(),
-                                                    &rooms,
-                                                )
-                                                .await;
-                                                done = true;
-                                            }
-                                            Err(_) => {}
-                                        }
-                                    }
-                                    if !done && replay_ok {
-                                        send_catch_up(
+                                    if !replay_ok {
+                                        // Withhold Hello until durable ticks
+                                        // replay. Canvas reconnects on close.
+                                        try_send_or_spawn(
                                             &tx,
-                                            &id,
-                                            seed,
-                                            delay,
-                                            role.as_str(),
-                                            conns
-                                                .get(&conn_id)
-                                                .and_then(|c| c.login.as_deref())
-                                                .unwrap_or(""),
-                                            &ours_name,
-                                            &theirs_name,
-                                            round,
-                                            total_rounds,
-                                            confirmed,
-                                            db::stats_for_round(&hunks, round),
-                                            &hunks,
-                                            &log,
+                                            encode(&ServerMsg::Error {
+                                                message: "preparing".into(),
+                                            }),
                                         );
+                                    } else {
+                                        let conn = Conn {
+                                            login,
+                                            token,
+                                            tx: tx.clone(),
+                                        };
+                                        let role = conn_role(&conn, &row, &hunks, round, github);
+                                        let confirmed = if next_tick == 0 {
+                                            -1
+                                        } else {
+                                            next_tick as i32 - 1
+                                        };
+                                        conns.insert(conn_id, conn);
+                                        refresh_slots(
+                                            &conns,
+                                            &row,
+                                            &hunks,
+                                            round,
+                                            github,
+                                            &mut ours,
+                                            &mut theirs,
+                                        );
+                                        if ours.seen && theirs.seen && started_at.is_none() {
+                                            match db::start_open_match(&pool, &id).await {
+                                                Ok(true) => started_at = Some(Instant::now()),
+                                                Ok(false) => {
+                                                    send_closed(&tx, &pool, &id).await;
+                                                    expire_now(
+                                                        &pool,
+                                                        &id,
+                                                        &conns,
+                                                        settings.result.as_ref(),
+                                                        &rooms,
+                                                    )
+                                                    .await;
+                                                    done = true;
+                                                }
+                                                Err(_) => {}
+                                            }
+                                        }
+                                        if !done {
+                                            send_catch_up(
+                                                &tx,
+                                                &id,
+                                                seed,
+                                                delay,
+                                                role.as_str(),
+                                                conns
+                                                    .get(&conn_id)
+                                                    .and_then(|c| c.login.as_deref())
+                                                    .unwrap_or(""),
+                                                &ours_name,
+                                                &theirs_name,
+                                                round,
+                                                total_rounds,
+                                                confirmed,
+                                                db::stats_for_round(&hunks, round),
+                                                &hunks,
+                                                &log,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1109,7 +1120,9 @@ pub(crate) async fn stored_round_hash(
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
     let mut log = Vec::new();
     let mut next = 0u32;
-    apply_input_log(&mut sim, &mut log, &mut next, &inputs);
+    if !apply_input_log(&mut sim, &mut log, &mut next, &inputs) {
+        return StoredHash::Unhashable;
+    }
     match hunks
         .iter()
         .find(|h| h.round_index == i64::from(round))
@@ -1171,16 +1184,21 @@ fn apply_input_log(
     log: &mut Vec<(u32, u8, u8)>,
     next_tick: &mut u32,
     inputs: &[(u32, u8, u8)],
-) {
+) -> bool {
     *next_tick = 0;
     log.clear();
     for (tick, ours, theirs) in inputs {
-        if *tick == *next_tick && sim.result.is_none() {
-            sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
-            log.push((*tick, *ours, *theirs));
-            *next_tick = next_tick.saturating_add(1);
+        if sim.result.is_some() {
+            break;
         }
+        if *tick != *next_tick {
+            return false;
+        }
+        sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
+        log.push((*tick, *ours, *theirs));
+        *next_tick = next_tick.saturating_add(1);
     }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1199,8 +1217,7 @@ async fn try_replay_round(
     };
     let (ours_stats, theirs_stats) = db::stats_for_round(hunks, round);
     *sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
-    apply_input_log(sim, log, next_tick, &inputs);
-    true
+    apply_input_log(sim, log, next_tick, &inputs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2104,6 +2121,20 @@ mod tests {
         assert_eq!(join_admit(MatchOpen::Open, false), JoinAdmit::Enter);
         assert_eq!(join_admit(MatchOpen::Open, true), JoinAdmit::ScoredAll);
         assert_eq!(join_admit(MatchOpen::Closed, false), JoinAdmit::Closed);
+        assert_eq!(join_replay_followup(true), "hello");
+        assert_eq!(
+            join_replay_followup(false),
+            "preparing",
+            "Join must not sit mute while match_inputs replay is still retrying"
+        );
+    }
+
+    fn join_replay_followup(replay_ok: bool) -> &'static str {
+        if replay_ok {
+            "hello"
+        } else {
+            "preparing"
+        }
     }
 
     #[tokio::test]
@@ -2395,9 +2426,96 @@ mod tests {
         let mut sim = FightState::new(1, FighterStats::default(), FighterStats::default());
         let mut log = Vec::new();
         let mut next = 0u32;
-        apply_input_log(&mut sim, &mut log, &mut next, &[(0, 1, 0), (1, 0, 2)]);
+        assert!(apply_input_log(
+            &mut sim,
+            &mut log,
+            &mut next,
+            &[(0, 1, 0), (1, 0, 2)]
+        ));
         assert_eq!(next, 2);
         assert_eq!(log, vec![(0, 1, 0), (1, 0, 2)]);
         assert_eq!(sim.tick, 2);
+    }
+
+    #[test]
+    fn apply_input_log_rejects_a_gap() {
+        let mut sim = FightState::new(1, FighterStats::default(), FighterStats::default());
+        let mut log = Vec::new();
+        let mut next = 0u32;
+        assert!(
+            !apply_input_log(&mut sim, &mut log, &mut next, &[(0, 1, 0), (2, 0, 2)]),
+            "a hole in match_inputs must not resume as if the later ticks were never stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_round_hash_is_unhashable_on_a_gapped_log() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "hfgap01hfgap01hfgap01hfgap01hf".into(),
+                seed: 11,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 60,
+                installation_id: None,
+                owner: String::new(),
+                repo: String::new(),
+                pr_number: 0,
+                pr_head_sha: String::new(),
+                pr_base_sha: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::insert_hunk(
+            &pool,
+            &crate::db::NewHunk {
+                match_id: "hfgap01hfgap01hfgap01hfgap01hf",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::insert_input(&pool, "hfgap01hfgap01hfgap01hfgap01hf", 0, 0, 1, 0)
+            .await
+            .unwrap();
+        crate::db::insert_input(&pool, "hfgap01hfgap01hfgap01hfgap01hf", 0, 2, 0, 2)
+            .await
+            .unwrap();
+        assert!(crate::db::set_hunk_winner(
+            &pool,
+            "hfgap01hfgap01hfgap01hfgap01hf",
+            0,
+            "ours",
+            true
+        )
+        .await
+        .unwrap());
+        let hunks = crate::db::list_hunks(&pool, "hfgap01hfgap01hfgap01hfgap01hf")
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_round_hash(&pool, "hfgap01hfgap01hfgap01hfgap01hf", 11, &hunks, 0).await,
+            StoredHash::Unhashable,
+            "a gapped log must not invent final_hash from the prefix"
+        );
     }
 }
