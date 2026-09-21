@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.pem
+.env
+.env.*
+!/.env.example
+data/
+node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
+crates/wasm/pkg/
+crates/wasm/target/
