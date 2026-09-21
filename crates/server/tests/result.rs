@@ -1225,6 +1225,34 @@ async fn transient_pull_failure_stays_unpublished() {
 }
 
 #[tokio::test]
+async fn junk_pull_sha_stays_unpublished() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks("HEAD", &base).await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    assert!(
+        git_fight_server::db::finish_open_match(&pool, MATCH_ID, "deadbeef")
+            .await
+            .unwrap()
+    );
+    let ctx = ctx(pool.clone(), &mock, bare);
+    let err = git_fight_server::publish_result(&ctx, MATCH_ID).await;
+    assert_eq!(err, Err("pull".into()));
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none(), "{row:?}");
+    assert!(row.abort_reason.is_none(), "{row:?}");
+    assert_eq!(
+        git_fight_server::db::list_unpublished_results(&pool)
+            .await
+            .unwrap(),
+        vec![MATCH_ID.to_string()]
+    );
+}
+
+#[tokio::test]
 async fn gone_pr_is_a_decision_skip() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = MockServer::start().await;

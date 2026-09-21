@@ -526,6 +526,11 @@ pub async fn insert_input(
     ours: u8,
     theirs: u8,
 ) -> Result<(), sqlx::Error> {
+    if round >= crate::limits::MAX_HUNKS as u32
+        || tick > git_fight_core::ROUND_TICKS + crate::protocol::INPUT_WINDOW
+    {
+        return Ok(());
+    }
     sqlx::query(
         "INSERT OR IGNORE INTO match_inputs (match_id, round_index, tick, ours, theirs)
          SELECT ?, ?, ?, ?, ?
@@ -1063,12 +1068,14 @@ pub fn clip_comment_text(s: &str) -> String {
         if out.chars().count() >= MAX {
             break;
         }
-        let keep = c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '/' | '…');
-        out.push(if keep { c } else { '_' });
+        // `_` is GFM emphasis. Map junk (including `*` / `_`) to `-` so
+        // `**bold**` cannot become `__bold__` in the bot's comment.
+        let keep = c.is_alphanumeric() || matches!(c, ' ' | '-' | '.' | '/' | '…');
+        out.push(if keep { c } else { '-' });
     }
     let t = out.trim();
     if t.is_empty() {
-        "_".into()
+        "-".into()
     } else {
         break_www_autolink(t)
     }
@@ -1088,7 +1095,7 @@ fn break_www_autolink(s: &str) -> String {
             out.push(chars[i]);
             out.push(chars[i + 1]);
             out.push(chars[i + 2]);
-            out.push('_');
+            out.push('-');
             i += 4;
         } else {
             out.push(chars[i]);
@@ -1766,11 +1773,14 @@ mod tests {
         assert!(!hostile.contains('@'), "{hostile}");
         assert!(!hostile.contains(':'), "{hostile}");
         assert!(!hostile.contains("://"), "{hostile}");
-        assert_eq!(clip_comment_text("   "), "_");
+        let stars = clip_comment_text("**bold**");
+        assert!(!stars.contains('*'), "{stars}");
+        assert!(!stars.contains('_'), "{stars}");
+        assert_eq!(clip_comment_text("   "), "-");
         assert_eq!(clip_comment_text(&"a".repeat(200)).chars().count(), 160);
         let www = clip_comment_text("www.evil.example/x.rs");
         assert!(!www.contains("www."), "{www}");
-        assert!(www.contains("www_"), "{www}");
+        assert!(www.contains("www-"), "{www}");
     }
 
     #[tokio::test]
@@ -2229,5 +2239,23 @@ mod tests {
         assert!(try_hunk(&pool, 0, "../x.rs", 0).await.is_err());
         assert!(try_hunk(&pool, 0, "-opt.rs", 0).await.is_err());
         try_hunk(&pool, 0, "lib.rs", 0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_input_ignores_out_of_range_ticks() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        insert_input(&pool, "m1", 0, 0, 1, 2).await.unwrap();
+        insert_input(&pool, "m1", crate::limits::MAX_HUNKS as u32, 0, 1, 2)
+            .await
+            .unwrap();
+        insert_input(&pool, "m1", 0, u32::MAX, 1, 2).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM match_inputs WHERE match_id = 'm1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

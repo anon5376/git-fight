@@ -95,7 +95,7 @@ async fn run_room(
     let mut round: u32 = hunks
         .iter()
         .find(|h| h.winner.is_none())
-        .map(|h| h.round_index as u32)
+        .and_then(|h| u32::try_from(h.round_index).ok())
         .unwrap_or(0)
         .min(total_rounds.saturating_sub(1));
     let (ours_stats, theirs_stats) = db::stats_for_round(&hunks, round);

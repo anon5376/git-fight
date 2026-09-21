@@ -78,8 +78,8 @@ async fn poll_mergeable_gives_up_with_none() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "number": 1,
             "mergeable": null,
-            "head": { "sha": "aaa", "ref": "pr" },
-            "base": { "sha": "bbb", "ref": "main" },
+            "head": { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ref": "pr" },
+            "base": { "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ref": "main" },
             "user": { "login": "alice" }
         })))
         .mount(&mock)
@@ -95,6 +95,35 @@ async fn poll_mergeable_gives_up_with_none() {
         .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/repos/acme/box/pulls/1")
         .count();
     assert_eq!(pulls, 8, "short cap is eight mergeable polls");
+}
+
+#[tokio::test]
+async fn get_pull_rejects_short_shas() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/pulls/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 1,
+            "mergeable": false,
+            "head": { "sha": "HEAD", "ref": "pr" },
+            "base": { "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ref": "main" },
+            "user": { "login": "alice" }
+        })))
+        .mount(&mock)
+        .await;
+    let err = client(&mock)
+        .get_pull(1, "acme", "box", 1)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "pull sha");
 }
 
 #[test]

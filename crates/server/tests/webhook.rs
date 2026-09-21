@@ -2158,6 +2158,40 @@ async fn pr_synchronize_same_sha_does_not_comment() {
 }
 
 #[tokio::test]
+async fn pr_synchronize_junk_sha_does_not_abort() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-fight-junk", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    let id = match_id_from(&comments);
+    assert_eq!(
+        post_signed(
+            addr,
+            "pull_request",
+            "deliv-sync-junk",
+            &pr_event_body("synchronize", "HEAD", &base)
+        )
+        .await,
+        200
+    );
+    let patched = settle_patched(&mock).await;
+    assert!(
+        patched.iter().all(|c| !c.contains("outdated")),
+        "{patched:?}"
+    );
+    let row = git_fight_server::db::get_match(&pool, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "pending");
+    assert!(row.abort_reason.is_none(), "{row:?}");
+}
+
+#[tokio::test]
 async fn pr_synchronize_moved_sha_comments_once() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;

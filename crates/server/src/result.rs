@@ -222,6 +222,9 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
                     return retry_later("pull");
                 }
             };
+            if !gitutil::is_github_sha(&pr.head.sha) || !gitutil::is_github_sha(&pr.base.sha) {
+                return retry_later("pull");
+            }
             if !pr.head.sha.eq_ignore_ascii_case(&row.pr_head_sha)
                 || !pr.base.sha.eq_ignore_ascii_case(&row.pr_base_sha)
             {

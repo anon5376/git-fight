@@ -169,7 +169,7 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
         .head
         .as_ref()
         .map(|s| s.sha.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| crate::gitutil::is_github_sha(s))
     else {
         return;
     };
@@ -177,7 +177,7 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
         .base
         .as_ref()
         .map(|s| s.sha.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| crate::gitutil::is_github_sha(s))
     else {
         return;
     };

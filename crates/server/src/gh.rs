@@ -218,9 +218,15 @@ impl GitHub {
         if !res.status().is_success() {
             return Err(format!("pull {}", res.status()));
         }
-        json_capped(res, MAX_API_JSON)
+        let pr: PullInfo = json_capped(res, MAX_API_JSON)
             .await
-            .ok_or_else(|| "pull json".into())
+            .ok_or_else(|| "pull json".to_string())?;
+        if !crate::gitutil::is_github_sha(&pr.head.sha)
+            || !crate::gitutil::is_github_sha(&pr.base.sha)
+        {
+            return Err("pull sha".into());
+        }
+        Ok(pr)
     }
 
     pub async fn poll_mergeable(
