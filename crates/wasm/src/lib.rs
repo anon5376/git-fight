@@ -122,7 +122,7 @@ impl WasmFight {
             .step(Input::from_u8(ours), Input::from_u8(theirs));
     }
 
-    pub fn cpu_input(&mut self, side: u8) -> u8 {
+    pub fn cpu_input(&self, side: u8) -> u8 {
         self.state.cpu_input(Side::from_u8(side)).as_u8()
     }
 

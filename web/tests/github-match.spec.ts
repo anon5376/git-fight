@@ -64,6 +64,7 @@ test("github session match plays two CPU rounds in the browser", async ({ contex
   const wait = page.getByTestId("wait");
   const resolved = page.getByTestId("resolved");
   await expect(stage).toBeVisible();
+  await expect(stage).toHaveAttribute("data-round", /1\/2/, { timeout: 10_000 });
   await expect(wait).not.toContainText(/spectating/i);
 
   await stage.click();
