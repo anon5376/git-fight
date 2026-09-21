@@ -517,7 +517,8 @@ async fn live_match_vs_cpu_pushes_after_last_round() {
     if let Some(b) = branch {
         assert!(b.starts_with("git-fight/pr-1-"), "{b}");
         assert!(heads(&bare).iter().any(|r| r.ends_with(&b)));
-        assert!(!heads(&bare).iter().any(|r| r.ends_with("refs/heads/pr")));
+        assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
+        assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
     }
 }
 
