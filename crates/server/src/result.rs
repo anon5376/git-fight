@@ -159,16 +159,31 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         }
     }
 
-    let _permit = crate::limits::git_slots()
-        .acquire()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let branch = gitutil::result_ref(row.pr_number, &row.id).map_err(|e| e.to_string())?;
-    let work = tempfile::Builder::new()
+    let branch = match gitutil::result_ref(row.pr_number, &row.id) {
+        Ok(b) => b,
+        Err(_) => {
+            return skip_push(
+                ctx,
+                &row,
+                match_id,
+                "push",
+                format!(
+                    "git fight: nothing pushed — could not name the result branch. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                    ctx.public_url.trim_end_matches('/')
+                ),
+            )
+            .await;
+        }
+    };
+    let work = match tempfile::Builder::new()
         .prefix("git-fight-result-")
         .tempdir()
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(w) => w,
+        Err(_) => {
+            return skip_clone(ctx, &row, match_id).await;
+        }
+    };
     let dest = work.path().join("repo.git");
     let key = format!("{}/{}", row.owner, row.repo);
     let (url, bearer) = if let Some(local) = ctx.test_repos.get(&key) {
@@ -188,34 +203,31 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             )
             .await;
         }
-        let inst = row
-            .installation_id
-            .ok_or_else(|| "missing installation".to_string())? as u64;
-        let gh = ctx
-            .gh
-            .as_ref()
-            .ok_or_else(|| "missing github".to_string())?;
-        let token = gh.installation_token(inst).await?;
+        let Some(inst) = row.installation_id.map(|i| i as u64) else {
+            return skip_clone(ctx, &row, match_id).await;
+        };
+        let Some(gh) = ctx.gh.as_ref() else {
+            return skip_clone(ctx, &row, match_id).await;
+        };
+        let token = match gh.installation_token(inst).await {
+            Ok(t) => t,
+            Err(_) => return skip_clone(ctx, &row, match_id).await,
+        };
         (
             format!("https://github.com/{}/{}.git", row.owner, row.repo),
             Some(token),
         )
     };
+    // Clone/merge-tree/push only. Token fetch is HTTP and must not take a slot.
+    let _permit = match crate::limits::git_slots().acquire().await {
+        Ok(p) => p,
+        Err(_) => return skip_clone(ctx, &row, match_id).await,
+    };
     if gitutil::clone_bare(&url, &dest, bearer.as_deref())
         .await
         .is_err()
     {
-        return skip_push(
-            ctx,
-            &row,
-            match_id,
-            "clone",
-            format!(
-                "git fight: nothing pushed — could not clone to write the result branch. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
-                ctx.public_url.trim_end_matches('/')
-            ),
-        )
-        .await;
+        return skip_clone(ctx, &row, match_id).await;
     }
     if gitutil::fetch_pr_objects(
         &dest,
@@ -405,6 +417,20 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     );
     comment(ctx, &row, &body).await;
     Ok(())
+}
+
+async fn skip_clone(ctx: &ResultCtx, row: &MatchRow, match_id: &str) -> Result<(), String> {
+    skip_push(
+        ctx,
+        row,
+        match_id,
+        "clone",
+        format!(
+            "git fight: nothing pushed — could not clone to write the result branch. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+            ctx.public_url.trim_end_matches('/')
+        ),
+    )
+    .await
 }
 
 async fn skip_push(

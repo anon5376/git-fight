@@ -145,13 +145,6 @@ pub async fn start_challenge(
         Err(e) => return Err(e.to_string()),
     }
 
-    // Clone/merge-tree/push only. Mergeable polling is HTTP and must not
-    // occupy a git worker, or a second /fight waits instead of seeing this row.
-    let _permit = match crate::limits::git_slots().acquire().await {
-        Ok(p) => p,
-        Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
-    };
-
     let work = match tempfile::Builder::new().prefix("git-fight-").tempdir() {
         Ok(w) => w,
         Err(_) => {
@@ -163,11 +156,21 @@ pub async fn start_challenge(
     let (url, bearer) = if let Some(local) = ctx.test_repos.get(&key) {
         (format!("file://{}", local.display()), None)
     } else {
-        let token = ctx.gh.installation_token(installation_id).await?;
+        // HTTP. Must not `?` after insert: that would leave a pending row.
+        let token = match ctx.gh.installation_token(installation_id).await {
+            Ok(t) => t,
+            Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
+        };
         (
             format!("https://github.com/{owner}/{repo}.git"),
             Some(token),
         )
+    };
+    // Clone/merge-tree/push only. Token fetch is HTTP and must not occupy a
+    // git worker, or a second /fight waits instead of seeing this row.
+    let _permit = match crate::limits::git_slots().acquire().await {
+        Ok(p) => p,
+        Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
     };
     if gitutil::clone_bare(&url, &dest, bearer.as_deref())
         .await
