@@ -30,6 +30,13 @@ fn note(body: impl Into<String>) -> ChallengeStart {
     }
 }
 
+fn silent() -> ChallengeStart {
+    ChallengeStart {
+        body: String::new(),
+        match_id: None,
+    }
+}
+
 fn already_open_note(ctx: &ChallengeCtx, id: &str) -> ChallengeStart {
     note(format!(
         "a fight is already open: {}/match/{id}",
@@ -53,8 +60,13 @@ async fn already_open_now(
 }
 
 async fn abort_start(pool: &SqlitePool, id: &str, reason: &str, body: String) -> ChallengeStart {
-    let _ = db::abort_open_match(pool, id, reason).await;
-    note(body)
+    if db::abort_open_match(pool, id, reason)
+        .await
+        .unwrap_or(false)
+    {
+        return note(body);
+    }
+    silent()
 }
 
 async fn abort_start_quiet(pool: &SqlitePool, id: &str, reason: &str) -> ChallengeStart {
@@ -295,6 +307,9 @@ pub async fn start_challenge(
     };
 
     let (hunks, stats) = prepared;
+    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
+        return Ok(silent());
+    }
     let mut login_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut sides: Vec<(String, String, Option<String>)> = Vec::new();
     for h in &hunks {
@@ -366,6 +381,9 @@ pub async fn start_challenge(
         format!("{ours_login} vs {theirs_name}")
     };
     let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
+    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
+        return Ok(silent());
+    }
     Ok(ChallengeStart {
         body: format!(
             "git fight: {vs}. {rounds} round{}. {link}",
@@ -448,5 +466,35 @@ mod tests {
         assert!(is_bot_user(Some("Bot"), Some("git-fight[bot]")));
         assert!(is_bot_user(Some("User"), Some("foo[bot]")));
         assert!(!is_bot_user(Some("User"), Some("alice")));
+    }
+
+    #[tokio::test]
+    async fn abort_start_comments_when_it_owns_the_row() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        let start = abort_start(&pool, "m1", "clone", "git fight could not start".into()).await;
+        assert_eq!(start.body, "git fight could not start");
+        let row = crate::db::get_match(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        assert_eq!(row.abort_reason.as_deref(), Some("clone"));
+    }
+
+    #[tokio::test]
+    async fn abort_start_is_silent_when_the_row_is_already_closed() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(crate::db::abort_open_match(&pool, "m1", "outdated")
+            .await
+            .unwrap());
+        let start = abort_start(&pool, "m1", "clone", "git fight could not start".into()).await;
+        assert!(start.body.is_empty());
+        assert!(start.match_id.is_none());
+        let row = crate::db::get_match(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
     }
 }

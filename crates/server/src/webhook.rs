@@ -248,6 +248,9 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
                 match_id: None,
             },
         };
+        if start.body.is_empty() {
+            return;
+        }
         let posted = ctx
             .gh
             .comment(inst, &owner, &name, number, &start.body)

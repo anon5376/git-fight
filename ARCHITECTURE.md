@@ -151,7 +151,7 @@ Map commit author emails to GitHub logins through the commits API. Same person o
 
 ### 6. Challenge comment
 
-Insert the match (status `pending`, `expires_at` = now + 24 hours, random seed, stored hunks). Comment who is fighting, how many rounds, and `https://<public-host>/match/<id>`.
+Insert the match (status `pending`, `expires_at` = now + 24 hours, random seed, stored hunks). Comment who is fighting, how many rounds, and `https://<public-host>/match/<id>`. If that row is aborted or expired before clone finishes (PR moved, 24h), do not post a fight link or a second “could not start”.
 
 ### 7. Play
 
