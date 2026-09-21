@@ -338,6 +338,11 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       hunkIndex = hello.hunk_index ?? 0;
       youAre = hello.you_are ?? "";
       nextSend = Math.max(0, confirmed + 1);
+      // A leftover key from the previous KO must not confirm on the new
+      // round. The server drops Input with the old Hello `round`; held
+      // buttons would be sent with the new one.
+      held = 0;
+      heldTheirs = 0;
       finished = false;
       preparing = false;
       reconnectAttempts = 0;
@@ -401,6 +406,9 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       showKo(ui.ko, end.result);
       if (matchOver) {
         finished = true;
+      } else {
+        held = 0;
+        heldTheirs = 0;
       }
       if (fight && end.tick === fight.tick() && !hashesMatch(fight, end.hash_hi, end.hash_lo)) {
         ui.resolved.textContent = "desync — server result stands";
