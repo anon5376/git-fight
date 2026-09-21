@@ -660,11 +660,27 @@ pub fn is_safe_github_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// GitHub logins are case-insensitive. Store one spelling so a fighter
-/// cannot be locked out of their slot or split on the leaderboard.
+/// GitHub logins, owners, and repos are case-insensitive. Store one spelling
+/// so a fighter cannot be locked out, a second `/fight` cannot bypass the
+/// one-open-match slot, and the leaderboard cannot split.
 pub fn normalize_github_login(s: &str) -> Option<String> {
     let t = s.trim();
     is_safe_github_name(t).then(|| t.to_ascii_lowercase())
+}
+
+/// Fold an owner, repo, or login for storage. Empty stays empty (local demo).
+pub fn fold_github_name(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    normalize_github_login(t).unwrap_or_else(|| t.to_ascii_lowercase())
+}
+
+pub fn fold_github_login_opt(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(fold_github_name)
 }
 
 pub fn same_github_login(a: Option<&str>, b: Option<&str>) -> bool {
@@ -807,6 +823,9 @@ mod tests {
         assert!(!same_github_login(Some("alice"), Some("bob")));
         assert!(!same_github_login(Some("alice"), Some("")));
         assert!(!same_github_login(None, Some("alice")));
+        assert_eq!(fold_github_name("Acme"), "acme");
+        assert_eq!(fold_github_name(""), "");
+        assert_eq!(fold_github_login_opt(Some("BOB")).as_deref(), Some("bob"));
     }
 
     #[test]

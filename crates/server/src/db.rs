@@ -87,9 +87,14 @@ async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE matches ADD COLUMN challenge_comment_id INTEGER")
         .execute(&mut *conn)
         .await;
+    // GitHub owner/repo are case-insensitive. Recreate so a casing change
+    // cannot open a second fight on the same PR.
+    sqlx::query("DROP INDEX IF EXISTS matches_one_open_per_pr")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS matches_one_open_per_pr
-         ON matches(owner, repo, pr_number)
+         ON matches(owner COLLATE NOCASE, repo COLLATE NOCASE, pr_number)
          WHERE status IN ('pending', 'in_progress') AND pr_number > 0 AND owner != ''",
     )
     .execute(&mut *conn)
@@ -697,6 +702,10 @@ pub struct NewMatch {
 pub async fn insert_full_match(pool: &SqlitePool, m: &NewMatch) -> Result<(), sqlx::Error> {
     let now = Utc::now();
     let expires = now + Duration::seconds(m.expire_secs);
+    let owner = crate::gh::fold_github_name(&m.owner);
+    let repo = crate::gh::fold_github_name(&m.repo);
+    let ours_login = crate::gh::fold_github_login_opt(m.ours_login.as_deref());
+    let theirs_login = crate::gh::fold_github_login_opt(m.theirs_login.as_deref());
     sqlx::query(
         "INSERT INTO matches (
             id, installation_id, owner, repo, pr_number, pr_head_sha, pr_base_sha,
@@ -707,14 +716,14 @@ pub async fn insert_full_match(pool: &SqlitePool, m: &NewMatch) -> Result<(), sq
     )
     .bind(&m.id)
     .bind(m.installation_id)
-    .bind(&m.owner)
-    .bind(&m.repo)
+    .bind(owner)
+    .bind(repo)
     .bind(m.pr_number)
     .bind(&m.pr_head_sha)
     .bind(&m.pr_base_sha)
     .bind(m.seed.to_string())
-    .bind(&m.ours_login)
-    .bind(&m.theirs_login)
+    .bind(ours_login)
+    .bind(theirs_login)
     .bind(&m.ours_name)
     .bind(&m.theirs_name)
     .bind(&m.ours_kind)
@@ -744,6 +753,7 @@ pub async fn update_match_fighters(
     theirs_name: &str,
     theirs_login: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    let theirs_login = crate::gh::fold_github_login_opt(theirs_login);
     sqlx::query(
         "UPDATE matches SET ours_kind = ?, theirs_kind = ?, theirs_name = ?, theirs_login = ?
          WHERE id = ?",
@@ -776,6 +786,7 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     // Result rebuilds from merge-tree + picks. Do not keep 1 MiB conflict
     // blobs in SQLite (hostile repo disk, and unused at resolve time).
     let _ = (h.ours, h.theirs, h.base);
+    let theirs_login = crate::gh::fold_github_login_opt(h.theirs_login);
     sqlx::query(
         "INSERT INTO match_hunks (
             match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
@@ -790,7 +801,7 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     .bind(&[] as &[u8])
     .bind(&[] as &[u8])
     .bind(&[] as &[u8])
-    .bind(h.theirs_login)
+    .bind(theirs_login)
     .bind(h.theirs_name)
     .bind(i64::from(h.ours_stats.hp))
     .bind(h.ours_stats.armor as i64)
@@ -809,8 +820,10 @@ pub async fn open_match_for_pr(
     repo: &str,
     pr: u64,
 ) -> Result<Option<MatchRow>, sqlx::Error> {
+    let owner = crate::gh::fold_github_name(owner);
+    let repo = crate::gh::fold_github_name(repo);
     sqlx::query_as::<_, MatchRow>(&format!(
-        "SELECT {MATCH_COLS} FROM matches WHERE owner = ? AND repo = ? AND pr_number = ?
+        "SELECT {MATCH_COLS} FROM matches WHERE owner = ? COLLATE NOCASE AND repo = ? COLLATE NOCASE AND pr_number = ?
          AND status IN ('pending', 'in_progress') LIMIT 1"
     ))
     .bind(owner)
@@ -844,8 +857,10 @@ pub async fn count_recent_matches_for_pr(
     within_secs: i64,
 ) -> Result<i64, sqlx::Error> {
     let cutoff = (Utc::now() - Duration::seconds(within_secs)).to_rfc3339();
+    let owner = crate::gh::fold_github_name(owner);
+    let repo = crate::gh::fold_github_name(repo);
     sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM matches WHERE owner = ? AND repo = ? AND pr_number = ? AND created_at >= ?",
+        "SELECT COUNT(*) FROM matches WHERE owner = ? COLLATE NOCASE AND repo = ? COLLATE NOCASE AND pr_number = ? AND created_at >= ?",
     )
     .bind(owner)
     .bind(repo)
@@ -1056,6 +1071,8 @@ pub async fn add_player_stats(
 ) -> Result<(), sqlx::Error> {
     let login = crate::gh::normalize_github_login(&stat.github_login)
         .unwrap_or_else(|| stat.github_login.trim().to_ascii_lowercase());
+    let owner = crate::gh::fold_github_name(owner);
+    let repo = crate::gh::fold_github_name(repo);
     sqlx::query(
         "INSERT INTO player_stats (owner, repo, github_login, wins, losses, kos, conflicts_caused)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1082,10 +1099,12 @@ pub async fn list_player_stats(
     owner: &str,
     repo: &str,
 ) -> Result<Vec<PlayerStat>, sqlx::Error> {
+    let owner = crate::gh::fold_github_name(owner);
+    let repo = crate::gh::fold_github_name(repo);
     let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
         "SELECT github_login, wins, losses, kos, conflicts_caused
          FROM player_stats
-         WHERE owner = ? AND repo = ?
+         WHERE owner = ? COLLATE NOCASE AND repo = ? COLLATE NOCASE
          ORDER BY wins DESC, kos DESC, conflicts_caused DESC, github_login COLLATE NOCASE ASC",
     )
     .bind(owner)
@@ -1112,10 +1131,12 @@ pub async fn get_player_stats(
     repo: &str,
     login: &str,
 ) -> Result<PlayerStat, sqlx::Error> {
+    let owner = crate::gh::fold_github_name(owner);
+    let repo = crate::gh::fold_github_name(repo);
     let row = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
         "SELECT github_login, wins, losses, kos, conflicts_caused
          FROM player_stats
-         WHERE owner = ? AND repo = ? AND github_login = ? COLLATE NOCASE",
+         WHERE owner = ? COLLATE NOCASE AND repo = ? COLLATE NOCASE AND github_login = ? COLLATE NOCASE",
     )
     .bind(owner)
     .bind(repo)
@@ -1519,6 +1540,79 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(open.id, "open2");
+    }
+
+    #[tokio::test]
+    async fn owner_repo_case_is_one_open_pr() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let mut m = NewMatch {
+            id: "case1".into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "a".into(),
+            theirs_name: "b".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: Some("Alice".into()),
+            theirs_login: None,
+            ours_token: "o".into(),
+            theirs_token: "t".into(),
+            expire_secs: 3600,
+            installation_id: Some(1),
+            owner: "Acme".into(),
+            repo: "Box".into(),
+            pr_number: 1,
+            pr_head_sha: "h".into(),
+            pr_base_sha: "b".into(),
+        };
+        insert_full_match(&pool, &m).await.unwrap();
+        let stored = get_match(&pool, "case1").await.unwrap().unwrap();
+        assert_eq!(stored.owner, "acme");
+        assert_eq!(stored.repo, "box");
+        assert_eq!(stored.ours_login.as_deref(), Some("alice"));
+        assert_eq!(
+            open_match_for_pr(&pool, "ACME", "BOX", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "case1"
+        );
+        m.id = "case2".into();
+        m.owner = "acme".into();
+        m.repo = "box".into();
+        let err = insert_full_match(&pool, &m).await.unwrap_err();
+        assert!(is_unique_violation(&err), "{err}");
+        assert_eq!(
+            count_recent_matches_for_pr(&pool, "Acme", "BOX", 1, 3600)
+                .await
+                .unwrap(),
+            1
+        );
+        add_player_stats(
+            &pool,
+            "ACME",
+            "Box",
+            &PlayerStat {
+                github_login: "alice".into(),
+                wins: 1,
+                losses: 0,
+                kos: 0,
+                conflicts_caused: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let board = list_player_stats(&pool, "acme", "box").await.unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].wins, 1);
+        assert_eq!(
+            get_player_stats(&pool, "Acme", "BOX", "ALICE")
+                .await
+                .unwrap()
+                .wins,
+            1
+        );
     }
 
     #[tokio::test]

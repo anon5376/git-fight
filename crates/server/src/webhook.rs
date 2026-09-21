@@ -232,8 +232,8 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         test_repos: state.test_repos.clone(),
         expire_secs: state.config.expire_secs,
     };
-    let owner = repo.owner.login.clone();
-    let name = repo.name.clone();
+    let owner = crate::gh::fold_github_name(&repo.owner.login);
+    let name = crate::gh::fold_github_name(&repo.name);
     if !crate::gh::is_safe_github_name(&owner) || !crate::gh::is_safe_github_name(&name) {
         return HttpStatus::OK;
     }

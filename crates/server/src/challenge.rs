@@ -83,14 +83,16 @@ pub async fn start_challenge(
     if !crate::gh::is_safe_github_name(owner) || !crate::gh::is_safe_github_name(repo) {
         return Ok(note("git fight could not start: invalid repository"));
     }
-    if let Some(existing) = db::open_match_for_pr(&ctx.pool, owner, repo, number)
+    let owner = crate::gh::fold_github_name(owner);
+    let repo = crate::gh::fold_github_name(repo);
+    if let Some(existing) = db::open_match_for_pr(&ctx.pool, &owner, &repo, number)
         .await
         .map_err(|e| e.to_string())?
     {
         return Ok(already_open_note(ctx, &existing.id));
     }
 
-    let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, owner, repo, number, 3600)
+    let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, &owner, &repo, number, 3600)
         .await
         .map_err(|e| e.to_string())?;
     if recent_pr >= crate::limits::MAX_MATCHES_PER_PR_HOUR {
@@ -104,7 +106,7 @@ pub async fn start_challenge(
         return Ok(note("too many fights from this installation; try later"));
     }
 
-    let repo_info = ctx.gh.get_repo(installation_id, owner, repo).await?;
+    let repo_info = ctx.gh.get_repo(installation_id, &owner, &repo).await?;
     if repo_info.size > MAX_REPO_KB {
         return Ok(note(
             "this repo is over 1 GB, so git fight will not clone it",
@@ -113,7 +115,7 @@ pub async fn start_challenge(
 
     let pr = ctx
         .gh
-        .poll_mergeable(installation_id, owner, repo, number)
+        .poll_mergeable(installation_id, &owner, &repo, number)
         .await?;
     match pr.mergeable {
         Some(true) => return Ok(note("no conflicts to fight")),
@@ -150,8 +152,8 @@ pub async fn start_challenge(
             theirs_token: String::new(),
             expire_secs: ctx.expire_secs,
             installation_id: Some(installation_id as i64),
-            owner: owner.into(),
-            repo: repo.into(),
+            owner: owner.clone(),
+            repo: repo.clone(),
             pr_number: number as i64,
             pr_head_sha: pr.head.sha.clone(),
             pr_base_sha: pr.base.sha.clone(),
@@ -161,7 +163,7 @@ pub async fn start_challenge(
     {
         Ok(()) => {}
         Err(e) if db::is_unique_violation(&e) => {
-            return already_open_now(ctx, owner, repo, number).await;
+            return already_open_now(ctx, &owner, &repo, number).await;
         }
         Err(e) => return Err(e.to_string()),
     }
@@ -322,8 +324,8 @@ pub async fn start_challenge(
         let login = blame_login(
             &ctx.gh,
             installation_id,
-            owner,
-            repo,
+            &owner,
+            &repo,
             &h.blame_sha,
             &h.blame_email,
             &mut login_cache,

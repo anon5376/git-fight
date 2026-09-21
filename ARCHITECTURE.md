@@ -244,7 +244,7 @@ SQLite via sqlx. Migrations run at server start on a single connection. No secre
 |---|---|---|
 | `id` | `TEXT` PK | URL- and ref-safe (lowercase hex). Used in `/match/<id>` and `git-fight/pr-<n>-<id>`. |
 | `installation_id` | `INTEGER` | GitHub installation. |
-| `owner`, `repo` | `TEXT` | |
+| `owner`, `repo` | `TEXT` | Stored lowercase. GitHub owner/repo are case-insensitive. The one-open-match index compares them without case. |
 | `pr_number` | `INTEGER` | |
 | `pr_head_sha`, `pr_base_sha` | `TEXT` | Frozen at challenge time. |
 | `seed` | `TEXT` | `u64` decimal. |
@@ -304,7 +304,7 @@ No GitHub access tokens here. Login exchanges the OAuth `code`, calls `GET /user
 
 Milestone 6. Per repo, per login: `wins`, `losses`, `kos`, `conflicts_caused`. `conflicts_caused` increments for the base-side blamed author of each fought hunk.
 
-Primary key `(owner, repo, github_login)`. Logins are stored lowercase so `Alice` and `alice` are one row.
+Primary key `(owner, repo, github_login)`. Owner, repo, and login are stored lowercase so `Acme/Box` / `Alice` and `acme/box` / `alice` are one row.
 
 ### `webhook_deliveries`
 
@@ -350,7 +350,7 @@ Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like 
 
 A spectator (or a stranger who found the match URL) sends `Input` for a fighter slot, or spoofs a query param `role=ours`.
 
-**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. GitHub logins are compared case-insensitively and stored lowercase so a fighter cannot be locked out of their slot or split on the leaderboard. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped **before** they enter the room event queue, so a spectator flood cannot fill the 512-slot channel and stall fighter confirm or Leave. Spectator `Join` is `try_send` (full = reject); spectator `Leave` does not block the read task. Fighter `Input` is `try_send` (late = idle). CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
+**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. GitHub logins, owners, and repos are compared case-insensitively and stored lowercase so a fighter cannot be locked out of their slot or split on the leaderboard, and a second `/fight` cannot bypass the one-open-match slot by changing case. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped **before** they enter the room event queue, so a spectator flood cannot fill the 512-slot channel and stall fighter confirm or Leave. Spectator `Join` is `try_send` (full = reject); spectator `Leave` does not block the read task. Fighter `Input` is `try_send` (late = idle). CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
 
 ### Hostile repos
 
@@ -367,7 +367,7 @@ A repo can be huge, contain symlink farms, `.git` path tricks, enormous blobs, o
 
 `/fight` in a loop, or a bot that replies to itself, burns clone quota and floods the PR.
 
-**Mitigation:** Ignore this app's own comments and `sender.type == Bot` unless we have a specific allow-list (we do not). One active `pending`/`in_progress` match per PR; extra `/fight` gets the existing link. Per-PR and per-installation rate limits on starting matches. `auto_challenge` defaults off. Webhook delivery dedup. Clone/size/hunk limits still apply.
+**Mitigation:** Ignore this app's own comments and `sender.type == Bot` unless we have a specific allow-list (we do not). One active `pending`/`in_progress` match per PR; extra `/fight` gets the existing link. Owner/repo casing cannot open a second slot or reset the per-PR rate limit. Per-PR and per-installation rate limits on starting matches. `auto_challenge` defaults off. Webhook delivery dedup. Clone/size/hunk limits still apply.
 
 ## Milestone map
 
