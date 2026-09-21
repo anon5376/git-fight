@@ -185,7 +185,7 @@ A match is one room: seed, two fighter slots, any number of spectators, current 
 On WebSocket connect the server reads the session, then sends:
 
 ```text
-Hello { match_id, seed, input_delay, your_role, ours, theirs, round, confirmed_tick, you_are }
+Hello { match_id, seed, input_delay, your_role, ours, theirs, round, confirmed_tick, you_are, path, hunk_index }
 ```
 
 `your_role` is `ours`, `theirs`, `both` (mirror), or `spectator`. Spectators never have a fighter slot.
@@ -216,7 +216,7 @@ The server confirms tick `n` when both slots have an input for `n`, or when the 
 Tick { n, ours, theirs }
 ```
 
-to every client, including spectators. Everyone, server included, applies those two inputs and steps one tick. After the step the server records `(n, ours, theirs)` in `match_inputs` and may send `Hash { n, state_hash }` so a desynced client can see it is wrong. After Hello, the server sends `Snapshot { round, seed, confirmed_tick, stats, ticks }` with the confirmed input log for the current round so a joiner or reconnect can catch up in one message. A desynced client does not get to overrule the server; it should resync from that snapshot (reconnect) or reload.
+to every client, including spectators. Everyone, server included, applies those two inputs and steps one tick. After the step the server records `(n, ours, theirs)` in `match_inputs` and may send `Hash { n, state_hash }` so a desynced client can see it is wrong. After Hello, the server sends `Snapshot { round, seed, confirmed_tick, stats, ticks, path, hunk_index }` with the confirmed input log for the current round so a joiner or reconnect can catch up in one message. A desynced client does not get to overrule the server; it should resync from that snapshot (reconnect) or reload.
 
 `--lag-ms` delays that broadcast (and inbound `Input`) by the requested milliseconds.
 

@@ -269,6 +269,8 @@ struct ReplayRound {
     seed_lo: u32,
     seed_hi: u32,
     ticks: Vec<[u8; 2]>,
+    path: String,
+    hunk_index: u32,
     ours_hp: i32,
     ours_armor: bool,
     ours_special: bool,
@@ -320,6 +322,7 @@ async fn get_replay(
     let mut rounds = Vec::new();
     for round in 0..total_rounds {
         let (ours_stats, theirs_stats) = db::stats_for_round(&hunks, round);
+        let (path, hunk_index) = db::hunk_meta_for_round(&hunks, round);
         let rs = round_seed(seed, round);
         let (seed_lo, seed_hi) = split_seed(rs);
         rounds.push(ReplayRound {
@@ -328,6 +331,8 @@ async fn get_replay(
             seed_lo,
             seed_hi,
             ticks: by_round.remove(&round).unwrap_or_default(),
+            path,
+            hunk_index,
             ours_hp: ours_stats.hp,
             ours_armor: ours_stats.armor,
             ours_special: ours_stats.special,

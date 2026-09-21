@@ -124,6 +124,8 @@ mod tests {
             seed_hi: 0,
             round: 2,
             confirmed_tick: 1,
+            path: "lib.rs".into(),
+            hunk_index: 1,
             ours_hp: 100,
             ours_armor: false,
             ours_special: false,
@@ -135,6 +137,8 @@ mod tests {
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "snapshot");
         assert_eq!(v["round"], 2);
+        assert_eq!(v["path"], "lib.rs");
+        assert_eq!(v["hunk_index"], 1);
         assert_eq!(v["ticks"], serde_json::json!([[0, 1, 0], [1, 0, 2]]));
     }
 }
@@ -165,6 +169,8 @@ pub enum ServerMsg {
         round: u32,
         total_rounds: u32,
         confirmed_tick: i32,
+        path: String,
+        hunk_index: u32,
         ours_hp: i32,
         ours_armor: bool,
         ours_special: bool,
@@ -187,6 +193,8 @@ pub enum ServerMsg {
         seed_hi: u32,
         round: u32,
         confirmed_tick: i32,
+        path: String,
+        hunk_index: u32,
         ours_hp: i32,
         ours_armor: bool,
         ours_special: bool,

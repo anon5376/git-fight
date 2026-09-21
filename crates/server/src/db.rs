@@ -684,6 +684,14 @@ pub fn stats_for_round(hunks: &[HunkRow], round: u32) -> (FighterStats, FighterS
         .unwrap_or_default()
 }
 
+pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
+    hunks
+        .iter()
+        .find(|h| h.round_index == i64::from(round))
+        .map(|h| (h.path.clone(), h.hunk_index.max(0) as u32))
+        .unwrap_or_else(|| (String::new(), 0))
+}
+
 pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
     sqlx::query_as::<_, HunkRow>(
         "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login,

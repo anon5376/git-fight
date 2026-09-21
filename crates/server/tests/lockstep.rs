@@ -208,6 +208,8 @@ async fn hello_includes_stored_fighter_stats() {
     assert_eq!(hello["theirs_special"].as_bool(), Some(false));
     assert_eq!(hello["you_are"].as_str(), Some(""));
     assert_eq!(hello["your_role"].as_str(), Some("ours"));
+    assert_eq!(hello["path"].as_str(), Some("lib.rs"));
+    assert_eq!(hello["hunk_index"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -414,6 +416,10 @@ async fn multi_round_replay_keeps_every_round() {
     assert_ne!(rounds[0]["seed"], rounds[1]["seed"]);
     assert_eq!(rounds[0]["seed"].as_str(), Some("7"));
     assert_eq!(rounds[1]["seed"].as_str(), Some("14"));
+    assert_eq!(rounds[0]["path"].as_str(), Some("lib.rs"));
+    assert_eq!(rounds[1]["path"].as_str(), Some("lib.rs"));
+    assert_eq!(rounds[0]["hunk_index"].as_u64(), Some(0));
+    assert_eq!(rounds[1]["hunk_index"].as_u64(), Some(1));
 }
 
 #[tokio::test]

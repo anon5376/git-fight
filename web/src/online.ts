@@ -36,6 +36,8 @@ type Hello = {
   theirs_hp?: number;
   theirs_armor?: boolean;
   theirs_special?: boolean;
+  path?: string;
+  hunk_index?: number;
 };
 
 type TickMsg = { type: "tick"; n: number; ours: number; theirs: number };
@@ -53,6 +55,8 @@ type SnapshotMsg = {
   theirs_armor?: boolean;
   theirs_special?: boolean;
   ticks: number[][];
+  path?: string;
+  hunk_index?: number;
 };
 type EndMsg = {
   type: "end";
@@ -111,6 +115,8 @@ export function paintFight(
   oursName: string,
   theirsName: string,
   roundLabel: string,
+  path?: string,
+  hunkIndex?: number,
 ): void {
   const tps = ticks_per_second();
   const round = round_ticks();
@@ -133,6 +139,12 @@ export function paintFight(
   stage.dataset.oursHp = String(fight.ours_hp());
   stage.dataset.theirsHp = String(fight.theirs_hp());
   stage.dataset.round = String(roundLabel);
+  if (path) {
+    stage.dataset.path = path;
+  }
+  if (hunkIndex !== undefined) {
+    stage.dataset.hunk = String(hunkIndex);
+  }
 }
 
 export function showKo(ko: HTMLElement, result: number): void {
@@ -157,6 +169,12 @@ function wsUrl(matchId: string, token: string | null): string {
   return url.toString();
 }
 
+function roundCaption(kind: string, round: number, total: number, path: string): string {
+  const n = `${round + 1}/${total}`;
+  const file = path.trim();
+  return file ? `${kind} ${n} ${file}` : `${kind} ${n}`;
+}
+
 export function startOnline(matchId: string, token: string | null, ui: OnlineUi): { stop: () => void } {
   let stopped = false;
   let fight: WasmFight | null = null;
@@ -170,6 +188,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let finished = false;
   let round = 0;
   let totalRounds = 1;
+  let path = "";
+  let hunkIndex = 0;
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
@@ -197,6 +217,12 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     fight = rebuilt;
     confirmed = snap.confirmed_tick;
     round = snap.round ?? round;
+    if (snap.path) {
+      path = snap.path;
+    }
+    if (snap.hunk_index !== undefined) {
+      hunkIndex = snap.hunk_index;
+    }
     nextSend = Math.max(0, confirmed + 1);
     if (rebuilt.tick() > 0 && role !== "spectator") {
       ui.wait.classList.add("hidden");
@@ -283,6 +309,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       theirsName = hello.theirs;
       round = hello.round ?? 0;
       totalRounds = hello.total_rounds ?? 1;
+      path = hello.path ?? "";
+      hunkIndex = hello.hunk_index ?? 0;
       nextSend = Math.max(0, confirmed + 1);
       finished = false;
       reconnectAttempts = 0;
@@ -423,7 +451,9 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         fight,
         oursName,
         theirsName,
-        `online ${round + 1}/${totalRounds}`,
+        roundCaption("online", round, totalRounds, path),
+        path,
+        hunkIndex,
       );
     }
     requestAnimationFrame(loop);
@@ -468,6 +498,8 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
       seed_lo: number;
       seed_hi: number;
       ticks: number[][];
+      path?: string;
+      hunk_index?: number;
       ours_hp?: number;
       ours_armor?: boolean;
       ours_special?: boolean;
@@ -565,7 +597,16 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
         ui.resolved.textContent = data.final_hash ? `hash ${data.final_hash}` : "";
       }
     }
-    paintFight(ui.stage, fight, "ours", "theirs", `replay ${ri + 1}/${rounds.length}`);
+    const current = rounds[ri];
+    paintFight(
+      ui.stage,
+      fight,
+      "ours",
+      "theirs",
+      roundCaption("replay", ri, rounds.length, current?.path ?? ""),
+      current?.path,
+      current?.hunk_index,
+    );
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);

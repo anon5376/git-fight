@@ -61,6 +61,7 @@ test("github session match plays two CPU rounds in the browser", async ({ contex
   const wait = page.getByTestId("wait");
   const resolved = page.getByTestId("resolved");
   await expect(stage).toBeVisible();
+  await expect(stage).toHaveAttribute("data-path", /a\.rs|b\.rs/, { timeout: 10_000 });
   await expect(wait).not.toContainText(/spectating/i);
 
   await stage.click();
@@ -82,6 +83,11 @@ test("github session match plays two CPU rounds in the browser", async ({ contex
 
   const replay = await page.request.get(`/api/replays/${matchId}`);
   expect(replay.ok()).toBeTruthy();
-  const replayBody = (await replay.json()) as { rounds?: unknown[] };
+  const replayBody = (await replay.json()) as { rounds?: Array<{ path?: string; hunk_index?: number }> };
   expect(replayBody.rounds).toHaveLength(2);
+  expect(replayBody.rounds?.map((r) => r.path)).toEqual(["a.rs", "b.rs"]);
+  expect(replayBody.rounds?.map((r) => r.hunk_index)).toEqual([0, 0]);
+
+  await page.goto(`/replay/${matchId}`);
+  await expect(page.getByTestId("stage")).toHaveAttribute("data-path", "a.rs", { timeout: 10_000 });
 });

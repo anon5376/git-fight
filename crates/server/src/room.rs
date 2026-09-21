@@ -162,6 +162,7 @@ async fn run_room(
                             total_rounds,
                             confirmed,
                             db::stats_for_round(&hunks, round),
+                            &hunks,
                         );
                         let _ = tx.send(encode(&hello)).await;
                         let snap = snapshot_msg(
@@ -170,6 +171,7 @@ async fn run_room(
                             confirmed,
                             db::stats_for_round(&hunks, round),
                             &log,
+                            &hunks,
                         );
                         let _ = tx.send(encode(&snap)).await;
                         for &(n, o, t) in &log {
@@ -480,6 +482,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
             a.total_rounds,
             -1,
             db::stats_for_round(a.hunks, *a.round),
+            a.hunks,
         );
         let _ = conn.tx.send(encode(&hello)).await;
     }
@@ -540,9 +543,11 @@ fn hello_msg(
     total_rounds: u32,
     confirmed_tick: i32,
     stats: (FighterStats, FighterStats),
+    hunks: &[db::HunkRow],
 ) -> ServerMsg {
     let (seed_lo, seed_hi) = split_seed(seed);
     let (ours_stats, theirs_stats) = stats;
+    let (path, hunk_index) = db::hunk_meta_for_round(hunks, round);
     ServerMsg::Hello {
         match_id: match_id.to_string(),
         seed_lo,
@@ -555,6 +560,8 @@ fn hello_msg(
         round,
         total_rounds,
         confirmed_tick,
+        path,
+        hunk_index,
         ours_hp: ours_stats.hp,
         ours_armor: ours_stats.armor,
         ours_special: ours_stats.special,
@@ -570,14 +577,18 @@ fn snapshot_msg(
     confirmed_tick: i32,
     stats: (FighterStats, FighterStats),
     log: &[(u32, u8, u8)],
+    hunks: &[db::HunkRow],
 ) -> ServerMsg {
     let (seed_lo, seed_hi) = split_seed(seed);
     let (ours_stats, theirs_stats) = stats;
+    let (path, hunk_index) = db::hunk_meta_for_round(hunks, round);
     ServerMsg::Snapshot {
         seed_lo,
         seed_hi,
         round,
         confirmed_tick,
+        path,
+        hunk_index,
         ours_hp: ours_stats.hp,
         ours_armor: ours_stats.armor,
         ours_special: ours_stats.special,
