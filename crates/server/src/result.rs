@@ -76,6 +76,20 @@ pub fn git_pick_for_winner(winner: &str) -> Option<Pick> {
     }
 }
 
+const MAX_COMMENT_PATH: usize = 160;
+
+fn clip_comment_path(path: &str) -> String {
+    if path.chars().count() <= MAX_COMMENT_PATH {
+        return path.to_string();
+    }
+    let mut s: String = path
+        .chars()
+        .take(MAX_COMMENT_PATH.saturating_sub(1))
+        .collect();
+    s.push('…');
+    s
+}
+
 fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
     hunks
         .iter()
@@ -83,7 +97,7 @@ fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
         .map(|h| {
             format!(
                 "{} hunk {} ({})",
-                h.path,
+                clip_comment_path(&h.path),
                 h.hunk_index,
                 h.winner.as_deref().unwrap_or("unresolved")
             )
@@ -109,7 +123,7 @@ fn round_lines(hunks: &[HunkRow]) -> String {
             format!(
                 "round {}: {} hunk {} {}",
                 h.round_index + 1,
-                h.path,
+                clip_comment_path(&h.path),
                 h.hunk_index,
                 h.winner.as_deref().unwrap_or("unresolved")
             )
@@ -575,4 +589,18 @@ async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) {
 pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) {
     let body = "git fight: this match expired before anyone finished. Nothing was pushed. Comment `/fight` for a rematch.".to_string();
     comment(ctx, row, &body).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comment_paths_are_length_capped() {
+        let long = format!("{}/lib.rs", "dir/".repeat(80));
+        let clipped = clip_comment_path(&long);
+        assert!(clipped.chars().count() <= MAX_COMMENT_PATH);
+        assert!(clipped.ends_with('…'), "{clipped}");
+        assert_eq!(clip_comment_path("lib.rs"), "lib.rs");
+    }
 }

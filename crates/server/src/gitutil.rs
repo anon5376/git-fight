@@ -22,6 +22,19 @@ pub struct FightHunk {
     pub blame_sha: String,
 }
 
+impl FightHunk {
+    /// Bytes are only needed for blame. After stats they must not sit in RAM
+    /// across GitHub HTTP, and they are not stored in SQLite.
+    pub fn drop_payload(&mut self) {
+        self.ours.clear();
+        self.theirs.clear();
+        self.base.clear();
+        self.ours.shrink_to_fit();
+        self.theirs.shrink_to_fit();
+        self.base.shrink_to_fit();
+    }
+}
+
 #[derive(Debug)]
 pub enum GitError {
     Timeout,
@@ -1281,6 +1294,23 @@ mod tests {
         assert!(is_safe_path(&"d".repeat(255)));
         assert!(is_safe_path("src/lib.rs"));
         assert!(is_safe_path("a/b.c"));
+    }
+
+    #[test]
+    fn drop_payload_releases_hunk_bytes() {
+        let mut h = FightHunk {
+            path: "lib.rs".into(),
+            hunk_index: 0,
+            ours: vec![b'a'; 64 * 1024],
+            theirs: vec![b'b'; 64 * 1024],
+            base: vec![b'c'; 64 * 1024],
+            blame_name: "bob".into(),
+            blame_email: String::new(),
+            blame_sha: String::new(),
+        };
+        h.drop_payload();
+        assert!(h.ours.is_empty() && h.theirs.is_empty() && h.base.is_empty());
+        assert!(h.ours.capacity() < 1024, "capacity {}", h.ours.capacity());
     }
 
     #[test]

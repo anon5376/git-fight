@@ -306,7 +306,10 @@ pub async fn start_challenge(
         }
     };
 
-    let (hunks, stats) = prepared;
+    let (mut hunks, stats) = prepared;
+    for h in &mut hunks {
+        h.drop_payload();
+    }
     if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
         return Ok(silent());
     }

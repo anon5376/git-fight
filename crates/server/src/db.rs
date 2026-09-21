@@ -633,10 +633,11 @@ pub async fn start_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx:
 }
 
 pub async fn is_open_match(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
-    Ok(get_match(pool, id)
-        .await?
-        .map(|row| matches!(row.status.as_str(), "pending" | "in_progress"))
-        .unwrap_or(false))
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM matches WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status.is_some_and(|s| matches!(s.as_str(), "pending" | "in_progress")))
 }
 
 pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
