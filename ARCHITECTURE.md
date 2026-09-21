@@ -22,7 +22,7 @@ Cargo workspace:
 ```
 crates/core     conflict engine + fight simulation. Pure, no I/O, compiles to wasm32-unknown-unknown.
 crates/cli      existing git-fight binary, using core.
-crates/server   axum + tokio. HTTP, WebSockets, SQLite via sqlx, GitHub App via octocrab.
+crates/server   axum + tokio. HTTP, WebSockets, SQLite via sqlx, GitHub App via reqwest.
 crates/wasm     wasm-bindgen bindings to core for the browser.
 web/            TypeScript + Vite client with a canvas renderer.
 ```

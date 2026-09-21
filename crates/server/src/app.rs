@@ -257,6 +257,10 @@ async fn create_match(
     State(state): State<AppState>,
     body: Option<Json<CreateBody>>,
 ) -> Result<Json<CreateOut>, StatusCode> {
+    // Live GitHub App fights start from `/fight`. Anonymous host is local-only.
+    if state.github.is_some() {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let seed = body
         .and_then(|b| b.seed)
         .unwrap_or_else(|| uuid::Uuid::new_v4().as_u128() as u64);
@@ -427,7 +431,11 @@ async fn ws_upgrade(
     headers: HeaderMap,
 ) -> Response {
     let login = auth::login_from_headers(&state.pool, &state.auth.session_key, &headers).await;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, q, login))
+    // Inputs are a few dozen bytes. Default 64 MiB frames are a room DoS.
+    const MAX_WS_MESSAGE: usize = 8 * 1024;
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| handle_socket(socket, state, q, login))
 }
 
 async fn reject_socket(mut socket: WebSocket, message: &str) {

@@ -2,9 +2,11 @@
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
+# Debian bookworm Node 18 is enough for Vite 6. Skip Playwright's browser fetch.
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN rustup target add wasm32-unknown-unknown \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/install-wasm-pack.sh /tmp/install-wasm-pack.sh
 RUN sh /tmp/install-wasm-pack.sh

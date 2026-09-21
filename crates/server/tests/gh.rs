@@ -46,6 +46,23 @@ async fn installation_token_is_cached_in_memory() {
 }
 
 #[tokio::test]
+async fn installation_token_rejects_huge_json() {
+    let mock = MockServer::start().await;
+    let huge = format!(
+        r#"{{"token":"{}","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        "a".repeat(32 * 1024)
+    );
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_string(huge))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert!(gh.installation_token(1).await.is_err());
+}
+
+#[tokio::test]
 async fn poll_mergeable_gives_up_with_none() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))

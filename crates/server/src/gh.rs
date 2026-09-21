@@ -32,6 +32,8 @@ const MAX_CONTENTS_JSON: usize = 16 * 1024;
 const MAX_COMMITS_JSON: usize = 64 * 1024;
 /// Pull/repo/comment JSON. PR bodies are capped by GitHub well under this.
 const MAX_API_JSON: usize = 1_048_576;
+/// Installation token, OAuth token, and `GET /user` JSON.
+const MAX_TOKEN_JSON: usize = 16 * 1024;
 
 impl std::fmt::Debug for GitHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,7 +57,7 @@ impl GitHub {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("http client"),
             api_base: api_base.trim_end_matches('/').to_string(),
             oauth_base: oauth_base.trim_end_matches('/').to_string(),
             app_id,
@@ -130,7 +132,9 @@ impl GitHub {
             token: String,
             expires_at: String,
         }
-        let body: Tok = res.json().await.map_err(|e| e.to_string())?;
+        let body: Tok = json_capped(res, MAX_TOKEN_JSON)
+            .await
+            .ok_or_else(|| "access_tokens json".to_string())?;
         let expires = parse_expires(&body.expires_at);
         let token = body.token;
         self.tokens
@@ -521,7 +525,9 @@ impl GitHub {
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        let tok: Token = res.json().await.map_err(|e| e.to_string())?;
+        let tok: Token = json_capped(res, MAX_TOKEN_JSON)
+            .await
+            .ok_or_else(|| "oauth json".to_string())?;
         if let Some(err) = tok.error {
             return Err(err);
         }
@@ -543,7 +549,9 @@ impl GitHub {
             id: i64,
             login: String,
         }
-        let user: User = user_res.json().await.map_err(|e| e.to_string())?;
+        let user: User = json_capped(user_res, MAX_TOKEN_JSON)
+            .await
+            .ok_or_else(|| "user json".to_string())?;
         if !is_safe_github_name(&user.login) {
             return Err("bad login".into());
         }

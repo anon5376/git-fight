@@ -2198,6 +2198,39 @@ async fn pr_synchronize_moved_sha_comments_once() {
 }
 
 #[tokio::test]
+async fn github_mode_does_not_create_anonymous_matches() {
+    let addr = spawn(Config {
+        webhook_secret: Some(SECRET.to_vec()),
+        github: Some(GitHub::new(
+            "http://127.0.0.1:1".into(),
+            "http://127.0.0.1:1".into(),
+            1,
+            APP_PEM.to_string(),
+            "cid".into(),
+            "csec".into(),
+        )),
+        auth: Auth {
+            session_key: SESSION_KEY.to_vec(),
+            public_url: "http://fight.test".into(),
+        },
+        ..Config::default()
+    })
+    .await;
+    let (status, body) = http(
+        addr,
+        "POST",
+        "/api/matches",
+        &[("Content-Type", "application/json")],
+        b"{}",
+    )
+    .await;
+    assert_eq!(status, 404);
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("ours_token"), "{text}");
+    assert!(!text.contains("theirs_token"), "{text}");
+}
+
+#[tokio::test]
 async fn installation_rate_limit_skips_clone() {
     use git_fight_server::db::NewMatch;
     use git_fight_server::MAX_MATCHES_PER_INSTALL_HOUR;

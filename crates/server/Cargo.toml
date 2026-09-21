@@ -33,7 +33,6 @@ hex = "0.4"
 subtle = "2"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-octocrab = "0.44"
 base64 = "0.22"
 tempfile = "3"
 libc = "0.2"

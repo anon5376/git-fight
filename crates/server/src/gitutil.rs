@@ -224,7 +224,46 @@ fn is_safe_blob_spec(spec: &str) -> bool {
     }
 }
 
+/// Clone/push remotes: test `file://` paths, or `https://github.com/<owner>/<repo>.git`.
+fn is_safe_git_url(url: &str) -> bool {
+    if !(8..=4096).contains(&url.len()) {
+        return false;
+    }
+    if url
+        .as_bytes()
+        .iter()
+        .any(|b| *b < 0x20 || *b > 0x7e || matches!(*b, b'?' | b'#' | b'\\' | b'@' | b' ' | b'\t'))
+    {
+        return false;
+    }
+    if let Some(rest) = url.strip_prefix("file://") {
+        return rest.starts_with('/') && rest.len() >= 2 && !rest.contains("//");
+    }
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let Some(path) = rest.strip_suffix(".git") else {
+        return false;
+    };
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(repo), None) => {
+            crate::gh::is_safe_github_name(owner) && crate::gh::is_safe_github_name(repo)
+        }
+        _ => false,
+    }
+}
+
 pub async fn clone_bare(url: &str, dest: &Path, bearer: Option<&str>) -> Result<(), GitError> {
+    if !is_safe_git_url(url) {
+        return Err(GitError::Command("unsafe url".into()));
+    }
+    let dest_s = dest
+        .to_str()
+        .ok_or_else(|| GitError::Command("dest".into()))?;
+    if dest_s.starts_with('-') {
+        return Err(GitError::Command("unsafe dest".into()));
+    }
     let mut cmd = git_base();
     apply_auth(&mut cmd, url, bearer);
     cmd.args([
@@ -233,9 +272,9 @@ pub async fn clone_bare(url: &str, dest: &Path, bearer: Option<&str>) -> Result<
         "--filter=blob:none",
         "--no-tags",
         "--no-local",
+        "--",
         url,
-        dest.to_str()
-            .ok_or_else(|| GitError::Command("dest".into()))?,
+        dest_s,
     ]);
     let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 {
@@ -873,6 +912,9 @@ pub async fn commit_tree(
 }
 
 pub async fn ref_exists(url: &str, refname: &str, bearer: Option<&str>) -> Result<bool, GitError> {
+    if !is_safe_git_url(url) {
+        return Err(GitError::Command("unsafe url".into()));
+    }
     if !refname.starts_with("git-fight/") {
         return Err(GitError::Command(
             "refusing to inspect non git-fight ref".into(),
@@ -883,6 +925,7 @@ pub async fn ref_exists(url: &str, refname: &str, bearer: Option<&str>) -> Resul
     cmd.args([
         "ls-remote",
         "--heads",
+        "--",
         url,
         &format!("refs/heads/{refname}"),
     ]);
@@ -903,6 +946,9 @@ pub async fn push_create_only(
     refname: &str,
     bearer: Option<&str>,
 ) -> Result<(), GitError> {
+    if !is_safe_git_url(url) {
+        return Err(GitError::Command("unsafe url".into()));
+    }
     if !refname.starts_with("git-fight/") || refname.contains("..") || refname.contains('\\') {
         return Err(GitError::Command(
             "refusing to push outside git-fight/*".into(),
@@ -1002,6 +1048,17 @@ mod tests {
         assert!(!is_safe_blob_spec(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:../x"
         ));
+        assert!(is_safe_git_url("https://github.com/acme/box.git"));
+        assert!(is_safe_git_url("file:///tmp/repo.git"));
+        assert!(!is_safe_git_url("https://evil.example/acme/box.git"));
+        assert!(!is_safe_git_url(
+            "https://github.com.evil.example/acme/box.git"
+        ));
+        assert!(!is_safe_git_url("ssh://github.com/acme/box.git"));
+        assert!(!is_safe_git_url("https://github.com/acme/box.git?u=1"));
+        assert!(!is_safe_git_url("https://github.com/acme/../box.git"));
+        assert!(!is_safe_git_url("--upload-pack=true"));
+        assert!(!is_safe_git_url("git@github.com:acme/box.git"));
     }
 
     #[test]
@@ -1086,6 +1143,20 @@ Auto-merging lib.rs\n";
         let b64 = header.rsplit(' ').next().expect("b64");
         let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
         assert_eq!(raw, b"x-access-token:ghs_live_token_secret");
+    }
+
+    #[tokio::test]
+    async fn clone_bare_rejects_non_github_https() {
+        let dest = tempfile::tempdir().unwrap();
+        let clone = dest.path().join("c.git");
+        let err = clone_bare("https://evil.example/acme/box.git", &clone, Some("ghs_x"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GitError::Command(ref s) if s == "unsafe url"),
+            "{err}"
+        );
+        assert!(!clone.exists());
     }
 
     #[tokio::test]
