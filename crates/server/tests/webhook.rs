@@ -65,6 +65,51 @@ fn conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     (tmp, bare, head, base)
 }
 
+fn conflict_two_authors() -> (tempfile::TempDir, PathBuf, String, String, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("a.rs"), "fn a() { 1 }\n").unwrap();
+    std::fs::write(work.join("b.rs"), "fn b() { 1 }\n").unwrap();
+    git(&work, &["add", "a.rs", "b.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::write(work.join("a.rs"), "fn a() { 2 }\n").unwrap();
+    std::fs::write(work.join("b.rs"), "fn b() { 2 }\n").unwrap();
+    git(&work, &["add", "a.rs", "b.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("a.rs"), "fn a() { 3 }\n").unwrap();
+    git(&work, &["add", "a.rs"]);
+    git(&work, &["commit", "-q", "-m", "bob"]);
+    let bob_sha = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["config", "user.email", "carol@example.com"]);
+    git(&work, &["config", "user.name", "carol"]);
+    std::fs::write(work.join("b.rs"), "fn b() { 3 }\n").unwrap();
+    git(&work, &["add", "b.rs"]);
+    git(&work, &["commit", "-q", "-m", "carol"]);
+    let carol_sha = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, carol_sha.clone(), bob_sha, carol_sha)
+}
+
 async fn spawn(cfg: Config) -> std::net::SocketAddr {
     spawn_with_pool(cfg).await.0
 }
@@ -180,6 +225,7 @@ struct MockOpts {
     commit_author: Value,
     size: u64,
     auto_challenge: bool,
+    commit_authors: Vec<(String, Value)>,
 }
 
 async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
@@ -227,13 +273,25 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
             .mount(&mock)
             .await;
     }
-    Mock::given(method("GET"))
-        .and(path_regex(r"/repos/acme/box/commits/.*"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "author": opts.commit_author
-        })))
-        .mount(&mock)
-        .await;
+    if opts.commit_authors.is_empty() {
+        Mock::given(method("GET"))
+            .and(path_regex(r"/repos/acme/box/commits/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "author": opts.commit_author
+            })))
+            .mount(&mock)
+            .await;
+    } else {
+        for (sha, author) in &opts.commit_authors {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/box/commits/{sha}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "author": author
+                })))
+                .mount(&mock)
+                .await;
+        }
+    }
     Mock::given(method("POST"))
         .and(path("/repos/acme/box/issues/1/comments"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 99 })))
@@ -247,6 +305,7 @@ fn cpu_opts() -> MockOpts {
         commit_author: Value::Null,
         size: 12,
         auto_challenge: false,
+        commit_authors: vec![],
     }
 }
 
@@ -360,6 +419,7 @@ async fn same_login_is_a_mirror_match() {
             commit_author: json!({ "login": "alice" }),
             size: 12,
             auto_challenge: false,
+            commit_authors: vec![],
         },
     )
     .await;
@@ -382,6 +442,7 @@ async fn oversized_repo_is_skipped() {
             commit_author: Value::Null,
             size: 1_048_577,
             auto_challenge: false,
+            commit_authors: vec![],
         },
     )
     .await;
@@ -437,6 +498,7 @@ async fn auto_challenge_starts_when_yaml_set() {
             commit_author: Value::Null,
             size: 12,
             auto_challenge: true,
+            commit_authors: vec![],
         },
     )
     .await;
@@ -593,4 +655,101 @@ async fn installation_rate_limit_skips_clone() {
         comments.iter().any(|t| t.contains("too many fights")),
         "{comments:?}"
     );
+}
+
+#[tokio::test]
+async fn pr_rate_limit_skips_clone() {
+    use git_fight_server::db::NewMatch;
+    use git_fight_server::MAX_MATCHES_PER_PR_HOUR;
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    for i in 0..MAX_MATCHES_PER_PR_HOUR {
+        let id = format!("prr{i:025}");
+        git_fight_server::db::insert_full_match(
+            &pool,
+            &NewMatch {
+                id: id.clone(),
+                seed: i as u64,
+                delay: 3,
+                ours_name: "alice".into(),
+                theirs_name: "bob".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: Some("alice".into()),
+                theirs_login: None,
+                ours_token: format!("o{i}"),
+                theirs_token: format!("t{i}"),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        git_fight_server::db::set_status(&pool, &id, "finished", true, true, None, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-pr-rate", &fight_body()).await,
+        200
+    );
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("too many fights on this pull request")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn each_hunk_stores_blamed_author_login() {
+    let (_keep, bare, head, base, bob_sha, carol_sha) = conflict_two_authors();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![
+                (bob_sha, json!({ "login": "bob" })),
+                (carol_sha, json!({ "login": "carol" })),
+            ],
+        },
+    )
+    .await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-hunks", &fight_body()).await,
+        200
+    );
+    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let text = comments
+        .iter()
+        .find(|t| t.contains("/match/"))
+        .expect("challenge comment");
+    let id = text
+        .split("/match/")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let hunks = git_fight_server::db::list_hunks(&pool, id).await.unwrap();
+    assert_eq!(
+        hunks.len(),
+        2,
+        "{:?}",
+        hunks.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+    let logins: Vec<Option<String>> = hunks.into_iter().map(|h| h.theirs_login).collect();
+    assert!(logins.contains(&Some("bob".into())), "{logins:?}");
+    assert!(logins.contains(&Some("carol".into())), "{logins:?}");
 }

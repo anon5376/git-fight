@@ -237,8 +237,11 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         hello.theirs_special,
       );
       if (role === "spectator") {
+        ui.wait.classList.remove("hidden");
         ui.wait.textContent = "spectating";
         void offerGithubLogin(matchId, ui);
+      } else {
+        ui.wait.textContent = "waiting for opponent…";
       }
     } else if (msg.type === "tick") {
       const tick = msg as TickMsg;

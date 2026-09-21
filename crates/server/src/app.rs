@@ -1,7 +1,7 @@
 use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
-use crate::protocol::{ClientMsg, Role, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY};
+use crate::protocol::{ClientMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY};
 use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
 use crate::webhook;
@@ -326,11 +326,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     if row.status == "expired" {
         return;
     }
-    let role = role_for(&row, q.token.as_deref(), login.as_deref());
+    let conn_id = uuid::Uuid::new_v4().as_u128() as u64;
     let tx = state.room_tx(&row).await;
 
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
-    let _ = tx.send(RoomEvent::Join { role, tx: out_tx }).await;
+    let _ = tx
+        .send(RoomEvent::Join {
+            conn_id,
+            login,
+            token: q.token,
+            tx: out_tx,
+        })
+        .await;
 
     let (mut sink, mut stream) = socket.split();
     let lag = state.config.lag;
@@ -351,19 +358,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
             else {
                 continue;
             };
-            if role == Role::Spectator {
-                continue;
-            }
             let _ = tx
                 .send(RoomEvent::Input {
-                    role,
+                    conn_id,
                     tick,
                     buttons,
                     theirs_buttons: theirs,
                 })
                 .await;
         }
-        let _ = leave_tx.send(RoomEvent::Leave { role }).await;
+        let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
     });
 
     let write = tokio::spawn(async move {
@@ -378,25 +382,4 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     });
 
     let _ = tokio::join!(read, write);
-}
-
-fn role_for(row: &MatchRow, token: Option<&str>, login: Option<&str>) -> Role {
-    if row.ours_login.is_some() || row.theirs_login.is_some() {
-        let Some(login) = login else {
-            return Role::Spectator;
-        };
-        let ours = row.ours_login.as_deref() == Some(login);
-        let theirs = row.theirs_login.as_deref() == Some(login);
-        return match (ours, theirs) {
-            (true, true) => Role::Both,
-            (true, false) => Role::Ours,
-            (false, true) => Role::Theirs,
-            (false, false) => Role::Spectator,
-        };
-    }
-    match token {
-        Some(t) if row.ours_token.as_deref() == Some(t) => Role::Ours,
-        Some(t) if row.theirs_token.as_deref() == Some(t) => Role::Theirs,
-        _ => Role::Spectator,
-    }
 }

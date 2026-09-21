@@ -1,6 +1,6 @@
 use crate::db::{self, MatchRow};
 use crate::protocol::{
-    split_hash, split_seed, Role, ServerMsg, DISCONNECT_SECS, INPUT_DELAY, INPUT_WINDOW,
+    role_for, split_hash, split_seed, Role, ServerMsg, DISCONNECT_SECS, INPUT_DELAY, INPUT_WINDOW,
 };
 use crate::result::{self, ResultCtx};
 use chrono::{DateTime, Utc};
@@ -13,14 +13,16 @@ use tokio::time::MissedTickBehavior;
 
 pub enum RoomEvent {
     Join {
-        role: Role,
+        conn_id: u64,
+        login: Option<String>,
+        token: Option<String>,
         tx: mpsc::Sender<String>,
     },
     Leave {
-        role: Role,
+        conn_id: u64,
     },
     Input {
-        role: Role,
+        conn_id: u64,
         tick: u32,
         buttons: u8,
         theirs_buttons: Option<u8>,
@@ -31,8 +33,13 @@ pub enum RoomEvent {
 struct Slot {
     kind_cpu: bool,
     seen: bool,
-    tx: Option<mpsc::Sender<String>>,
     disconnected_at: Option<Instant>,
+}
+
+struct Conn {
+    login: Option<String>,
+    token: Option<String>,
+    tx: mpsc::Sender<String>,
 }
 
 pub struct RoomSettings {
@@ -70,6 +77,7 @@ async fn run_room(
     let seed: u64 = row.seed.parse().unwrap_or(1);
     let delay = u32::try_from(row.input_delay_ticks).unwrap_or(INPUT_DELAY);
     let hunks = db::list_hunks(&pool, &row.id).await.unwrap_or_default();
+    let github = db::github_identity(&row, &hunks);
     let total_rounds = u32::try_from(hunks.len()).unwrap_or(0).max(1);
     let mut round: u32 = hunks
         .iter()
@@ -92,30 +100,36 @@ async fn run_room(
     }
 
     let mut ours = Slot {
-        kind_cpu: row.ours_kind == "cpu",
-        seen: row.ours_kind == "cpu",
-        tx: None,
+        kind_cpu: false,
+        seen: false,
         disconnected_at: None,
     };
     let mut theirs = Slot {
-        kind_cpu: row.theirs_kind == "cpu",
-        seen: row.theirs_kind == "cpu",
-        tx: None,
+        kind_cpu: false,
+        seen: false,
         disconnected_at: None,
     };
-    let mut spectators: Vec<mpsc::Sender<String>> = Vec::new();
+    let mut conns: BTreeMap<u64, Conn> = BTreeMap::new();
     let mut pending_ours: BTreeMap<u32, u8> = BTreeMap::new();
     let mut pending_theirs: BTreeMap<u32, u8> = BTreeMap::new();
     let mut started_at: Option<Instant> = None;
     let mut done = sim.result.is_some() || row.status == "finished" || row.status == "expired";
-    let mut mirror = row.ours_kind == "mirror" || row.theirs_kind == "mirror";
+    let mut mirror = false;
     let id = row.id.clone();
     let ours_name = row.ours_name.clone();
-    let mut theirs_name = hunks
-        .get(round as usize)
-        .and_then(|h| h.theirs_name.clone())
-        .unwrap_or_else(|| row.theirs_name.clone());
+    let mut theirs_name = db::theirs_name_for_round(&hunks, round, &row.theirs_name);
     let expires_at = parse_rfc3339(&row.expires_at);
+    apply_round_identity(
+        &row,
+        &hunks,
+        round,
+        github,
+        &mut ours,
+        &mut theirs,
+        &mut theirs_name,
+        &mut mirror,
+        true,
+    );
 
     let mut clock = tokio::time::interval(Duration::from_millis(1000 / 30));
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -127,14 +141,13 @@ async fn run_room(
                 match ev {
                     RoomEvent::Shutdown => {
                         if !done {
-                            expire_now(&pool, &id, &ours, &theirs, &spectators).await;
+                            expire_now(&pool, &id, &conns).await;
                         }
                         break;
                     }
-                    RoomEvent::Join { role, tx } => {
-                        if role == Role::Both {
-                            mirror = true;
-                        }
+                    RoomEvent::Join { conn_id, login, token, tx } => {
+                        let conn = Conn { login, token, tx: tx.clone() };
+                        let role = conn_role(&conn, &row, &hunks, round, github);
                         let confirmed = if next_tick == 0 { -1 } else { next_tick as i32 - 1 };
                         let hello = hello_msg(
                             &id,
@@ -162,27 +175,17 @@ async fn run_room(
                             let match_over = round + 1 >= total_rounds;
                             let _ = tx.send(encode(&end_msg(&sim, result, round, match_over))).await;
                         }
-                        match role {
-                            Role::Ours => {
-                                ours.seen = true;
-                                ours.tx = Some(tx);
-                                ours.disconnected_at = None;
-                            }
-                            Role::Theirs => {
-                                theirs.seen = true;
-                                theirs.tx = Some(tx);
-                                theirs.disconnected_at = None;
-                            }
-                            Role::Both => {
-                                ours.seen = true;
-                                theirs.seen = true;
-                                ours.tx = Some(tx.clone());
-                                theirs.tx = Some(tx);
-                                ours.disconnected_at = None;
-                                theirs.disconnected_at = None;
-                            }
-                            Role::Spectator => spectators.push(tx),
-                        }
+                        conns.insert(conn_id, conn);
+                        refresh_slots(
+                            &conns,
+                            &row,
+                            &hunks,
+                            round,
+                            github,
+                            &mut ours,
+                            &mut theirs,
+                            started_at.is_some(),
+                        );
                         if !done && ours.seen && theirs.seen && started_at.is_none() {
                             started_at = Some(Instant::now());
                             let _ = db::set_status(
@@ -191,33 +194,23 @@ async fn run_room(
                             .await;
                         }
                     }
-                    RoomEvent::Leave { role } => match role {
-                        Role::Ours => {
-                            ours.tx = None;
-                            if !done && ours.seen && !ours.kind_cpu {
-                                ours.disconnected_at = Some(Instant::now());
-                            }
+                    RoomEvent::Leave { conn_id } => {
+                        conns.remove(&conn_id);
+                        if !done {
+                            refresh_slots(
+                                &conns,
+                                &row,
+                                &hunks,
+                                round,
+                                github,
+                                &mut ours,
+                                &mut theirs,
+                                started_at.is_some(),
+                            );
                         }
-                        Role::Theirs => {
-                            theirs.tx = None;
-                            if !done && theirs.seen && !theirs.kind_cpu {
-                                theirs.disconnected_at = Some(Instant::now());
-                            }
-                        }
-                        Role::Both => {
-                            ours.tx = None;
-                            theirs.tx = None;
-                            if !done && ours.seen && !ours.kind_cpu {
-                                ours.disconnected_at = Some(Instant::now());
-                            }
-                            if !done && theirs.seen && !theirs.kind_cpu {
-                                theirs.disconnected_at = Some(Instant::now());
-                            }
-                        }
-                        Role::Spectator => {}
-                    },
+                    }
                     RoomEvent::Input {
-                        role,
+                        conn_id,
                         tick,
                         buttons,
                         theirs_buttons,
@@ -228,7 +221,10 @@ async fn run_room(
                         if tick < next_tick || tick > next_tick.saturating_add(INPUT_WINDOW) {
                             continue;
                         }
-                        match role {
+                        let Some(conn) = conns.get(&conn_id) else {
+                            continue;
+                        };
+                        match conn_role(conn, &row, &hunks, round, github) {
                             Role::Ours => {
                                 pending_ours.entry(tick).or_insert(buttons);
                             }
@@ -250,7 +246,7 @@ async fn run_room(
                 if !done && started_at.is_none() {
                     if let Some(exp) = expires_at {
                         if Utc::now() >= exp {
-                            expire_now(&pool, &id, &ours, &theirs, &spectators).await;
+                            expire_now(&pool, &id, &conns).await;
                             done = true;
                         }
                     }
@@ -270,7 +266,7 @@ async fn run_room(
             pending_theirs: &mut pending_theirs,
             ours: &mut ours,
             theirs: &mut theirs,
-            spectators: &mut spectators,
+            conns: &conns,
             pool: &pool,
             id: &id,
             started_at: &mut started_at,
@@ -285,7 +281,9 @@ async fn run_room(
             hunks: &hunks,
             match_id: &id,
             result: settings.result.clone(),
-            mirror,
+            mirror: &mut mirror,
+            row: &row,
+            github,
         })
         .await;
     }
@@ -299,7 +297,7 @@ struct Advance<'a> {
     pending_theirs: &'a mut BTreeMap<u32, u8>,
     ours: &'a mut Slot,
     theirs: &'a mut Slot,
-    spectators: &'a mut Vec<mpsc::Sender<String>>,
+    conns: &'a BTreeMap<u64, Conn>,
     pool: &'a SqlitePool,
     id: &'a str,
     started_at: &'a mut Option<Instant>,
@@ -314,7 +312,9 @@ struct Advance<'a> {
     hunks: &'a [db::HunkRow],
     match_id: &'a str,
     result: Option<ResultCtx>,
-    mirror: bool,
+    mirror: &'a mut bool,
+    row: &'a MatchRow,
+    github: bool,
 }
 
 async fn advance(a: Advance<'_>) -> bool {
@@ -392,7 +392,7 @@ async fn advance(a: Advance<'_>) -> bool {
             ours: ours_btn,
             theirs: theirs_btn,
         });
-        broadcast(a.ours, a.theirs, a.spectators, &msg).await;
+        broadcast(a.conns, &msg).await;
         if n % 10 == 9 || a.sim.result.is_some() {
             let (lo, hi) = split_hash(a.sim.state_hash());
             let hash = encode(&ServerMsg::Hash {
@@ -400,7 +400,7 @@ async fn advance(a: Advance<'_>) -> bool {
                 hi,
                 lo,
             });
-            broadcast(a.ours, a.theirs, a.spectators, &hash).await;
+            broadcast(a.conns, &hash).await;
         }
     }
     if let Some(result) = a.sim.result {
@@ -418,96 +418,70 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
     let hash_s = format!("{hi:08x}{lo:08x}");
+    if match_over {
+        let _ = db::set_status(a.pool, a.id, "finished", true, true, Some(&hash_s), None).await;
+        if let Some(ctx) = a.result {
+            let id = a.id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = result::publish(&ctx, &id).await {
+                    eprintln!("git fight result: {e}");
+                }
+            });
+        }
+    }
     let msg = encode(&end_msg(a.sim, result, *a.round, match_over));
-    broadcast(a.ours, a.theirs, a.spectators, &msg).await;
-    if !match_over {
-        let _ = db::clear_inputs(a.pool, a.id).await;
-        *a.round += 1;
-        let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
-        *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
-        *a.next_tick = 0;
-        a.log.clear();
-        a.pending_ours.clear();
-        a.pending_theirs.clear();
-        if let Some(h) = a.hunks.get(*a.round as usize) {
-            if let Some(name) = &h.theirs_name {
-                *a.theirs_name = name.clone();
-            }
-        }
-        *a.started_at = Some(Instant::now());
-        let ours_role = if a.mirror { "both" } else { "ours" };
-        let theirs_role = if a.mirror { "both" } else { "theirs" };
-        if let Some(tx) = &a.ours.tx {
-            let hello = hello_msg(
-                a.match_id,
-                round_seed(a.seed, *a.round),
-                a.delay,
-                ours_role,
-                a.ours_name,
-                a.theirs_name,
-                *a.round,
-                a.total_rounds,
-                -1,
-                db::stats_for_round(a.hunks, *a.round),
-            );
-            let _ = tx.send(encode(&hello)).await;
-        }
-        if let Some(tx) = &a.theirs.tx {
-            let hello = hello_msg(
-                a.match_id,
-                round_seed(a.seed, *a.round),
-                a.delay,
-                theirs_role,
-                a.ours_name,
-                a.theirs_name,
-                *a.round,
-                a.total_rounds,
-                -1,
-                db::stats_for_round(a.hunks, *a.round),
-            );
-            let _ = tx.send(encode(&hello)).await;
-        }
-        for tx in a.spectators.iter() {
-            let hello = hello_msg(
-                a.match_id,
-                round_seed(a.seed, *a.round),
-                a.delay,
-                "spectator",
-                a.ours_name,
-                a.theirs_name,
-                *a.round,
-                a.total_rounds,
-                -1,
-                db::stats_for_round(a.hunks, *a.round),
-            );
-            let _ = tx.send(encode(&hello)).await;
-        }
-        return false;
+    broadcast(a.conns, &msg).await;
+    if match_over {
+        return true;
     }
-    let _ = db::set_status(a.pool, a.id, "finished", true, true, Some(&hash_s), None).await;
-    if let Some(ctx) = a.result {
-        let id = a.id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = result::publish(&ctx, &id).await {
-                eprintln!("git fight result: {e}");
-            }
-        });
+    let _ = db::clear_inputs(a.pool, a.id).await;
+    *a.round += 1;
+    let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
+    *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
+    *a.next_tick = 0;
+    a.log.clear();
+    a.pending_ours.clear();
+    a.pending_theirs.clear();
+    apply_round_identity(
+        a.row,
+        a.hunks,
+        *a.round,
+        a.github,
+        a.ours,
+        a.theirs,
+        a.theirs_name,
+        a.mirror,
+        false,
+    );
+    refresh_slots(
+        a.conns, a.row, a.hunks, *a.round, a.github, a.ours, a.theirs, true,
+    );
+    *a.started_at = Some(Instant::now());
+    for conn in a.conns.values() {
+        let role = conn_role(conn, a.row, a.hunks, *a.round, a.github);
+        let hello = hello_msg(
+            a.match_id,
+            round_seed(a.seed, *a.round),
+            a.delay,
+            role.as_str(),
+            a.ours_name,
+            a.theirs_name,
+            *a.round,
+            a.total_rounds,
+            -1,
+            db::stats_for_round(a.hunks, *a.round),
+        );
+        let _ = conn.tx.send(encode(&hello)).await;
     }
-    true
+    false
 }
 
-async fn expire_now(
-    pool: &SqlitePool,
-    id: &str,
-    ours: &Slot,
-    theirs: &Slot,
-    spectators: &[mpsc::Sender<String>],
-) {
+async fn expire_now(pool: &SqlitePool, id: &str, conns: &BTreeMap<u64, Conn>) {
     let _ = db::set_status(pool, id, "expired", false, true, None, Some("expired")).await;
     let msg = encode(&ServerMsg::Error {
         message: "expired".into(),
     });
-    broadcast(ours, theirs, spectators, &msg).await;
+    broadcast(conns, &msg).await;
 }
 
 fn end_msg(sim: &FightState, result: RoundResult, round: u32, match_over: bool) -> ServerMsg {
@@ -566,15 +540,9 @@ fn hello_msg(
     }
 }
 
-async fn broadcast(ours: &Slot, theirs: &Slot, spectators: &[mpsc::Sender<String>], msg: &str) {
-    if let Some(tx) = &ours.tx {
-        let _ = tx.send(msg.to_string()).await;
-    }
-    if let Some(tx) = &theirs.tx {
-        let _ = tx.send(msg.to_string()).await;
-    }
-    for tx in spectators.iter() {
-        let _ = tx.send(msg.to_string()).await;
+async fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
+    for conn in conns.values() {
+        let _ = conn.tx.send(msg.to_string()).await;
     }
 }
 
@@ -586,4 +554,100 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.with_timezone(&Utc))
+}
+
+fn conn_role(conn: &Conn, row: &MatchRow, hunks: &[db::HunkRow], round: u32, github: bool) -> Role {
+    role_for(
+        github,
+        row.ours_login.as_deref(),
+        db::theirs_login_for_round(hunks, round, row.theirs_login.as_deref()),
+        conn.login.as_deref(),
+        conn.token.as_deref(),
+        row.ours_token.as_deref(),
+        row.theirs_token.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_round_identity(
+    row: &MatchRow,
+    hunks: &[db::HunkRow],
+    round: u32,
+    github: bool,
+    ours: &mut Slot,
+    theirs: &mut Slot,
+    theirs_name: &mut String,
+    mirror: &mut bool,
+    initial: bool,
+) {
+    *theirs_name = db::theirs_name_for_round(hunks, round, &row.theirs_name);
+    if github {
+        let ours_login = row.ours_login.as_deref();
+        let t_login = db::theirs_login_for_round(hunks, round, row.theirs_login.as_deref());
+        *mirror = t_login.is_some() && t_login == ours_login;
+        ours.kind_cpu = row.ours_kind == "cpu";
+        theirs.kind_cpu = !*mirror
+            && (t_login.is_none()
+                || (row.theirs_kind == "cpu" && t_login == row.theirs_login.as_deref()));
+    } else {
+        *mirror = row.ours_kind == "mirror" || row.theirs_kind == "mirror";
+        ours.kind_cpu = row.ours_kind == "cpu";
+        theirs.kind_cpu = row.theirs_kind == "cpu";
+    }
+    if ours.kind_cpu {
+        ours.seen = true;
+        ours.disconnected_at = None;
+    } else if !initial {
+        ours.disconnected_at = None;
+    }
+    if theirs.kind_cpu {
+        theirs.seen = true;
+        theirs.disconnected_at = None;
+    } else if !initial {
+        theirs.seen = false;
+        theirs.disconnected_at = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_slots(
+    conns: &BTreeMap<u64, Conn>,
+    row: &MatchRow,
+    hunks: &[db::HunkRow],
+    round: u32,
+    github: bool,
+    ours: &mut Slot,
+    theirs: &mut Slot,
+    match_started: bool,
+) {
+    let mut ours_here = ours.kind_cpu;
+    let mut theirs_here = theirs.kind_cpu;
+    for conn in conns.values() {
+        match conn_role(conn, row, hunks, round, github) {
+            Role::Ours => ours_here = true,
+            Role::Theirs => theirs_here = true,
+            Role::Both => {
+                ours_here = true;
+                theirs_here = true;
+            }
+            Role::Spectator => {}
+        }
+    }
+    apply_presence(ours, ours_here, match_started);
+    apply_presence(theirs, theirs_here, match_started);
+}
+
+fn apply_presence(slot: &mut Slot, here: bool, match_started: bool) {
+    if here {
+        slot.seen = true;
+        slot.disconnected_at = None;
+        return;
+    }
+    if slot.kind_cpu {
+        slot.disconnected_at = None;
+        return;
+    }
+    if (slot.seen || match_started) && slot.disconnected_at.is_none() {
+        slot.disconnected_at = Some(Instant::now());
+    }
 }

@@ -26,6 +26,96 @@ impl Role {
     }
 }
 
+/// Slot from the session login (GitHub matches) or share token (local matches).
+/// `theirs_login` is the right-side identity for the **current** round.
+#[allow(clippy::too_many_arguments)]
+pub fn role_for(
+    github: bool,
+    ours_login: Option<&str>,
+    theirs_login: Option<&str>,
+    login: Option<&str>,
+    token: Option<&str>,
+    ours_token: Option<&str>,
+    theirs_token: Option<&str>,
+) -> Role {
+    if github {
+        let Some(login) = login else {
+            return Role::Spectator;
+        };
+        let ours = ours_login == Some(login);
+        let theirs = theirs_login == Some(login);
+        return match (ours, theirs) {
+            (true, true) => Role::Both,
+            (true, false) => Role::Ours,
+            (false, true) => Role::Theirs,
+            (false, false) => Role::Spectator,
+        };
+    }
+    match token {
+        Some(t) if ours_token == Some(t) && theirs_token == Some(t) => Role::Both,
+        Some(t) if ours_token == Some(t) => Role::Ours,
+        Some(t) if theirs_token == Some(t) => Role::Theirs,
+        _ => Role::Spectator,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_roles_follow_this_round_theirs() {
+        assert_eq!(
+            role_for(
+                true,
+                Some("alice"),
+                Some("bob"),
+                Some("bob"),
+                None,
+                None,
+                None
+            ),
+            Role::Theirs
+        );
+        assert_eq!(
+            role_for(
+                true,
+                Some("alice"),
+                Some("carol"),
+                Some("bob"),
+                None,
+                None,
+                None
+            ),
+            Role::Spectator
+        );
+        assert_eq!(
+            role_for(
+                true,
+                Some("alice"),
+                Some("alice"),
+                Some("alice"),
+                None,
+                None,
+                None
+            ),
+            Role::Both
+        );
+        assert_eq!(
+            role_for(
+                true,
+                Some("alice"),
+                Some("bob"),
+                None,
+                Some("ours-token"),
+                Some("o"),
+                Some("t")
+            ),
+            Role::Spectator
+        );
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {

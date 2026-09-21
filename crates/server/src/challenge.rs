@@ -35,6 +35,13 @@ pub async fn start_challenge(
         ));
     }
 
+    let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, owner, repo, number, 3600)
+        .await
+        .map_err(|e| e.to_string())?;
+    if recent_pr >= crate::limits::MAX_MATCHES_PER_PR_HOUR {
+        return Ok("too many fights on this pull request; try later".into());
+    }
+
     let recent = db::count_recent_matches_for_install(&ctx.pool, installation_id, 3600)
         .await
         .map_err(|e| e.to_string())?;
@@ -104,34 +111,25 @@ pub async fn start_challenge(
     }
 
     let ours_login = pr.user.login.clone();
-    let blame_sha = hunks
-        .first()
-        .map(|h| h.blame_sha.clone())
-        .unwrap_or_default();
-    let blame_email = hunks
-        .first()
-        .map(|h| h.blame_email.clone())
-        .unwrap_or_default();
-    let blame_name = hunks
-        .first()
-        .map(|h| h.blame_name.clone())
-        .unwrap_or_else(|| "theirs".into());
-    let mut theirs_login = ctx
-        .gh
-        .login_for_commit(installation_id, owner, repo, &blame_sha)
+    let mut login_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut sides: Vec<(String, String, Option<String>)> = Vec::new();
+    for h in &hunks {
+        let login = blame_login(
+            &ctx.gh,
+            installation_id,
+            owner,
+            repo,
+            &h.blame_sha,
+            &h.blame_email,
+            &mut login_cache,
+        )
         .await;
-    if theirs_login.is_none() {
-        theirs_login = ctx
-            .gh
-            .login_for_email(installation_id, owner, repo, &blame_email)
-            .await;
+        sides.push(side_from_blame(&ours_login, login, &h.blame_name));
     }
-
-    let (theirs_kind, theirs_name, theirs_login) = match theirs_login {
-        Some(login) if login == ours_login => ("mirror", ours_login.clone(), Some(login)),
-        Some(login) => ("github", login.clone(), Some(login)),
-        None => ("cpu", blame_name, None),
-    };
+    let (theirs_kind, theirs_name, theirs_login) = sides
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ("cpu".into(), "theirs".into(), None));
 
     let id = uuid::Uuid::new_v4().simple().to_string();
     let seed = uuid::Uuid::new_v4().as_u128() as u64;
@@ -151,7 +149,7 @@ pub async fn start_challenge(
                 "github"
             }
             .into(),
-            theirs_kind: theirs_kind.into(),
+            theirs_kind: theirs_kind.clone(),
             ours_login: Some(ours_login.clone()),
             theirs_login,
             ours_token,
@@ -185,8 +183,8 @@ pub async fn start_challenge(
                 ours: &h.ours,
                 theirs: &h.theirs,
                 base: &h.base,
-                theirs_login: None,
-                theirs_name: Some(&h.blame_name),
+                theirs_login: sides.get(round).and_then(|s| s.2.as_deref()),
+                theirs_name: sides.get(round).map(|s| s.1.as_str()),
                 ours_stats,
                 theirs_stats,
             },
@@ -222,6 +220,48 @@ pub fn is_bot_user(kind: Option<&str>, login: Option<&str>) -> bool {
         return true;
     }
     login.map(|l| l.ends_with("[bot]")).unwrap_or(false)
+}
+
+async fn blame_login(
+    gh: &crate::gh::GitHub,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+    email: &str,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    let key = if !sha.is_empty() {
+        format!("s:{sha}")
+    } else {
+        format!("e:{email}")
+    };
+    if let Some(hit) = cache.get(&key) {
+        return hit.clone();
+    }
+    let mut login = gh.login_for_commit(installation_id, owner, repo, sha).await;
+    if login.is_none() {
+        login = gh
+            .login_for_email(installation_id, owner, repo, email)
+            .await;
+    }
+    cache.insert(key, login.clone());
+    if !email.is_empty() {
+        cache.entry(format!("e:{email}")).or_insert(login.clone());
+    }
+    login
+}
+
+fn side_from_blame(
+    ours_login: &str,
+    login: Option<String>,
+    blame_name: &str,
+) -> (String, String, Option<String>) {
+    match login {
+        Some(l) if l == ours_login => ("mirror".into(), ours_login.to_string(), Some(l)),
+        Some(l) => ("github".into(), l.clone(), Some(l)),
+        None => ("cpu".into(), blame_name.to_string(), None),
+    }
 }
 
 #[cfg(test)]

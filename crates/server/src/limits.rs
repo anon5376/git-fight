@@ -9,3 +9,5 @@ pub const MAX_HUNKS: usize = 15;
 pub const MAX_BLOB_BYTES: usize = 1_048_576;
 /// New `/fight` (and auto-challenge) starts per GitHub installation per hour.
 pub const MAX_MATCHES_PER_INSTALL_HOUR: i64 = 20;
+/// New `/fight` (and auto-challenge) starts per pull request per hour.
+pub const MAX_MATCHES_PER_PR_HOUR: i64 = 5;

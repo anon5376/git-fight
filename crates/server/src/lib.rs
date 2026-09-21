@@ -16,7 +16,7 @@ pub use app::{router, serve, AppState, Config};
 pub use auth::{sign as sign_session, Auth};
 pub use db::connect as db_connect;
 pub use gh::GitHub;
-pub use limits::MAX_MATCHES_PER_INSTALL_HOUR;
+pub use limits::{MAX_MATCHES_PER_INSTALL_HOUR, MAX_MATCHES_PER_PR_HOUR};
 pub use protocol::EXPIRE_SECS as protocol_expire_secs;
 pub use protocol::INPUT_DELAY;
 pub use result::{publish as publish_result, ResultCtx};

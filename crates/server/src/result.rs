@@ -104,7 +104,9 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             let pr = gh
                 .get_pull(inst, &row.owner, &row.repo, row.pr_number as u64)
                 .await?;
-            if pr.head.sha != row.pr_head_sha || pr.base.sha != row.pr_base_sha {
+            if !pr.head.sha.eq_ignore_ascii_case(&row.pr_head_sha)
+                || !pr.base.sha.eq_ignore_ascii_case(&row.pr_base_sha)
+            {
                 let body = format!(
                     "git fight: this fight used outdated code (PR head or base moved). Nothing was pushed. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
                     ctx.public_url.trim_end_matches('/'),

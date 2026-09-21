@@ -431,6 +431,53 @@ pub async fn count_recent_matches_for_install(
     .map(|r| r.0)
 }
 
+pub async fn count_recent_matches_for_pr(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    within_secs: i64,
+) -> Result<i64, sqlx::Error> {
+    let cutoff = (Utc::now() - Duration::seconds(within_secs)).to_rfc3339();
+    sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM matches WHERE owner = ? AND repo = ? AND pr_number = ? AND created_at >= ?",
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(pr as i64)
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await
+    .map(|r| r.0)
+}
+
+pub fn theirs_login_for_round<'a>(
+    hunks: &'a [HunkRow],
+    round: u32,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    hunks
+        .iter()
+        .find(|h| h.round_index == i64::from(round))
+        .and_then(|h| h.theirs_login.as_deref())
+        .or(fallback)
+}
+
+pub fn theirs_name_for_round(hunks: &[HunkRow], round: u32, fallback: &str) -> String {
+    hunks
+        .iter()
+        .find(|h| h.round_index == i64::from(round))
+        .and_then(|h| h.theirs_name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+pub fn github_identity(row: &MatchRow, hunks: &[HunkRow]) -> bool {
+    row.ours_login.is_some()
+        || row.theirs_login.is_some()
+        || hunks.iter().any(|h| h.theirs_login.is_some())
+}
+
 pub async fn record_delivery(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, received_at) VALUES (?, ?)",
@@ -775,5 +822,17 @@ mod tests {
             .unwrap();
         assert_eq!(open.id, "inst1");
         assert_eq!(open.pr_head_sha, "h");
+        assert_eq!(
+            count_recent_matches_for_pr(&pool, "acme", "box", 1, 3600)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            count_recent_matches_for_pr(&pool, "acme", "box", 2, 3600)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

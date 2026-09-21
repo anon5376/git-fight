@@ -1,5 +1,6 @@
-use futures_util::StreamExt;
-use git_fight_server::db::NewMatch;
+use futures_util::{SinkExt, StreamExt};
+use git_fight_core::FighterStats;
+use git_fight_server::db::{NewHunk, NewMatch};
 use git_fight_server::{sign_session, Auth, Config};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -144,6 +145,144 @@ async fn github_match_roles_follow_session_not_token() {
         hello_role(addr, Some(&alice), Some("theirs-token")).await,
         "ours"
     );
+}
+
+#[tokio::test]
+async fn later_round_gives_theirs_slot_to_that_hunk_author() {
+    let (addr, pool) = spawn_cfg(Config {
+        instant: true,
+        ..Config::default()
+    })
+    .await;
+    github_match(&pool).await;
+    for round in 0..2 {
+        let login = if round == 0 { "bob" } else { "carol" };
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "match1",
+                round,
+                path: "lib.rs",
+                hunk_index: round,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: Some(login),
+                theirs_name: Some(login),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let alice = session(&pool, "alice").await;
+    let bob = session(&pool, "bob").await;
+    let carol = session(&pool, "carol").await;
+
+    let (mut alice_sink, mut alice_stream) = connect(addr, Some(&alice)).await;
+    let (mut bob_sink, mut bob_stream) = connect(addr, Some(&bob)).await;
+    let (_carol_sink, mut carol_stream) = connect(addr, Some(&carol)).await;
+
+    assert_eq!(
+        wait_type(&mut alice_stream, "hello").await["your_role"].as_str(),
+        Some("ours")
+    );
+    assert_eq!(
+        wait_type(&mut bob_stream, "hello").await["your_role"].as_str(),
+        Some("theirs")
+    );
+    assert_eq!(
+        wait_type(&mut carol_stream, "hello").await["your_role"].as_str(),
+        Some("spectator")
+    );
+
+    let mut next_send = 0u32;
+    let mut confirmed: i32 = -1;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let end = loop {
+        let horizon = u32::try_from(confirmed.saturating_add(1)).unwrap_or(0) + 24;
+        while next_send <= horizon {
+            let msg = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
+            alice_sink
+                .send(Message::Text(msg.clone().into()))
+                .await
+                .unwrap();
+            bob_sink.send(Message::Text(msg.into())).await.unwrap();
+            next_send = next_send.saturating_add(1);
+        }
+        let msg = tokio::time::timeout_at(deadline, alice_stream.next())
+            .await
+            .expect("timeout waiting for round 0")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("tick") => confirmed = v["n"].as_i64().unwrap_or(0) as i32,
+            Some("end") => break v,
+            Some("error") => panic!("server error {}", v["message"]),
+            _ => {}
+        }
+    };
+    assert_eq!(end["match_over"].as_bool(), Some(false));
+    assert_eq!(
+        wait_type(&mut alice_stream, "hello").await["your_role"].as_str(),
+        Some("ours")
+    );
+    assert_eq!(
+        wait_type(&mut bob_stream, "hello").await["your_role"].as_str(),
+        Some("spectator")
+    );
+    assert_eq!(
+        wait_type(&mut carol_stream, "hello").await["your_role"].as_str(),
+        Some("theirs")
+    );
+}
+
+async fn connect(
+    addr: std::net::SocketAddr,
+    cookie: Option<&str>,
+) -> (
+    futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        Message,
+    >,
+    futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    >,
+) {
+    let url = format!("ws://{addr}/ws?match=match1");
+    let mut req = url.into_client_request().unwrap();
+    if let Some(c) = cookie {
+        req.headers_mut()
+            .insert("Cookie", format!("git_fight_sid={c}").parse().unwrap());
+    }
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.split()
+}
+
+async fn wait_type(
+    stream: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    ty: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timeout waiting for ws")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        if v["type"].as_str() == Some(ty) {
+            return v;
+        }
+    }
 }
 
 #[tokio::test]
