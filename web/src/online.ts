@@ -132,6 +132,7 @@ export function paintFight(
   });
   stage.dataset.oursHp = String(fight.ours_hp());
   stage.dataset.theirsHp = String(fight.theirs_hp());
+  stage.dataset.round = String(roundLabel);
 }
 
 export function showKo(ko: HTMLElement, result: number): void {
