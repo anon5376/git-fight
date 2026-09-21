@@ -1858,7 +1858,7 @@ async fn later_round_disconnect_forfeits_after_prior_latch() {
     let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
     let (theirs_ws, _) = tokio_tungstenite::connect_async(&theirs_url).await.unwrap();
     let (mut ours_sink, mut ours_stream) = ours_ws.split();
-    let (theirs_sink, mut theirs_stream) = theirs_ws.split();
+    let (mut theirs_sink, mut theirs_stream) = theirs_ws.split();
     let ours_hello = wait_type(&mut ours_stream, "hello").await;
     let theirs_hello = wait_type(&mut theirs_stream, "hello").await;
     assert_eq!(ours_hello["round"].as_u64(), Some(1));
