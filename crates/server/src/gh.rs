@@ -35,12 +35,16 @@ const MAX_API_JSON: usize = 1_048_576;
 /// Installation token, OAuth token, and `GET /user` JSON.
 const MAX_TOKEN_JSON: usize = 16 * 1024;
 
-/// Blame → GitHub login. `None` is “no account” (CPU). `Unavailable` is a
-/// transient HTTP/parse miss and must not be stored as CPU.
+/// Blame → GitHub login.
+/// `None` is “no account” (CPU) and may fall back to email lookup.
+/// `Rejected` is an author.login that is not a GitHub name — CPU, no email
+/// fallback (`?author=` is any recent commit with that address, not this SHA).
+/// `Unavailable` is a transient HTTP/parse miss and must not be stored as CPU.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoginLookup {
     Found(String),
     None,
+    Rejected,
     Unavailable,
 }
 
@@ -474,7 +478,7 @@ impl GitHub {
         match row.author.and_then(|a| a.login) {
             Some(login) => match normalize_github_login(&login) {
                 Some(stored) => LoginLookup::Found(stored),
-                None => LoginLookup::None,
+                None => LoginLookup::Rejected,
             },
             None => LoginLookup::None,
         }

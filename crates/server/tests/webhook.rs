@@ -2216,6 +2216,48 @@ async fn blame_email_maps_through_commits_api() {
 }
 
 #[tokio::test]
+async fn unsafe_commit_login_does_not_email_fallback() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_author: json!({ "login": "acme/other" }),
+            ..Default::default()
+        },
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .and(HasQueryParam("author"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "author": { "login": "mallory" },
+            "commit": { "author": { "email": "bob@example.com" } }
+        }])))
+        .mount(&mock)
+        .await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-reject-login", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("CPU") && t.contains("/match/") && !t.contains("mallory")),
+        "an unsafe author.login must stay CPU, not the email-lookup login: {comments:?}"
+    );
+    let id = match_id_from(&comments);
+    let hunks = git_fight_server::db::list_hunks(&pool, &id).await.unwrap();
+    assert!(
+        hunks.iter().all(|h| h.theirs_login.is_none()),
+        "{:?}",
+        hunks.iter().map(|h| &h.theirs_login).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn blame_http_failure_does_not_start_a_cpu_fight() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(

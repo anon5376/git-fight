@@ -253,7 +253,7 @@ async fn run_room(
                                     db::stats_for_round(&hunks, round),
                                     &hunks,
                                 );
-                                let _ = tx.try_send(encode(&hello));
+                                try_send_or_spawn(&tx, encode(&hello));
                                 let snap = snapshot_msg(
                                     round_seed(seed, round),
                                     round,
@@ -262,12 +262,13 @@ async fn run_room(
                                     &log,
                                     &hunks,
                                 );
-                                let _ = tx.try_send(encode(&snap));
+                                try_send_or_spawn(&tx, encode(&snap));
                                 if let Some(result) = sim.result {
                                     let match_over = round + 1 >= total_rounds;
-                                    let _ = tx.try_send(encode(&end_msg(
-                                        &sim, result, round, match_over,
-                                    )));
+                                    try_send_or_spawn(
+                                        &tx,
+                                        encode(&end_msg(&sim, result, round, match_over)),
+                                    );
                                 }
                             }
                         }
@@ -593,6 +594,23 @@ fn last_round_done(marked: bool, open: MatchOpen) -> bool {
     marked || open == MatchOpen::Closed
 }
 
+/// After a non-final winner is stored, broadcast End only when the row is
+/// known still open. Unknown retries without End.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfterNonFinal {
+    EndAndAdvance,
+    Expire,
+    Retry,
+}
+
+fn after_non_final(open: MatchOpen) -> AfterNonFinal {
+    match open {
+        MatchOpen::Open => AfterNonFinal::EndAndAdvance,
+        MatchOpen::Closed => AfterNonFinal::Expire,
+        MatchOpen::Unknown => AfterNonFinal::Retry,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoredRound {
     Winner,
@@ -668,16 +686,19 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         broadcast(a.conns, &msg);
         return true;
     }
-    let msg = encode(&end_msg(a.sim, result, *a.round, false));
-    broadcast(a.conns, &msg);
-    match match_is_open(a.pool, a.id).await {
-        MatchOpen::Closed => {
+    // Clients advance Input.round on End. A busy open-status read must
+    // retry without that broadcast so GitHub inputs for the next conflict
+    // are not dropped while this room is still on the finished round.
+    match after_non_final(match_is_open(a.pool, a.id).await) {
+        AfterNonFinal::Expire => {
             expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
             return true;
         }
-        MatchOpen::Unknown => return false,
-        MatchOpen::Open => {}
+        AfterNonFinal::Retry => return false,
+        AfterNonFinal::EndAndAdvance => {}
     }
+    let msg = encode(&end_msg(a.sim, result, *a.round, false));
+    broadcast(a.conns, &msg);
     *a.round += 1;
     let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
     *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
@@ -757,16 +778,19 @@ async fn closed_message(pool: &SqlitePool, id: &str) -> String {
 
 async fn send_closed(tx: &mpsc::Sender<String>, pool: &SqlitePool, id: &str) {
     let message = closed_message(pool, id).await;
-    let _ = tx.try_send(encode(&ServerMsg::Error { message }));
+    try_send_or_spawn(tx, encode(&ServerMsg::Error { message }));
 }
 
 async fn drain_late_joins(rx: &mut mpsc::Receiver<RoomEvent>, pool: &SqlitePool, id: &str) {
     let message = closed_message(pool, id).await;
     while let Ok(ev) = rx.try_recv() {
         if let RoomEvent::Join { tx, .. } = ev {
-            let _ = tx.try_send(encode(&ServerMsg::Error {
-                message: message.clone(),
-            }));
+            try_send_or_spawn(
+                &tx,
+                encode(&ServerMsg::Error {
+                    message: message.clone(),
+                }),
+            );
         }
     }
 }
@@ -904,9 +928,10 @@ fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
     }
 }
 
-/// Next-round Hello must not vanish when the outbound channel is full.
-/// Ticks can be skipped (Snapshot on reconnect); a dropped Hello leaves
-/// `--instant` waiting forever for Input tagged with the new round.
+/// Join Hello/Snapshot and next-round Hello must not vanish when the
+/// outbound channel is full. Ticks can be skipped (Snapshot on reconnect);
+/// a dropped Hello leaves `--instant` waiting forever for Input tagged
+/// with the new round.
 fn try_send_or_spawn(tx: &mpsc::Sender<String>, msg: String) {
     if let Err(err) = tx.try_send(msg) {
         match err {
@@ -1236,5 +1261,28 @@ mod tests {
             !last_round_done(false, MatchOpen::Unknown),
             "busy mark must not leave a won fight without a room"
         );
+        assert_eq!(
+            after_non_final(MatchOpen::Open),
+            AfterNonFinal::EndAndAdvance
+        );
+        assert_eq!(after_non_final(MatchOpen::Closed), AfterNonFinal::Expire);
+        assert_eq!(
+            after_non_final(MatchOpen::Unknown),
+            AfterNonFinal::Retry,
+            "busy open-status must not broadcast End before the next Hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_send_or_spawn_delivers_when_buffer_is_full() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("held".into()).unwrap();
+        try_send_or_spawn(&tx, "hello".into());
+        assert_eq!(rx.recv().await.as_deref(), Some("held"));
+        let next = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("spawned send waited")
+            .expect("channel open");
+        assert_eq!(next, "hello");
     }
 }

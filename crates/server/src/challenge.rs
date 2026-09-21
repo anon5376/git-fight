@@ -433,13 +433,14 @@ async fn blame_login(
     let login = match gh.login_for_commit(installation_id, owner, repo, sha).await {
         crate::gh::LoginLookup::Found(login) => Some(login),
         crate::gh::LoginLookup::Unavailable => return Err(()),
+        crate::gh::LoginLookup::Rejected => None,
         crate::gh::LoginLookup::None => match gh
             .login_for_email(installation_id, owner, repo, email)
             .await
         {
             crate::gh::LoginLookup::Found(login) => Some(login),
             crate::gh::LoginLookup::Unavailable => return Err(()),
-            crate::gh::LoginLookup::None => None,
+            crate::gh::LoginLookup::Rejected | crate::gh::LoginLookup::None => None,
         },
     };
     cache.insert(key, login.clone());

@@ -462,7 +462,7 @@ async fn login_for_commit_drops_unsafe_login() {
     let gh = client(&mock);
     assert_eq!(
         gh.login_for_commit(1, "acme", "box", sha).await,
-        LoginLookup::None
+        LoginLookup::Rejected
     );
 }
 
