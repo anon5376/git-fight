@@ -516,12 +516,14 @@ enum FinishAfterWrite {
     Retry,
 }
 
-fn finish_after_write(tagged: bool, open: MatchOpen, stored: bool) -> FinishAfterWrite {
+fn finish_after_write(tagged: bool, open: MatchOpen, stored: StoredRound) -> FinishAfterWrite {
     if tagged {
         FinishAfterWrite::Proceed { record: true }
     } else if open == MatchOpen::Closed {
         FinishAfterWrite::Close
-    } else if stored {
+    } else if matches!(stored, StoredRound::Winner | StoredRound::Missing) {
+        // Winner: write-once resume. Missing: local demo / no hunk row —
+        // there is nothing to score; still End. Do not retry forever.
         FinishAfterWrite::Proceed { record: false }
     } else {
         FinishAfterWrite::Retry
@@ -549,16 +551,23 @@ fn last_round_done(marked: bool, open: MatchOpen) -> bool {
     marked || open == MatchOpen::Closed
 }
 
-async fn stored_round_has_winner(pool: &SqlitePool, id: &str, round: u32) -> bool {
-    db::list_hunks(pool, id)
-        .await
-        .ok()
-        .and_then(|hs| {
-            hs.into_iter()
-                .find(|h| h.round_index == i64::from(round))
-                .and_then(|h| h.winner)
-        })
-        .is_some()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredRound {
+    Winner,
+    Empty,
+    Missing,
+    Unknown,
+}
+
+async fn stored_round(pool: &SqlitePool, id: &str, round: u32) -> StoredRound {
+    match db::list_hunks(pool, id).await {
+        Err(_) => StoredRound::Unknown,
+        Ok(hs) => match hs.into_iter().find(|h| h.round_index == i64::from(round)) {
+            None => StoredRound::Missing,
+            Some(h) if h.winner.is_some() => StoredRound::Winner,
+            Some(_) => StoredRound::Empty,
+        },
+    }
 }
 
 async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
@@ -578,9 +587,11 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         .await
         .unwrap_or(false);
     let open = match_is_open(a.pool, a.id).await;
-    let stored = !tagged
-        && open != MatchOpen::Closed
-        && stored_round_has_winner(a.pool, a.id, *a.round).await;
+    let stored = if tagged {
+        StoredRound::Winner
+    } else {
+        stored_round(a.pool, a.id, *a.round).await
+    };
     match finish_after_write(tagged, open, stored) {
         FinishAfterWrite::Proceed { record: true } => {
             *a.forfeit_pending = false;
@@ -1111,37 +1122,47 @@ mod tests {
     #[test]
     fn finish_retries_when_winner_write_fails_and_nothing_is_stored() {
         assert_eq!(
-            finish_after_write(true, MatchOpen::Open, false),
+            finish_after_write(true, MatchOpen::Open, StoredRound::Empty),
             FinishAfterWrite::Proceed { record: true }
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Closed, false),
+            finish_after_write(false, MatchOpen::Closed, StoredRound::Empty),
             FinishAfterWrite::Close
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Open, true),
+            finish_after_write(false, MatchOpen::Open, StoredRound::Winner),
             FinishAfterWrite::Proceed { record: false },
             "write-once already set: resume End / next round"
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Open, false),
+            finish_after_write(false, MatchOpen::Open, StoredRound::Empty),
             FinishAfterWrite::Retry,
             "SQLite miss must not advance as if the hunk was scored"
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Unknown, false),
+            finish_after_write(false, MatchOpen::Unknown, StoredRound::Empty),
             FinishAfterWrite::Retry,
             "a busy status read is not a closed match"
         );
         assert_eq!(
-            finish_after_write(true, MatchOpen::Unknown, false),
+            finish_after_write(true, MatchOpen::Unknown, StoredRound::Empty),
             FinishAfterWrite::Proceed { record: true },
             "a successful write still records even if the follow-up status read fails"
         );
         assert_eq!(
-            finish_after_write(false, MatchOpen::Unknown, true),
+            finish_after_write(false, MatchOpen::Unknown, StoredRound::Winner),
             FinishAfterWrite::Proceed { record: false },
             "write-once already set: do not expire on a busy status read"
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Open, StoredRound::Missing),
+            FinishAfterWrite::Proceed { record: false },
+            "local demo has no hunk row; still End"
+        );
+        assert_eq!(
+            finish_after_write(false, MatchOpen::Open, StoredRound::Unknown),
+            FinishAfterWrite::Retry,
+            "cannot tell whether the hunk exists; do not ghost-advance"
         );
         assert!(last_round_done(true, MatchOpen::Open));
         assert!(last_round_done(false, MatchOpen::Closed));
