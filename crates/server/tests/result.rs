@@ -449,6 +449,85 @@ async fn outdated_pr_skips_push() {
 }
 
 #[tokio::test]
+async fn expired_pending_match_comments_and_skips_push() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let before = heads(&bare);
+    let mock = github_mocks(&head, &base).await;
+    let dir = std::env::temp_dir().join(format!(
+        "gf-expire-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    seed_match(&pool, &head, &base, None).await;
+    git_fight_server::db::set_challenge_comment_id(&pool, MATCH_ID, 42)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE matches SET expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?")
+        .bind(MATCH_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut test_repos = HashMap::new();
+    test_repos.insert("acme/box".into(), bare.clone());
+    let cfg = Config {
+        github: Some(gh(&mock)),
+        auth: Auth {
+            session_key: KEY.to_vec(),
+            public_url: "http://fight.test".into(),
+        },
+        test_repos,
+        ..Config::default()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(listener, serve_pool, cfg)
+            .await
+            .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..80 {
+        if row.status == "expired" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        row = git_fight_server::db::get_match(&pool, MATCH_ID)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(row.status, "expired");
+    assert_eq!(row.abort_reason.as_deref(), Some("expired"));
+    assert!(row.result_branch.is_none());
+    assert!(row.final_hash.is_none());
+    assert_eq!(heads(&bare), before);
+    let patched = patched_comments(&mock).await;
+    assert!(
+        patched.iter().any(|c| {
+            c.contains("expired") && c.contains("Nothing was pushed") && c.contains("/fight")
+        }),
+        "patched={patched:?} posted={:?}",
+        posted_comments(&mock).await
+    );
+}
+
+#[tokio::test]
 async fn result_edits_challenge_comment_when_id_set() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base).await;

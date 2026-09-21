@@ -40,6 +40,30 @@ async fn two_clients_agree_with_server_hash() {
 }
 
 #[tokio::test]
+async fn lag_holds_outbound_hello() {
+    let addr = spawn_server(Config {
+        lag: Duration::from_millis(80),
+        instant: true,
+        ..Config::default()
+    })
+    .await;
+    let created: Value = http_post(addr, "/api/matches", r#"{"seed":1}"#).await.1;
+    let id = created["id"].as_str().unwrap();
+    let token = created["ours_token"].as_str().unwrap();
+    let url = format!("ws://{addr}/ws?match={id}&token={token}");
+    let started = tokio::time::Instant::now();
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let hello = wait_type(&mut stream, "hello").await;
+    assert_eq!(hello["type"].as_str(), Some("hello"));
+    assert!(
+        started.elapsed() >= Duration::from_millis(60),
+        "Hello arrived in {:?} without --lag-ms hold",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn cpu_lockstep_hashes_agree_with_client() {
     use git_fight_server::db::{NewHunk, NewMatch};
     let dir = std::env::temp_dir().join(format!(

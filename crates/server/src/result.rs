@@ -275,10 +275,6 @@ async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) {
 }
 
 pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) {
-    let public = ctx.public_url.trim_end_matches('/');
-    let body = format!(
-        "git fight: this match expired before anyone finished. Nothing was pushed.\nopen match: {public}/match/{}",
-        row.id
-    );
+    let body = "git fight: this match expired before anyone finished. Nothing was pushed. Comment `/fight` for a rematch.".to_string();
     comment(ctx, row, &body).await;
 }
