@@ -459,7 +459,7 @@ pub async fn fighter_stats(dir: &Path, rev: &str, path: &str, author: &str) -> F
     }
     let hp = hp_from_blame(dir, rev, path, author).await;
     let armor = armor_from_commit(dir, rev, path).await;
-    let special = special_from_log(dir, author).await;
+    let special = special_from_log(dir, rev, author).await;
     FighterStats::clamped(hp, armor, special)
 }
 
@@ -512,14 +512,18 @@ async fn armor_from_commit(dir: &Path, rev: &str, path: &str) -> bool {
     String::from_utf8_lossy(&out).lines().any(looks_like_test)
 }
 
-async fn special_from_log(dir: &Path, name: &str) -> bool {
+async fn special_from_log(dir: &Path, rev: &str, name: &str) -> bool {
     let name = name.trim();
     if name.is_empty() || name.contains('\0') || name.contains('\n') || name.starts_with('-') {
+        return false;
+    }
+    if !is_safe_rev(rev) {
         return false;
     }
     let mut cmd = git_dir(dir);
     cmd.args(["log", "--since=7 days ago", "--format=%ad", "--date=short"]);
     cmd.arg(format!("--author={name}"));
+    cmd.arg(rev);
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(15)).await else {
         return false;
     };
