@@ -3,7 +3,7 @@
 use crate::db::{self, clip_display_path, HunkRow, MatchRow};
 use crate::gh::GitHub;
 use crate::gitutil::{self, ExistingResult};
-use crate::limits::GIT_JOB_TIMEOUT;
+use crate::limits::{GIT_JOB_TIMEOUT, MAX_HUNKS};
 use git_fight_core::{ConflictFile, Pick};
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -525,10 +525,17 @@ async fn skip_push(
     Ok(())
 }
 
+fn hunk_slot(index: i64) -> Option<usize> {
+    let n = usize::try_from(index).ok()?;
+    (n < MAX_HUNKS).then_some(n)
+}
+
 fn grouped_picks(hunks: &[HunkRow]) -> BTreeMap<String, Vec<Option<Pick>>> {
     let mut max_idx: BTreeMap<String, usize> = BTreeMap::new();
     for h in hunks {
-        let n = h.hunk_index as usize;
+        let Some(n) = hunk_slot(h.hunk_index) else {
+            continue;
+        };
         max_idx
             .entry(h.path.clone())
             .and_modify(|m| *m = (*m).max(n))
@@ -539,10 +546,10 @@ fn grouped_picks(hunks: &[HunkRow]) -> BTreeMap<String, Vec<Option<Pick>>> {
         out.insert(path, vec![None; max + 1]);
     }
     for h in hunks {
-        if let Some(slot) = out
-            .get_mut(&h.path)
-            .and_then(|v| v.get_mut(h.hunk_index as usize))
-        {
+        let Some(n) = hunk_slot(h.hunk_index) else {
+            continue;
+        };
+        if let Some(slot) = out.get_mut(&h.path).and_then(|v| v.get_mut(n)) {
             *slot = git_pick_for_winner(h.winner.as_deref().unwrap_or(""));
         }
     }
@@ -590,6 +597,28 @@ mod tests {
         assert!(clipped.chars().count() <= 160);
         assert!(clipped.ends_with('…'), "{clipped}");
         assert_eq!(clip_display_path("lib.rs"), "lib.rs");
+    }
+
+    #[test]
+    fn grouped_picks_ignores_hostile_hunk_index() {
+        let row = |index: i64| HunkRow {
+            round_index: 0,
+            path: "lib.rs".into(),
+            hunk_index: index,
+            winner: Some("ours".into()),
+            theirs_name: None,
+            theirs_login: None,
+            ours_hp: 100,
+            ours_armor: false,
+            ours_special: false,
+            theirs_hp: 100,
+            theirs_armor: false,
+            theirs_special: false,
+        };
+        assert!(grouped_picks(&[row(i64::MAX), row(-1)]).is_empty());
+        let picks = grouped_picks(&[row(0)]);
+        assert_eq!(picks.get("lib.rs").map(Vec::len), Some(1));
+        assert_eq!(picks["lib.rs"][0], Some(Pick::Theirs));
     }
 
     #[test]

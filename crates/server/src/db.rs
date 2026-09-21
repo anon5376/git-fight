@@ -786,6 +786,9 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     // Result rebuilds from merge-tree + picks. Do not keep 1 MiB conflict
     // blobs in SQLite (hostile repo disk, and unused at resolve time).
     let _ = (h.ours, h.theirs, h.base);
+    if !(0..crate::limits::MAX_HUNKS as i64).contains(&h.hunk_index) {
+        return Err(sqlx::Error::Protocol("hunk_index".into()));
+    }
     let theirs_login = crate::gh::fold_github_login_opt(h.theirs_login);
     sqlx::query(
         "INSERT INTO match_hunks (

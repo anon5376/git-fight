@@ -163,7 +163,7 @@ After the last round (Milestone 5):
 
 - Any draw, skip, or forfeit that left a hunk unresolved: push nothing; comment the unresolved paths.
 - Re-fetch the PR. If `head` or `base` SHA changed: push nothing; say the fight was over outdated code and offer a rematch (`/fight` again). An aborted or expired match does not record leaderboard rounds or start another round. Hunk winners are write-once and only while the row is still `pending` or `in_progress`.
-- Otherwise build each resolved file in core from the winning side. `git hash-object -w` the blobs, a temporary index, `write-tree`, `commit-tree` with parents `(pr_head_sha, pr_base_sha)`. Commit message lists each round and who won it. Push **only** `refs/heads/git-fight/pr-<number>-<match-id>` (create, never `--force`). If that ref already points at this match's commit (author `git-fight`, those parents, message `git fight match <id>`), that is success — crash recovery, not overwrite.
+- Otherwise build each resolved file in core from the winning side. `git hash-object -w` the blobs, a temporary index, `write-tree`, `commit-tree` with parents `(pr_head_sha, pr_base_sha)`. Commit message lists each round and who won it. Push **only** `refs/heads/git-fight/pr-<number>-<match-id>` (create, never `--force`). If that ref already points at this match's commit (author `git-fight`, those parents, message `git fight match <id>`), that is success — crash recovery, not overwrite. Resolve ignores a `hunk_index` outside `0..15` so a hostile row cannot allocate on publish.
 - `result_branch` and skip `abort_reason` are write-once and mutually exclusive. A later skip cannot clobber a stored branch.
 - Comment: winner of each round, compare URL for the new branch, replay URL `/replay/<id>`.
 - Server restart retries finished GitHub matches that still have no `result_branch` and no skip reason. Transient clone, token, pull, or push failures do not write a skip reason, so boot and the expirer can try the create-only push again. Decision skips (draw, forfeit, outdated, exists, no conflicts, gone PR) still write once and comment. Round winners are write-once on an open match; a resume does not record the same leaderboard round twice or start another round after SHA-drift/expiry.
@@ -268,7 +268,7 @@ One row per round.
 | `match_id` | `TEXT` | FK `matches.id`. |
 | `round_index` | `INTEGER` | `0..n-1`. |
 | `path` | `TEXT` | Repo-relative, already validated. |
-| `hunk_index` | `INTEGER` | Nth fightable hunk in that file. |
+| `hunk_index` | `INTEGER` | Nth fightable hunk in that file (`0..15`). Out of range is not stored and is ignored at resolve. |
 | `ours_bytes`, `theirs_bytes`, `base_bytes` | `BLOB` | Unused at rest. Resolve rebuilds from merge-tree + picks so a hostile 1 MiB hunk cannot sit in SQLite. |
 | `theirs_login`, `theirs_name` | `TEXT` NULL | Right-side identity for this round if it differs. |
 | `winner` | `TEXT` NULL | `ours` / `theirs` / `draw` / `forfeit_ours` / `forfeit_theirs`. |
