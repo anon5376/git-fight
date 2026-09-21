@@ -313,6 +313,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       if (tick.n === fight.tick()) {
         fight.step(tick.ours, tick.theirs);
         confirmed = tick.n;
+        nextSend = Math.max(nextSend, confirmed + 1);
         ui.wait.classList.add("hidden");
       }
     } else if (msg.type === "hash") {
