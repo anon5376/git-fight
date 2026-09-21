@@ -467,6 +467,10 @@ async fn advance(a: Advance<'_>) -> bool {
 }
 
 async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
+    if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
+        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+        return true;
+    }
     let tag = result::winner_tag(result, forfeit);
     let ko =
         !forfeit && result != RoundResult::Draw && (a.sim.ours.hp <= 0 || a.sim.theirs.hp <= 0);

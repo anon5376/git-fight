@@ -101,6 +101,24 @@ async fn ko_win_updates_wins_losses_kos_and_conflicts_caused() {
 }
 
 #[tokio::test]
+async fn aborted_match_does_not_record_stats() {
+    let pool = pool().await;
+    seed(&pool, "m-ab", Some("alice"), Some("bob"), "acme", "box").await;
+    assert!(
+        git_fight_server::db::abort_open_match(&pool, "m-ab", "outdated")
+            .await
+            .unwrap()
+    );
+    git_fight_server::record_round(&pool, "m-ab", 0, "ours", true)
+        .await
+        .unwrap();
+    let board = git_fight_server::db::list_player_stats(&pool, "acme", "box")
+        .await
+        .unwrap();
+    assert!(board.is_empty(), "{board:?}");
+}
+
+#[tokio::test]
 async fn draw_skips_wins_but_counts_conflicts_caused() {
     let pool = pool().await;
     seed(&pool, "m2", Some("alice"), Some("bob"), "acme", "box").await;

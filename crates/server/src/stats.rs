@@ -28,6 +28,9 @@ pub async fn record_round(
     if row.owner.is_empty() || row.repo.is_empty() {
         return Ok(());
     }
+    if !matches!(row.status.as_str(), "pending" | "in_progress") {
+        return Ok(());
+    }
     let hunks = db::list_hunks(pool, match_id).await?;
     let theirs_login = hunks
         .iter()

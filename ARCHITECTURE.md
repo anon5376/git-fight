@@ -162,7 +162,7 @@ Players log in with GitHub. Only the two fighter logins can take a slot; everyon
 After the last round (Milestone 5):
 
 - Any draw, skip, or forfeit that left a hunk unresolved: push nothing; comment the unresolved paths.
-- Re-fetch the PR. If `head` or `base` SHA changed: push nothing; say the fight was over outdated code and offer a rematch (`/fight` again).
+- Re-fetch the PR. If `head` or `base` SHA changed: push nothing; say the fight was over outdated code and offer a rematch (`/fight` again). An aborted or expired match does not record leaderboard rounds or start another round.
 - Otherwise build each resolved file in core from the winning side. `git hash-object -w` the blobs, a temporary index, `write-tree`, `commit-tree` with parents `(pr_head_sha, pr_base_sha)`. Commit message lists each round and who won it. Push **only** `refs/heads/git-fight/pr-<number>-<match-id>` (create, never `--force`).
 - Comment: winner of each round, compare URL for the new branch, replay URL `/replay/<id>`.
 
