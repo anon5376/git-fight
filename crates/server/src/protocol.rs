@@ -141,6 +141,13 @@ mod tests {
         assert_eq!(v["hunk_index"], 1);
         assert_eq!(v["ticks"], serde_json::json!([[0, 1, 0], [1, 0, 2]]));
     }
+
+    #[test]
+    fn play_caps() {
+        assert_eq!(INPUT_DELAY, 3);
+        assert_eq!(DISCONNECT_SECS, 30);
+        assert_eq!(EXPIRE_SECS, 24 * 60 * 60);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

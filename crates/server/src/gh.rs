@@ -17,6 +17,7 @@ pub struct GitHub {
     client_id: String,
     client_secret: String,
     tokens: Arc<Mutex<HashMap<u64, (String, Instant)>>>,
+    poll_wait: Duration,
 }
 
 impl std::fmt::Debug for GitHub {
@@ -49,7 +50,14 @@ impl GitHub {
             client_id,
             client_secret,
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            poll_wait: Duration::from_millis(50),
         }
+    }
+
+    /// Test hook: shorten mergeable backoff. Production keeps the default.
+    pub fn with_poll_wait(mut self, poll_wait: Duration) -> Self {
+        self.poll_wait = poll_wait;
+        self
     }
 
     fn encoding_key(&self) -> Result<EncodingKey, String> {
@@ -186,16 +194,21 @@ impl GitHub {
         repo: &str,
         number: u64,
     ) -> Result<PullInfo, String> {
-        let mut wait = Duration::from_millis(50);
+        let mut wait = self.poll_wait;
+        let cap = (self.poll_wait * 40)
+            .max(Duration::from_millis(1))
+            .min(Duration::from_secs(2));
+        let mut last = None;
         for _ in 0..8 {
             let pr = self.get_pull(installation_id, owner, repo, number).await?;
             if pr.mergeable.is_some() {
                 return Ok(pr);
             }
+            last = Some(pr);
             tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(Duration::from_secs(2));
+            wait = (wait * 2).min(cap);
         }
-        Err("mergeable stayed null".into())
+        last.ok_or_else(|| "mergeable stayed null".into())
     }
 
     pub async fn comment(

@@ -803,6 +803,31 @@ Auto-merging lib.rs\n";
     }
 
     #[test]
+    fn redacts_authorization_from_git_text() {
+        let raw = "fatal: could not read\nAuthorization: bearer ghs_live_token\nx-access-token: abc\nerror: failed\n";
+        let out = redact_git_text(raw);
+        assert!(!out.to_ascii_lowercase().contains("authorization"));
+        assert!(!out.contains("ghs_live_token"));
+        assert!(!out.contains("x-access-token"));
+        assert!(out.contains("error: failed"));
+    }
+
+    #[tokio::test]
+    async fn command_timeout_is_timeout_error() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+        cmd.stdin(Stdio::null());
+        let started = std::time::Instant::now();
+        let err = run(cmd, Duration::from_millis(120)).await.unwrap_err();
+        assert!(matches!(err, GitError::Timeout), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout must not wait out the child"
+        );
+    }
+
+    #[test]
     fn parse_merge_tree_skips_unsafe_paths() {
         let sample = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
 100644 1111111111111111111111111111111111111111 1\t.git/config\n\

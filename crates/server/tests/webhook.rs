@@ -1508,6 +1508,51 @@ async fn mergeable_null_then_false_starts_fight() {
 }
 
 #[tokio::test]
+async fn mergeable_stays_null_comments_and_skips() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![],
+            mergeable: vec![Value::Null],
+        },
+    )
+    .await;
+    let mut cfg = cfg_for(&mock, bare);
+    cfg.github = cfg
+        .github
+        .take()
+        .map(|gh| gh.with_poll_wait(std::time::Duration::from_millis(1)));
+    let (addr, pool) = spawn_with_pool(cfg).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-mergeable-null", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("could not determine mergeability")),
+        "{comments:?}"
+    );
+    assert!(
+        comments.iter().all(|t| !t.contains("/match/")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "undetermined mergeability must not reserve a match"
+    );
+}
+
+#[tokio::test]
 async fn binary_conflict_is_not_fightable() {
     let (_keep, bare, head, base) = binary_conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
