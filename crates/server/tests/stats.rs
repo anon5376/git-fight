@@ -320,6 +320,58 @@ async fn cpu_side_without_login_is_skipped() {
 }
 
 #[tokio::test]
+async fn later_round_cpu_does_not_record_previous_author() {
+    let pool = pool().await;
+    seed(&pool, "m-cpu2", Some("alice"), Some("bob"), "acme", "box").await;
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: "m-cpu2",
+            round: 1,
+            path: "b.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("dave"),
+            ours_stats: Default::default(),
+            theirs_stats: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        git_fight_server::db::set_hunk_winner(&pool, "m-cpu2", 0, "ours", true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        git_fight_server::db::set_hunk_winner(&pool, "m-cpu2", 1, "ours", true)
+            .await
+            .unwrap()
+    );
+    git_fight_server::record_round(&pool, "m-cpu2", 0, "ours", true)
+        .await
+        .unwrap();
+    git_fight_server::record_round(&pool, "m-cpu2", 1, "ours", true)
+        .await
+        .unwrap();
+    let bob = git_fight_server::db::get_player_stats(&pool, "acme", "box", "bob")
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.losses, 1,
+        "a later-round CPU hunk must not give bob a second loss"
+    );
+    assert_eq!(bob.conflicts_caused, 1);
+    let alice = git_fight_server::db::get_player_stats(&pool, "acme", "box", "alice")
+        .await
+        .unwrap();
+    assert_eq!(alice.wins, 2);
+}
+
+#[tokio::test]
 async fn record_round_rolls_back_claim_when_stats_write_fails() {
     let pool = pool().await;
     seed(&pool, "m-tx", Some("alice"), Some("bob"), "acme", "box").await;

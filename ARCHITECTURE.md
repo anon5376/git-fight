@@ -305,7 +305,7 @@ No GitHub access tokens here. Login exchanges the OAuth `code`, calls `GET /user
 
 ### `player_stats`
 
-Milestone 6. Per repo, per login: `wins`, `losses`, `kos`, `conflicts_caused`. `conflicts_caused` increments for the base-side blamed author of each fought hunk.
+Milestone 6. Per repo, per login: `wins`, `losses`, `kos`, `conflicts_caused`. `conflicts_caused` increments for the base-side blamed author of each fought hunk. A later-round hunk with no blamed GitHub login is CPU: it does not increment the previous author's `conflicts_caused`, wins, or losses.
 
 Primary key `(owner, repo, github_login)`. Owner, repo, and login are stored lowercase so `Acme/Box` / `Alice` and `acme/box` / `alice` are one row.
 

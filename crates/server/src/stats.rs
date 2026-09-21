@@ -28,11 +28,9 @@ pub async fn record_round(
         return Ok(());
     }
     let hunks = db::list_hunks(pool, match_id).await?;
-    let theirs_login = hunks
-        .iter()
-        .find(|h| h.round_index == round)
-        .and_then(|h| h.theirs_login.clone())
-        .or(row.theirs_login);
+    let theirs_login = u32::try_from(round).ok().and_then(|r| {
+        db::theirs_login_for_round(&hunks, r, row.theirs_login.as_deref()).map(str::to_string)
+    });
     let ours_login = row.ours_login;
     let stored_ko = hunks
         .iter()
