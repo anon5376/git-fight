@@ -65,6 +65,11 @@ pub fn is_safe_path(path: &str) -> bool {
     true
 }
 
+fn ssl_ca_bundle() -> Option<&'static str> {
+    const CA: &str = "/etc/ssl/certs/ca-certificates.crt";
+    Path::new(CA).is_file().then_some(CA)
+}
+
 fn git_base() -> Command {
     let mut c = Command::new("git");
     c.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -72,7 +77,23 @@ fn git_base() -> Command {
     c.env("GIT_TERMINAL_PROMPT", "0");
     c.env_remove("GIT_DIR");
     c.env_remove("GIT_WORK_TREE");
+    // Inherited env can disable TLS or dump Authorization: on stderr.
+    c.env_remove("GIT_SSL_NO_VERIFY");
+    c.env_remove("GIT_CURL_VERBOSE");
+    c.env_remove("GIT_TRACE");
+    c.env_remove("GIT_TRACE_CURL");
+    c.env_remove("GIT_TRACE_PACKET");
+    c.env_remove("GIT_CONFIG_PARAMETERS");
+    c.env_remove("GIT_CONFIG_COUNT");
+    c.env_remove("GIT_PROXY_COMMAND");
+    c.env_remove("GIT_SSH_COMMAND");
+    c.env_remove("GIT_ASKPASS");
+    if let Some(ca) = ssl_ca_bundle() {
+        c.env("GIT_SSL_CAINFO", ca);
+        c.arg("-c").arg(format!("http.sslCAInfo={ca}"));
+    }
     c.arg("-c").arg("core.hooksPath=/dev/null");
+    c.arg("-c").arg("http.sslVerify=true");
     c.kill_on_drop(true);
     c.stdin(Stdio::null());
     // Never inherit a user worktree as cwd (hooks, local config, relative dest).
@@ -129,6 +150,8 @@ fn github_git_auth_header(token: &str) -> String {
 
 fn apply_git_bearer(cmd: &mut Command, bearer: Option<&str>) {
     if let Some(token) = bearer {
+        // extraHeader + HTTP/2 can drop the GitHub App Basic header.
+        cmd.arg("-c").arg("http.version=HTTP/1.1");
         cmd.arg("-c").arg(github_git_auth_header(token));
     }
 }
@@ -977,6 +1000,22 @@ Auto-merging lib.rs\n";
         assert!(!out.contains("dGVzdA=="));
         assert!(!out.contains("x-access-token"));
         assert!(out.contains("error: failed"));
+    }
+
+    #[tokio::test]
+    async fn plumbing_keeps_tls_on() {
+        let mut verify = git_base();
+        verify.args(["config", "--get", "http.sslVerify"]);
+        let (code, out, err) = run(verify, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "true");
+        if let Some(ca) = ssl_ca_bundle() {
+            let mut info = git_base();
+            info.args(["config", "--get", "http.sslCAInfo"]);
+            let (code, out, err) = run(info, Duration::from_secs(5)).await.unwrap();
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+            assert_eq!(String::from_utf8_lossy(&out).trim(), ca);
+        }
     }
 
     #[test]
