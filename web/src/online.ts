@@ -359,24 +359,55 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
     theirs_hp?: number;
     theirs_armor?: boolean;
     theirs_special?: boolean;
+    rounds?: Array<{
+      round: number;
+      seed_lo: number;
+      seed_hi: number;
+      ticks: number[][];
+      ours_hp?: number;
+      ours_armor?: boolean;
+      ours_special?: boolean;
+      theirs_hp?: number;
+      theirs_armor?: boolean;
+      theirs_special?: boolean;
+    }>;
   };
-  const seed = BigInt(data.seed);
-  const seedLo = Number(seed & 0xffffffffn);
-  const seedHi = Number(seed >> 32n);
-  const fight = fightFromWire(
-    seedLo,
-    seedHi,
-    data.ours_hp,
-    data.ours_armor,
-    data.ours_special,
-    data.theirs_hp,
-    data.theirs_armor,
-    data.theirs_special,
-  );
-  const ticks = data.ticks ?? [];
+  const rounds =
+    data.rounds && data.rounds.length > 0
+      ? data.rounds
+      : [
+          {
+            round: 0,
+            seed_lo: Number(BigInt(data.seed) & 0xffffffffn),
+            seed_hi: Number(BigInt(data.seed) >> 32n),
+            ticks: data.ticks ?? [],
+            ours_hp: data.ours_hp,
+            ours_armor: data.ours_armor,
+            ours_special: data.ours_special,
+            theirs_hp: data.theirs_hp,
+            theirs_armor: data.theirs_armor,
+            theirs_special: data.theirs_special,
+          },
+        ];
+  const makeFight = (round: (typeof rounds)[0]): WasmFight =>
+    fightFromWire(
+      round.seed_lo,
+      round.seed_hi,
+      round.ours_hp,
+      round.ours_armor,
+      round.ours_special,
+      round.theirs_hp,
+      round.theirs_armor,
+      round.theirs_special,
+    );
+  let ri = 0;
+  let fight = makeFight(rounds[0]);
+  let ticks = rounds[0]?.ticks ?? [];
   let i = 0;
   let stopped = false;
   let finished = false;
+  let between = false;
+  let hold = 0;
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
@@ -396,10 +427,31 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
     last = now;
     while (leftover >= tickMs) {
       leftover -= tickMs;
+      if (hold > 0) {
+        hold -= 1;
+        continue;
+      }
+      if (between) {
+        between = false;
+        ri += 1;
+        const next = rounds[ri];
+        fight = makeFight(next);
+        ticks = next.ticks ?? [];
+        i = 0;
+        ui.ko.classList.add("hidden");
+        continue;
+      }
       if (i < ticks.length) {
         const pair = ticks[i] ?? [0, 0];
         fight.step(pair[0] ?? 0, pair[1] ?? 0);
         i += 1;
+      } else if (ri + 1 < rounds.length) {
+        const result = fight.result();
+        if (result !== -1) {
+          showKo(ui.ko, result);
+        }
+        hold = Math.max(1, Math.floor(tps / 2));
+        between = true;
       } else if (!finished) {
         finished = true;
         const result = fight.result();
@@ -409,7 +461,7 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
         ui.resolved.textContent = data.final_hash ? `hash ${data.final_hash}` : "";
       }
     }
-    paintFight(ui.stage, fight, "ours", "theirs", "replay 1/1");
+    paintFight(ui.stage, fight, "ours", "theirs", `replay ${ri + 1}/${rounds.length}`);
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);

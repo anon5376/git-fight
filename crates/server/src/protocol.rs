@@ -113,6 +113,8 @@ mod tests {
             ),
             Role::Spectator
         );
+        assert_eq!(round_seed(7, 0), 7);
+        assert_eq!(round_seed(7, 1), 14);
     }
 }
 
@@ -181,4 +183,8 @@ pub fn join_seed(lo: u32, hi: u32) -> u64 {
 
 pub fn split_hash(h: u64) -> (u32, u32) {
     (h as u32, (h >> 32) as u32)
+}
+
+pub fn round_seed(seed: u64, round: u32) -> u64 {
+    seed.wrapping_mul(u64::from(round) + 1)
 }

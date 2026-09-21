@@ -1,6 +1,7 @@
 use crate::db::{self, MatchRow};
 use crate::protocol::{
-    role_for, split_hash, split_seed, Role, ServerMsg, DISCONNECT_SECS, INPUT_DELAY, INPUT_WINDOW,
+    role_for, round_seed, split_hash, split_seed, Role, ServerMsg, DISCONNECT_SECS, INPUT_DELAY,
+    INPUT_WINDOW,
 };
 use crate::result::{self, ResultCtx};
 use chrono::{DateTime, Utc};
@@ -89,7 +90,7 @@ async fn run_room(
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
     let mut next_tick = 0u32;
     let mut log: Vec<(u32, u8, u8)> = Vec::new();
-    if let Ok(inputs) = db::load_inputs(&pool, &row.id).await {
+    if let Ok(inputs) = db::load_inputs(&pool, &row.id, round).await {
         for (tick, ours, theirs) in &inputs {
             if *tick == next_tick && sim.result.is_none() {
                 sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
@@ -386,7 +387,7 @@ async fn advance(a: Advance<'_>) -> bool {
         let n = *a.next_tick;
         *a.next_tick = a.next_tick.saturating_add(1);
         a.log.push((n, ours_btn, theirs_btn));
-        let _ = db::insert_input(a.pool, a.id, n, ours_btn, theirs_btn).await;
+        let _ = db::insert_input(a.pool, a.id, *a.round, n, ours_btn, theirs_btn).await;
         let msg = encode(&ServerMsg::Tick {
             n,
             ours: ours_btn,
@@ -434,7 +435,6 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     if match_over {
         return true;
     }
-    let _ = db::clear_inputs(a.pool, a.id).await;
     *a.round += 1;
     let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
     *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
@@ -499,10 +499,6 @@ fn end_msg(sim: &FightState, result: RoundResult, round: u32, match_over: bool) 
         round,
         match_over,
     }
-}
-
-fn round_seed(seed: u64, round: u32) -> u64 {
-    seed.wrapping_mul(u64::from(round) + 1)
 }
 
 #[allow(clippy::too_many_arguments)]

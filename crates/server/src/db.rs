@@ -76,17 +76,7 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS match_inputs (
-            match_id TEXT NOT NULL,
-            tick INTEGER NOT NULL,
-            ours INTEGER NOT NULL,
-            theirs INTEGER NOT NULL,
-            PRIMARY KEY (match_id, tick)
-        )",
-    )
-    .execute(pool)
-    .await?;
+    ensure_match_inputs(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS match_hunks (
             match_id TEXT NOT NULL,
@@ -157,6 +147,58 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+async fn ensure_match_inputs(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    let exists: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'match_inputs'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if exists.is_none() {
+        sqlx::query(
+            "CREATE TABLE match_inputs (
+                match_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                tick INTEGER NOT NULL,
+                ours INTEGER NOT NULL,
+                theirs INTEGER NOT NULL,
+                PRIMARY KEY (match_id, round_index, tick)
+            )",
+        )
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+    let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('match_inputs')")
+        .fetch_all(pool)
+        .await?;
+    if cols.iter().any(|(n,)| n == "round_index") {
+        return Ok(());
+    }
+    sqlx::query(
+        "CREATE TABLE match_inputs_v2 (
+            match_id TEXT NOT NULL,
+            round_index INTEGER NOT NULL,
+            tick INTEGER NOT NULL,
+            ours INTEGER NOT NULL,
+            theirs INTEGER NOT NULL,
+            PRIMARY KEY (match_id, round_index, tick)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO match_inputs_v2 (match_id, round_index, tick, ours, theirs)
+         SELECT match_id, 0, tick, ours, theirs FROM match_inputs",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("DROP TABLE match_inputs").execute(pool).await?;
+    sqlx::query("ALTER TABLE match_inputs_v2 RENAME TO match_inputs")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn insert_match(
     pool: &SqlitePool,
     id: &str,
@@ -207,16 +249,39 @@ pub async fn list_live_matches(pool: &SqlitePool) -> Result<Vec<MatchRow>, sqlx:
     .await
 }
 
-pub async fn load_inputs(pool: &SqlitePool, id: &str) -> Result<Vec<(u32, u8, u8)>, sqlx::Error> {
+pub async fn load_inputs(
+    pool: &SqlitePool,
+    id: &str,
+    round: u32,
+) -> Result<Vec<(u32, u8, u8)>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (i64, i64, i64)>(
-        "SELECT tick, ours, theirs FROM match_inputs WHERE match_id = ? ORDER BY tick",
+        "SELECT tick, ours, theirs FROM match_inputs
+         WHERE match_id = ? AND round_index = ? ORDER BY tick",
+    )
+    .bind(id)
+    .bind(i64::from(round))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(t, o, th)| (t as u32, o as u8, th as u8))
+        .collect())
+}
+
+pub async fn load_all_inputs(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Vec<(u32, u32, u8, u8)>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT round_index, tick, ours, theirs FROM match_inputs
+         WHERE match_id = ? ORDER BY round_index, tick",
     )
     .bind(id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(t, o, th)| (t as u32, o as u8, th as u8))
+        .map(|(r, t, o, th)| (r as u32, t as u32, o as u8, th as u8))
         .collect())
 }
 
@@ -231,14 +296,17 @@ pub async fn clear_inputs(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error
 pub async fn insert_input(
     pool: &SqlitePool,
     id: &str,
+    round: u32,
     tick: u32,
     ours: u8,
     theirs: u8,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT OR REPLACE INTO match_inputs (match_id, tick, ours, theirs) VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO match_inputs (match_id, round_index, tick, ours, theirs)
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
+    .bind(i64::from(round))
     .bind(i64::from(tick))
     .bind(i64::from(ours))
     .bind(i64::from(theirs))
@@ -777,11 +845,14 @@ mod tests {
         insert_match(&pool, "abc", 1, 3, "o", "t", 60)
             .await
             .unwrap();
-        insert_input(&pool, "abc", 0, 1, 2).await.unwrap();
-        insert_input(&pool, "abc", 1, 3, 4).await.unwrap();
-        assert_eq!(load_inputs(&pool, "abc").await.unwrap().len(), 2);
+        insert_input(&pool, "abc", 0, 0, 1, 2).await.unwrap();
+        insert_input(&pool, "abc", 0, 1, 3, 4).await.unwrap();
+        insert_input(&pool, "abc", 1, 0, 5, 6).await.unwrap();
+        assert_eq!(load_inputs(&pool, "abc", 0).await.unwrap().len(), 2);
+        assert_eq!(load_inputs(&pool, "abc", 1).await.unwrap().len(), 1);
+        assert_eq!(load_all_inputs(&pool, "abc").await.unwrap().len(), 3);
         clear_inputs(&pool, "abc").await.unwrap();
-        assert!(load_inputs(&pool, "abc").await.unwrap().is_empty());
+        assert!(load_all_inputs(&pool, "abc").await.unwrap().is_empty());
 
         let m = NewMatch {
             id: "inst1".into(),

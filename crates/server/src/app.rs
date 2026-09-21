@@ -1,7 +1,9 @@
 use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
-use crate::protocol::{ClientMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY};
+use crate::protocol::{
+    round_seed, split_seed, ClientMsg, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY,
+};
 use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
 use crate::webhook;
@@ -15,7 +17,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -252,6 +254,21 @@ async fn get_match(
 }
 
 #[derive(Serialize)]
+struct ReplayRound {
+    round: u32,
+    seed: String,
+    seed_lo: u32,
+    seed_hi: u32,
+    ticks: Vec<[u8; 2]>,
+    ours_hp: i32,
+    ours_armor: bool,
+    ours_special: bool,
+    theirs_hp: i32,
+    theirs_armor: bool,
+    theirs_special: bool,
+}
+
+#[derive(Serialize)]
 struct ReplayOut {
     id: String,
     seed: String,
@@ -264,6 +281,8 @@ struct ReplayOut {
     theirs_hp: i32,
     theirs_armor: bool,
     theirs_special: bool,
+    total_rounds: u32,
+    rounds: Vec<ReplayRound>,
 }
 
 async fn get_replay(
@@ -277,28 +296,52 @@ async fn get_replay(
     if row.status != "finished" {
         return Err(StatusCode::NOT_FOUND);
     }
-    let inputs = db::load_inputs(&state.pool, &id)
+    let inputs = db::load_all_inputs(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let hunks = db::list_hunks(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (ours_stats, theirs_stats) = hunks
-        .last()
-        .map(|h| (h.ours_stats(), h.theirs_stats()))
-        .unwrap_or_default();
+    let mut by_round: BTreeMap<u32, Vec<[u8; 2]>> = BTreeMap::new();
+    for (round, _tick, o, t) in inputs {
+        by_round.entry(round).or_default().push([o, t]);
+    }
+    let seed: u64 = row.seed.parse().unwrap_or(1);
+    let total_rounds = u32::try_from(hunks.len()).unwrap_or(0).max(1);
+    let mut rounds = Vec::new();
+    for round in 0..total_rounds {
+        let (ours_stats, theirs_stats) = db::stats_for_round(&hunks, round);
+        let rs = round_seed(seed, round);
+        let (seed_lo, seed_hi) = split_seed(rs);
+        rounds.push(ReplayRound {
+            round,
+            seed: rs.to_string(),
+            seed_lo,
+            seed_hi,
+            ticks: by_round.remove(&round).unwrap_or_default(),
+            ours_hp: ours_stats.hp,
+            ours_armor: ours_stats.armor,
+            ours_special: ours_stats.special,
+            theirs_hp: theirs_stats.hp,
+            theirs_armor: theirs_stats.armor,
+            theirs_special: theirs_stats.special,
+        });
+    }
+    let first = rounds.first();
     Ok(Json(ReplayOut {
         id: row.id,
         seed: row.seed,
-        ticks: inputs.into_iter().map(|(_, o, t)| [o, t]).collect(),
+        ticks: first.map(|r| r.ticks.clone()).unwrap_or_default(),
         final_hash: row.final_hash,
         status: row.status,
-        ours_hp: ours_stats.hp,
-        ours_armor: ours_stats.armor,
-        ours_special: ours_stats.special,
-        theirs_hp: theirs_stats.hp,
-        theirs_armor: theirs_stats.armor,
-        theirs_special: theirs_stats.special,
+        ours_hp: first.map(|r| r.ours_hp).unwrap_or(100),
+        ours_armor: first.map(|r| r.ours_armor).unwrap_or(false),
+        ours_special: first.map(|r| r.ours_special).unwrap_or(false),
+        theirs_hp: first.map(|r| r.theirs_hp).unwrap_or(100),
+        theirs_armor: first.map(|r| r.theirs_armor).unwrap_or(false),
+        theirs_special: first.map(|r| r.theirs_special).unwrap_or(false),
+        total_rounds,
+        rounds,
     }))
 }
 

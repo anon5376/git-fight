@@ -31,6 +31,12 @@ async fn two_clients_agree_with_server_hash() {
     let (hi, lo) = (ours >> 32, ours as u32);
     let expected = format!("{hi:08x}{lo:08x}");
     assert_eq!(hash, expected, "server hash {hash} != client {expected}");
+    let rounds = replay["rounds"].as_array().expect("rounds");
+    assert_eq!(rounds.len(), 1);
+    assert!(
+        !rounds[0]["ticks"].as_array().unwrap().is_empty(),
+        "round 0 should keep its input log"
+    );
 }
 
 #[tokio::test]
@@ -177,13 +183,13 @@ async fn reconnect_resumes_later_round_from_stored_inputs() {
     git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours")
         .await
         .unwrap();
-    git_fight_server::db::insert_input(&pool, id, 0, 1, 0)
+    git_fight_server::db::insert_input(&pool, id, 1, 0, 1, 0)
         .await
         .unwrap();
-    git_fight_server::db::insert_input(&pool, id, 1, 0, 1)
+    git_fight_server::db::insert_input(&pool, id, 1, 1, 0, 1)
         .await
         .unwrap();
-    git_fight_server::db::insert_input(&pool, id, 2, 0, 0)
+    git_fight_server::db::insert_input(&pool, id, 1, 2, 0, 0)
         .await
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -216,6 +222,96 @@ async fn reconnect_resumes_later_round_from_stored_inputs() {
         ));
     }
     assert_eq!(ticks, vec![(0, 1, 0), (1, 0, 1), (2, 0, 0)]);
+}
+
+#[tokio::test]
+async fn multi_round_replay_keeps_every_round() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = std::env::temp_dir().join(format!(
+        "gf-replay-rounds-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "replay0001replay0001replay0001re";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 7,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    for round in 0..2 {
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: id,
+                round,
+                path: "lib.rs",
+                hunk_index: round,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        git_fight_server::db::insert_input(&pool, id, round as u32, 0, 1, 0)
+            .await
+            .unwrap();
+        git_fight_server::db::insert_input(&pool, id, round as u32, 1, 0, 1)
+            .await
+            .unwrap();
+    }
+    git_fight_server::db::set_status(&pool, id, "finished", true, true, Some("aabbccdd"), None)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(listener, pool, Config::default())
+            .await
+            .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let replay: Value = http_get(addr, &format!("/api/replays/{id}")).await.1;
+    assert_eq!(replay["total_rounds"].as_u64(), Some(2));
+    let rounds = replay["rounds"].as_array().expect("rounds");
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[0]["ticks"], serde_json::json!([[1, 0], [0, 1]]));
+    assert_eq!(rounds[1]["ticks"], serde_json::json!([[1, 0], [0, 1]]));
+    assert_ne!(rounds[0]["seed"], rounds[1]["seed"]);
+    assert_eq!(rounds[0]["seed"].as_str(), Some("7"));
+    assert_eq!(rounds[1]["seed"].as_str(), Some("14"));
 }
 
 #[tokio::test]
