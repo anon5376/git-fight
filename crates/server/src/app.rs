@@ -538,7 +538,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
     let (mut sink, mut stream) = socket.split();
     let lag = state.config.lag;
     let leave_tx = tx.clone();
-    let mut read = tokio::spawn(async move {
+    let read = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             let Message::Text(text) = msg else {
                 continue;
@@ -566,7 +566,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         let _ = leave_tx.send(RoomEvent::Leave { conn_id }).await;
     });
 
-    let mut write = tokio::spawn(async move {
+    let write = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
             if lag > Duration::ZERO {
                 tokio::time::sleep(lag).await;
@@ -577,14 +577,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         }
     });
 
-    tokio::select! {
-        _ = &mut read => {
-            write.abort();
-        }
-        _ = &mut write => {
-            read.abort();
-        }
-    }
+    let _ = tokio::join!(read, write);
 }
 
 #[cfg(test)]

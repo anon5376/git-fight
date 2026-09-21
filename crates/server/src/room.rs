@@ -145,9 +145,30 @@ async fn run_room(
     let mut clock = tokio::time::interval(Duration::from_millis(1000 / 30));
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut drain_until: Option<tokio::time::Instant> = None;
     loop {
         if done {
-            break;
+            let until = *drain_until
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(2));
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        None | Some(RoomEvent::Shutdown) => break,
+                        Some(RoomEvent::Join { tx, .. }) => {
+                            send_closed(&tx, &pool, &id).await;
+                        }
+                        Some(RoomEvent::Leave { conn_id }) => {
+                            conns.remove(&conn_id);
+                            if conns.is_empty() {
+                                break;
+                            }
+                        }
+                        Some(RoomEvent::Input { .. }) => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(until) => break,
+            }
+            continue;
         }
         tokio::select! {
             ev = rx.recv() => {
@@ -275,7 +296,7 @@ async fn run_room(
         }
 
         if done {
-            break;
+            continue;
         }
 
         done = advance(Advance {

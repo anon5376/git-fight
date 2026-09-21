@@ -1075,7 +1075,9 @@ async fn play(addr: std::net::SocketAddr, id: &str, token: &str, is_ours: bool) 
                 0
             };
             let msg = format!(r#"{{"type":"input","tick":{next_send},"buttons":{buttons}}}"#);
-            sink.send(Message::Text(msg.into())).await.unwrap();
+            if sink.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
             next_send = next_send.saturating_add(1);
         }
 

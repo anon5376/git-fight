@@ -229,7 +229,7 @@ to every client, including spectators. Everyone, server included, applies those 
 
 ### Replay
 
-A finished match already has `seed` and the full input log. `GET /replay/<id>` serves the client, which runs WASM locally feeding the log. No room, no inputs. `GET /ws?match=` on a finished match returns `Error { message: "finished" }` and does not spawn a room. Unfinished matches are not replayable. On restart, a live match whose current round already has a result in `match_inputs` runs that round's finish (next round or match over) instead of spawning a room that immediately exits.
+A finished match already has `seed` and the full input log. `GET /replay/<id>` serves the client, which runs WASM locally feeding the log. No room, no inputs. `GET /ws?match=` on a finished match returns `Error { message: "finished" }` and does not spawn a room. After the last round the live room stops the 30 Hz clock and keeps existing sockets briefly so clients can read `End`; new sockets still get `Error`. Unfinished matches are not replayable. On restart, a live match whose current round already has a result in `match_inputs` runs that round's finish (next round or match over) instead of spawning a room that immediately exits.
 
 ## Database tables
 
