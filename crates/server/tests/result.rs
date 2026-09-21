@@ -336,6 +336,92 @@ async fn draw_skips_push() {
     assert_eq!(row.abort_reason.as_deref(), Some("draw"));
 }
 
+#[test]
+fn forfeit_is_not_a_git_side_pick() {
+    use git_fight_core::Pick;
+    use git_fight_server::result::git_pick_for_winner;
+    assert_eq!(git_pick_for_winner("ours"), Some(Pick::Theirs));
+    assert_eq!(git_pick_for_winner("theirs"), Some(Pick::Ours));
+    assert_eq!(git_pick_for_winner("draw"), None);
+    assert_eq!(git_pick_for_winner("forfeit_ours"), None);
+    assert_eq!(git_pick_for_winner("forfeit_theirs"), None);
+}
+
+#[tokio::test]
+async fn forfeit_skips_push() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let before = heads(&bare);
+    let mock = github_mocks(&head, &base).await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("forfeit_ours")).await;
+    let ctx = ctx(pool.clone(), &mock, bare.clone());
+    git_fight_server::publish_result(&ctx, MATCH_ID)
+        .await
+        .unwrap();
+    assert_eq!(heads(&bare), before);
+    let comments = posted_comments(&mock).await;
+    assert!(
+        comments.iter().any(|c| {
+            c.contains("nothing pushed") && c.contains("forfeit") && c.contains("lib.rs")
+        }),
+        "{comments:?}"
+    );
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none());
+    assert_eq!(row.abort_reason.as_deref(), Some("forfeit"));
+}
+
+#[tokio::test]
+async fn forfeit_skips_push_even_when_another_round_was_won() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let before = heads(&bare);
+    let mock = github_mocks(&head, &base).await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: MATCH_ID,
+            round: 1,
+            path: "lib.rs",
+            hunk_index: 1,
+            ours: b"fn v() { 2 }\n",
+            theirs: b"fn v() { 3 }\n",
+            base: b"fn v() { 1 }\n",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: Default::default(),
+            theirs_stats: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::set_hunk_winner(&pool, MATCH_ID, 1, "forfeit_theirs")
+        .await
+        .unwrap();
+    let ctx = ctx(pool.clone(), &mock, bare.clone());
+    git_fight_server::publish_result(&ctx, MATCH_ID)
+        .await
+        .unwrap();
+    assert_eq!(heads(&bare), before);
+    let comments = posted_comments(&mock).await;
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.contains("nothing pushed") && c.contains("forfeit_theirs")),
+        "{comments:?}"
+    );
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none());
+    assert_eq!(row.abort_reason.as_deref(), Some("forfeit"));
+}
+
 #[tokio::test]
 async fn outdated_pr_skips_push() {
     let (_keep, bare, head, base) = conflict_bare();

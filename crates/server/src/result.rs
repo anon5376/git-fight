@@ -37,10 +37,11 @@ pub fn winner_tag(result: git_fight_core::RoundResult, forfeit: bool) -> &'stati
 }
 
 /// Game Ours is the PR (git-theirs in merge-tree). Game Theirs is base (git-ours).
+/// Forfeit and draw leave the hunk unresolved: they are not a side pick.
 pub fn git_pick_for_winner(winner: &str) -> Option<Pick> {
     match winner {
-        "ours" | "forfeit_theirs" => Some(Pick::Theirs),
-        "theirs" | "forfeit_ours" => Some(Pick::Ours),
+        "ours" => Some(Pick::Theirs),
+        "theirs" => Some(Pick::Ours),
         _ => None,
     }
 }
@@ -49,8 +50,26 @@ fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
     hunks
         .iter()
         .filter(|h| git_pick_for_winner(h.winner.as_deref().unwrap_or("")).is_none())
-        .map(|h| format!("{} hunk {}", h.path, h.hunk_index))
+        .map(|h| {
+            format!(
+                "{} hunk {} ({})",
+                h.path,
+                h.hunk_index,
+                h.winner.as_deref().unwrap_or("unresolved")
+            )
+        })
         .collect()
+}
+
+fn skip_reason(hunks: &[HunkRow]) -> &'static str {
+    if hunks
+        .iter()
+        .any(|h| matches!(h.winner.as_deref(), Some("forfeit_ours" | "forfeit_theirs")))
+    {
+        "forfeit"
+    } else {
+        "draw"
+    }
 }
 
 fn round_lines(hunks: &[HunkRow]) -> String {
@@ -93,13 +112,14 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
 
     let unresolved = unresolved_paths(&hunks);
     if !unresolved.is_empty() {
+        let reason = skip_reason(&hunks);
         let body = format!(
-            "git fight: nothing pushed — unresolved conflicts (draw):\n{}\nComment `/fight` to try again.\nreplay: {}/replay/{match_id}",
+            "git fight: nothing pushed — unresolved conflicts ({reason}):\n{}\nComment `/fight` to try again.\nreplay: {}/replay/{match_id}",
             unresolved.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"),
             ctx.public_url.trim_end_matches('/'),
         );
         comment(ctx, &row, &body).await;
-        let _ = db::set_result_branch(&ctx.pool, match_id, None, Some("draw")).await;
+        let _ = db::set_result_branch(&ctx.pool, match_id, None, Some(reason)).await;
         return Ok(());
     }
 

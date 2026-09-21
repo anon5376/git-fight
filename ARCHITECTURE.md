@@ -7,7 +7,7 @@ This document is the Milestone 0 plan. Later milestones implement it. Hard rules
 ## Hard rules
 
 - The bot's only GitHub writes are issue/PR comments and **new** branches named `git-fight/pr-<number>-<match-id>`. It never pushes to an existing branch, never force-pushes, and never merges a PR.
-- A draw leaves that conflict unresolved. If any conflict in a match is unresolved, the bot pushes nothing and says so.
+- A draw or forfeit leaves that conflict unresolved. If any conflict in a match is unresolved, the bot pushes nothing and says so.
 - Never run code from a user's repo. Server-side git is plumbing only: clone, fetch, merge-tree, cat-file, hash-object, commit-tree, push. Every git invocation sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and `-c core.hooksPath=/dev/null`.
 - Verify every webhook's `X-Hub-Signature-256` with a constant-time comparison **before** parsing the body.
 - Least privilege: the app asks only for the permissions in [GitHub App](#github-app).
@@ -252,7 +252,7 @@ SQLite via sqlx. Migrations run at server start. No secrets, no installation tok
 | `created_at`, `started_at`, `finished_at`, `expires_at` | `TEXT` | RFC 3339. `expires_at` = created + 24h. |
 | `result_branch` | `TEXT` NULL | Set only after a successful create-only push. |
 | `final_hash` | `TEXT` NULL | Server `state_hash` at match end. |
-| `abort_reason` | `TEXT` NULL | `draw` / `outdated` / `expired` / `too_many` / … |
+| `abort_reason` | `TEXT` NULL | `draw` / `forfeit` / `outdated` / `expired` / `too_many` / … |
 | `challenge_comment_id` | `INTEGER` NULL | GitHub issue-comment id of the challenge. Outcome comments (result, draw, outdated, expired) edit this comment when set. |
 
 ### `match_hunks`

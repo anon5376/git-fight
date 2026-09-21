@@ -39,7 +39,7 @@ You pick a mode at the start: fight the CPU, or play 2 players on one keyboard.
 
 ## Online
 
-Comment `/fight` on a GitHub pull request that has merge conflicts. The GitHub App challenges the two colliding authors to a live match in the browser. Teammates can watch. Each round decides one conflict. After the last round the bot pushes the resolution to a **new** `git-fight/pr-<number>-<match-id>` branch for humans to review. It never force-pushes, never writes an existing branch, and never merges the PR. A draw (or any unresolved conflict) skips the whole push.
+Comment `/fight` on a GitHub pull request that has merge conflicts. The GitHub App challenges the two colliding authors to a live match in the browser. Teammates can watch. Each round decides one conflict. After the last round the bot pushes the resolution to a **new** `git-fight/pr-<number>-<match-id>` branch for humans to review. It never force-pushes, never writes an existing branch, and never merges the PR. A draw, a forfeit, or any other unresolved conflict skips the whole push.
 
 Install and configure the App: [SETUP.md](SETUP.md).
 
