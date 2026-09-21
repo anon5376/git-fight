@@ -81,17 +81,36 @@ impl Default for RoomSettings {
     }
 }
 
+pub(crate) type RoomMap = Arc<Mutex<HashMap<String, mpsc::Sender<RoomEvent>>>>;
+
+/// Drop the sender and queue Shutdown without waiting on a full channel.
+/// Callers that comment after expiry must invoke this first.
+pub(crate) async fn close_live_room(rooms: &RoomMap, id: &str) {
+    let tx = {
+        let mut rooms = rooms.lock().await;
+        rooms.remove(id)
+    };
+    if let Some(tx) = tx {
+        if tx.try_send(RoomEvent::Shutdown).is_err() {
+            tokio::spawn(async move {
+                let _ = tx.send(RoomEvent::Shutdown).await;
+            });
+        }
+    }
+}
+
 pub fn spawn_room(
     row: MatchRow,
     pool: SqlitePool,
     settings: RoomSettings,
-    rooms: Arc<Mutex<HashMap<String, mpsc::Sender<RoomEvent>>>>,
+    rooms: RoomMap,
 ) -> mpsc::Sender<RoomEvent> {
     let (tx, rx) = mpsc::channel(512);
     let id = row.id.clone();
     let posted = tx.clone();
+    let rooms_run = rooms.clone();
     tokio::spawn(async move {
-        run_room(row, pool, settings, rx).await;
+        run_room(row, pool, settings, rx, rooms_run).await;
         let mut rooms = rooms.lock().await;
         if rooms.get(&id).is_some_and(|t| t.same_channel(&posted)) {
             rooms.remove(&id);
@@ -105,6 +124,7 @@ async fn run_room(
     pool: SqlitePool,
     settings: RoomSettings,
     mut rx: mpsc::Receiver<RoomEvent>,
+    rooms: RoomMap,
 ) {
     let seed: u64 = row.seed.parse().unwrap_or(1);
     let delay = u32::try_from(row.input_delay_ticks).unwrap_or(INPUT_DELAY);
@@ -236,6 +256,7 @@ async fn run_room(
             row: &row,
             github,
             forfeit_pending: &mut forfeit_pending,
+            rooms: &rooms,
         })
         .await;
     }
@@ -288,7 +309,7 @@ async fn run_room(
                             match join_admit(match_is_open(&pool, &id).await, scored_all) {
                                 JoinAdmit::Closed => {
                                     send_closed(&tx, &pool, &id).await;
-                                    expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+                                    expire_now(&pool, &id, &conns, settings.result.as_ref(), &rooms).await;
                                     done = true;
                                 }
                                 JoinAdmit::Unknown => {
@@ -358,6 +379,7 @@ async fn run_room(
                                                     &id,
                                                     &conns,
                                                     settings.result.as_ref(),
+                                                    &rooms,
                                                 )
                                                 .await;
                                                 done = true;
@@ -453,7 +475,7 @@ async fn run_room(
                     if let Some(exp) = expires_at {
                         if Utc::now() >= exp && !scored_all {
                             expiry_due = true;
-                            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+                            expire_now(&pool, &id, &conns, settings.result.as_ref(), &rooms).await;
                             // expire_open_match no-ops a fully scored row;
                             // stay in the room so last-round finish can retry.
                             done = match_is_open(&pool, &id).await == MatchOpen::Closed;
@@ -467,7 +489,7 @@ async fn run_room(
             continue;
         }
         if expiry_due && !scored_all {
-            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+            expire_now(&pool, &id, &conns, settings.result.as_ref(), &rooms).await;
             done = match_is_open(&pool, &id).await == MatchOpen::Closed;
             continue;
         }
@@ -553,6 +575,7 @@ async fn run_room(
             row: &row,
             github,
             forfeit_pending: &mut forfeit_pending,
+            rooms: &rooms,
         })
         .await;
     }
@@ -586,6 +609,7 @@ struct Advance<'a> {
     row: &'a MatchRow,
     github: bool,
     forfeit_pending: &'a mut bool,
+    rooms: &'a RoomMap,
 }
 
 async fn advance(a: Advance<'_>) -> bool {
@@ -597,7 +621,7 @@ async fn advance(a: Advance<'_>) -> bool {
     }
     match match_is_open(a.pool, a.id).await {
         MatchOpen::Closed => {
-            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
             return true;
         }
         MatchOpen::Unknown => return false,
@@ -607,7 +631,7 @@ async fn advance(a: Advance<'_>) -> bool {
         match db::start_open_match(a.pool, a.id).await {
             Ok(true) => *a.started_at = Some(Instant::now()),
             Ok(false) => {
-                expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
                 return true;
             }
             Err(_) => return false,
@@ -688,7 +712,7 @@ async fn advance(a: Advance<'_>) -> bool {
         }
         match match_is_open(a.pool, a.id).await {
             MatchOpen::Closed => {
-                expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
                 return true;
             }
             MatchOpen::Unknown => return false,
@@ -708,7 +732,7 @@ async fn advance(a: Advance<'_>) -> bool {
             Ok(true) => {}
             Ok(false) => {
                 if match_is_open(a.pool, a.id).await == MatchOpen::Closed {
-                    expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                    expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
                     return true;
                 }
                 return false;
@@ -932,7 +956,7 @@ async fn finish_closed(a: Advance<'_>, result: RoundResult) -> bool {
             broadcast_or_spawn(a.conns, &msg);
         }
         LastRound::Terminal | LastRound::Retry => {
-            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
         }
     }
     true
@@ -997,7 +1021,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         match last_round_followup(marked, match_last_round_status(a.pool, a.id).await) {
             LastRound::Retry => return false,
             LastRound::Terminal => {
-                expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
                 return true;
             }
             LastRound::MatchOver => {
@@ -1012,7 +1036,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     // are not dropped while this room is still on the finished round.
     match after_non_final(match_is_open(a.pool, a.id).await) {
         AfterNonFinal::Expire => {
-            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
             return true;
         }
         AfterNonFinal::Retry => return false,
@@ -1278,10 +1302,12 @@ async fn expire_now(
     id: &str,
     conns: &BTreeMap<u64, Conn>,
     result: Option<&ResultCtx>,
+    rooms: &RoomMap,
 ) {
     let row = db::get_match(pool, id).await.ok().flatten();
     if let Some(row) = row.as_ref() {
         if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
+            close_live_room(rooms, id).await;
             let msg = encode(&ServerMsg::Error {
                 message: terminal_ws_error(row),
             });
@@ -1293,6 +1319,7 @@ async fn expire_now(
         let row = db::get_match(pool, id).await.ok().flatten();
         if let Some(row) = row.as_ref() {
             if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
+                close_live_room(rooms, id).await;
                 let msg = encode(&ServerMsg::Error {
                     message: terminal_ws_error(row),
                 });
@@ -1301,6 +1328,13 @@ async fn expire_now(
         }
         return;
     }
+    // Architecture: close the live room before expiry comment HTTP so
+    // GitHub latency cannot keep confirming ticks on an expired row.
+    close_live_room(rooms, id).await;
+    let msg = encode(&ServerMsg::Error {
+        message: "expired".into(),
+    });
+    broadcast_or_spawn(conns, &msg);
     if let (Some(ctx), Some(row)) = (result, row.as_ref()) {
         let ctx = ctx.clone();
         let row = row.clone();
@@ -1310,10 +1344,6 @@ async fn expire_now(
             }
         });
     }
-    let msg = encode(&ServerMsg::Error {
-        message: "expired".into(),
-    });
-    broadcast_or_spawn(conns, &msg);
 }
 
 fn end_msg(sim: &FightState, result: RoundResult, round: u32, match_over: bool) -> ServerMsg {
@@ -1694,6 +1724,123 @@ mod tests {
         } else {
             "advance"
         }
+    }
+
+    #[test]
+    fn expiry_comment_waits_until_the_live_room_is_closed() {
+        assert_eq!(expire_comment_followup(false), "hold");
+        assert_eq!(
+            expire_comment_followup(true),
+            "comment",
+            "GitHub expiry HTTP must not start while the room can still confirm ticks"
+        );
+    }
+
+    fn expire_comment_followup(room_closed: bool) -> &'static str {
+        if room_closed {
+            "comment"
+        } else {
+            "hold"
+        }
+    }
+
+    #[tokio::test]
+    async fn expire_now_closes_live_room_before_comment() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "expclose1", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(8);
+        rooms.lock().await.insert("expclose1".into(), tx);
+        expire_now(&pool, "expclose1", &BTreeMap::new(), None, &rooms).await;
+        assert!(
+            rooms.lock().await.get("expclose1").is_none(),
+            "the live-room map must drop the sender before expiry comment HTTP"
+        );
+        let row = crate::db::get_match(&pool, "expclose1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "expired");
+    }
+
+    #[tokio::test]
+    async fn expire_now_does_not_close_a_scored_all_row() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "expscoredexpscoredexpscoredexps".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "alice".into(),
+                theirs_name: "bob".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "github".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: None,
+                owner: String::new(),
+                repo: String::new(),
+                pr_number: 0,
+                pr_head_sha: String::new(),
+                pr_base_sha: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::insert_hunk(
+            &pool,
+            &crate::db::NewHunk {
+                match_id: "expscoredexpscoredexpscoredexps",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::set_hunk_winner(&pool, "expscoredexpscoredexpscoredexps", 0, "ours", true)
+            .await
+            .unwrap();
+        let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(8);
+        rooms
+            .lock()
+            .await
+            .insert("expscoredexpscoredexpscoredexps".into(), tx);
+        expire_now(
+            &pool,
+            "expscoredexpscoredexpscoredexps",
+            &BTreeMap::new(),
+            None,
+            &rooms,
+        )
+        .await;
+        assert!(
+            rooms
+                .lock()
+                .await
+                .get("expscoredexpscoredexpscoredexps")
+                .is_some(),
+            "a scored-all row stays open until finished, so the room must not drop"
+        );
+        let row = crate::db::get_match(&pool, "expscoredexpscoredexpscoredexps")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "pending");
     }
 
     #[test]

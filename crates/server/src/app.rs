@@ -446,17 +446,7 @@ impl AppState {
     }
 
     pub(crate) async fn close_room(&self, id: &str) {
-        let tx = {
-            let mut rooms = self.rooms.lock().await;
-            rooms.remove(id)
-        };
-        if let Some(tx) = tx {
-            if tx.try_send(RoomEvent::Shutdown).is_err() {
-                tokio::spawn(async move {
-                    let _ = tx.send(RoomEvent::Shutdown).await;
-                });
-            }
-        }
+        room::close_live_room(&self.rooms, id).await;
     }
 }
 
