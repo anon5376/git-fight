@@ -311,7 +311,11 @@ async fn run_room(
                         if done {
                             send_closed(&tx, &pool, &id).await;
                         } else {
-                            match join_admit(match_is_open(&pool, &id).await, scored_all) {
+                            match join_admit(
+                                match_is_open(&pool, &id).await,
+                                scored_all,
+                                sim.result.is_some(),
+                            ) {
                                 JoinAdmit::Closed => {
                                     send_closed(&tx, &pool, &id).await;
                                     expire_now(&pool, &id, &conns, settings.result.as_ref(), &rooms).await;
@@ -522,7 +526,10 @@ async fn run_room(
                 continue;
             }
         }
-        if scored_all {
+        // A live last-round sim still owes End { match_over }. Do not
+        // stop on try_finish_scored_all, which marks finished without
+        // broadcasting to sockets that were in the room.
+        if scored_all && sim.result.is_none() {
             done = try_finish_scored_all(
                 &pool,
                 &id,
@@ -642,6 +649,23 @@ struct Advance<'a> {
 }
 
 async fn advance(a: Advance<'_>) -> bool {
+    // A latched disconnect forfeit must not finish a replayed KO as a
+    // side pick. persist first; only then finish().
+    if !apply_latched_forfeit(
+        a.pool,
+        a.id,
+        *a.round,
+        a.row,
+        a.sim,
+        a.ours,
+        a.theirs,
+        a.started_at,
+        a.forfeit_pending,
+    )
+    .await
+    {
+        return false;
+    }
     // A last-round sim that already ended must reach finish() even if
     // another writer marked the row finished — that path sends End,
     // not a generic terminal Error.
@@ -882,11 +906,14 @@ async fn wait_playable_hunks(
 }
 
 /// A busy open-status read is not an open fight: do not Hello.
-fn join_admit(open: MatchOpen, scored_all: bool) -> JoinAdmit {
+/// A decided sim whose `finished` write is still retrying is the same:
+/// Hello+Snapshot of that KO would sit without `End { match_over }`.
+fn join_admit(open: MatchOpen, scored_all: bool, sim_decided: bool) -> JoinAdmit {
     match open {
         MatchOpen::Closed => JoinAdmit::Closed,
         MatchOpen::Unknown => JoinAdmit::Unknown,
         MatchOpen::Open if scored_all => JoinAdmit::ScoredAll,
+        MatchOpen::Open if sim_decided => JoinAdmit::Unknown,
         MatchOpen::Open => JoinAdmit::Enter,
     }
 }
@@ -929,10 +956,13 @@ fn last_round_followup(marked: bool, status: LastRoundStatus) -> LastRound {
 }
 
 /// The row is already closed. Last-round + `finished` still owes
-/// `End { match_over }` to sockets that were in the room.
+/// `End { match_over }` to sockets that were in the room. A busy
+/// status read is not `Error { finished }`.
 fn closed_finish_followup(last_round: bool, status: LastRoundStatus) -> LastRound {
     if last_round && status == LastRoundStatus::Finished {
         LastRound::MatchOver
+    } else if last_round && status == LastRoundStatus::Unknown {
+        LastRound::Retry
     } else {
         LastRound::Terminal
     }
@@ -993,6 +1023,46 @@ async fn persist_pending_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &
         .unwrap_or(false)
 }
 
+/// Apply a match-row disconnect forfeit before `finish()`. `false` means
+/// the hunk write is still busy and the sim already has a KO — do not
+/// store that KO as a side pick.
+async fn apply_latched_forfeit(
+    pool: &SqlitePool,
+    id: &str,
+    round: u32,
+    row: &MatchRow,
+    sim: &mut FightState,
+    ours: &mut Slot,
+    theirs: &mut Slot,
+    started_at: &mut Option<Instant>,
+    forfeit_pending: &mut bool,
+) -> bool {
+    if *forfeit_pending {
+        return true;
+    }
+    let Some(tag) = row.pending_forfeit_for(round) else {
+        return true;
+    };
+    if persist_disconnect_forfeit(pool, id, round, tag).await {
+        *forfeit_pending = true;
+        match tag {
+            "forfeit_ours" => sim.forfeit(Side::Ours),
+            "forfeit_theirs" => sim.forfeit(Side::Theirs),
+            _ => {}
+        }
+        return true;
+    }
+    match tag {
+        "forfeit_ours" => ours.forfeit_due = true,
+        "forfeit_theirs" => theirs.forfeit_due = true,
+        _ => {}
+    }
+    if started_at.is_none() {
+        *started_at = Some(Instant::now());
+    }
+    sim.result.is_none()
+}
+
 async fn persist_disconnect_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &str) -> bool {
     let tagged = db::set_hunk_winner(pool, id, i64::from(round), tag, false)
         .await
@@ -1025,12 +1095,14 @@ async fn finish_closed(a: Advance<'_>, result: RoundResult) -> bool {
         LastRound::MatchOver => {
             let msg = encode(&end_msg(a.sim, result, *a.round, true));
             broadcast_or_spawn(a.conns, &msg);
+            true
         }
-        LastRound::Terminal | LastRound::Retry => {
+        LastRound::Retry => false,
+        LastRound::Terminal => {
             expire_now(a.pool, a.id, a.conns, a.result.as_ref(), a.rooms).await;
+            true
         }
     }
-    true
 }
 
 async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
@@ -2280,13 +2352,37 @@ mod tests {
             "busy open-status must not broadcast End before the next Hello"
         );
         assert_eq!(
-            join_admit(MatchOpen::Unknown, false),
+            join_admit(MatchOpen::Unknown, false, false),
             JoinAdmit::Unknown,
             "busy status must not insert or Hello"
         );
-        assert_eq!(join_admit(MatchOpen::Open, false), JoinAdmit::Enter);
-        assert_eq!(join_admit(MatchOpen::Open, true), JoinAdmit::ScoredAll);
-        assert_eq!(join_admit(MatchOpen::Closed, false), JoinAdmit::Closed);
+        assert_eq!(join_admit(MatchOpen::Open, false, false), JoinAdmit::Enter);
+        assert_eq!(
+            join_admit(MatchOpen::Open, true, false),
+            JoinAdmit::ScoredAll
+        );
+        assert_eq!(
+            join_admit(MatchOpen::Closed, false, false),
+            JoinAdmit::Closed
+        );
+        assert_eq!(
+            join_admit(MatchOpen::Open, false, true),
+            JoinAdmit::Unknown,
+            "a decided sim whose finish is retrying must not Hello"
+        );
+        assert_eq!(
+            closed_finish_followup(true, LastRoundStatus::Unknown),
+            LastRound::Retry,
+            "busy get_match must not send Error { finished } in place of End"
+        );
+        assert_eq!(latched_forfeit_followup(false, false, true), "finish");
+        assert_eq!(
+            latched_forfeit_followup(true, false, true),
+            "retry",
+            "a replayed KO must not become a side pick while the forfeit hunk write is busy"
+        );
+        assert_eq!(latched_forfeit_followup(true, true, true), "forfeit");
+        assert_eq!(latched_forfeit_followup(true, false, false), "latch");
         assert_eq!(join_replay_followup(true), "hello");
         assert_eq!(
             join_replay_followup(false),
@@ -2308,6 +2404,20 @@ mod tests {
             "hello"
         } else {
             "preparing"
+        }
+    }
+
+    fn latched_forfeit_followup(pending: bool, persist_ok: bool, sim_result: bool) -> &'static str {
+        if !pending {
+            return if sim_result { "finish" } else { "play" };
+        }
+        if persist_ok {
+            return "forfeit";
+        }
+        if sim_result {
+            "retry"
+        } else {
+            "latch"
         }
     }
 
