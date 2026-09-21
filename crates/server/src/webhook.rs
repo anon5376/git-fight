@@ -345,10 +345,9 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
     tokio::spawn(async move {
         let start = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
             Ok(msg) => msg,
-            Err(_) => challenge::ChallengeStart {
-                body: "git fight could not start".into(),
-                match_id: None,
-            },
+            // Transient GitHub/SQLite I/O is not a user-visible decision.
+            // Ok(note(...)) still comments; Err must not POST a thread.
+            Err(_) => challenge::silent(),
         };
         if start.body.is_empty() {
             return;
@@ -615,6 +614,25 @@ mod tests {
             "retry",
             "busy open-status must not post a fight link we cannot confirm"
         );
+    }
+
+    #[test]
+    fn start_challenge_err_does_not_comment() {
+        assert_eq!(start_err_followup(Ok("note")), "comment");
+        assert_eq!(start_err_followup(Ok("")), "silent");
+        assert_eq!(
+            start_err_followup(Err(())),
+            "silent",
+            "transient start Err must not POST could-not-start"
+        );
+    }
+
+    fn start_err_followup(start: Result<&'static str, ()>) -> &'static str {
+        match start {
+            Ok("") => "silent",
+            Ok(_) => "comment",
+            Err(()) => "silent",
+        }
     }
 
     fn fight_link_followup(has_match: bool, open: Result<bool, ()>) -> &'static str {

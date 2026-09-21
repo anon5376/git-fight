@@ -149,7 +149,7 @@ fn note(body: impl Into<String>) -> ChallengeStart {
     }
 }
 
-fn silent() -> ChallengeStart {
+pub(crate) fn silent() -> ChallengeStart {
     ChallengeStart {
         body: String::new(),
         match_id: None,

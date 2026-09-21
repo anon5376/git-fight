@@ -2004,6 +2004,39 @@ async fn oversized_repo_is_skipped() {
 }
 
 #[tokio::test]
+async fn transient_start_error_does_not_comment() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_test_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/box/issues/1/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 99 })))
+        .mount(&mock)
+        .await;
+    let addr = spawn(cfg_for(&mock, PathBuf::from("/nope"))).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-repo-503", &fight_body()).await,
+        200
+    );
+    let comments = settle_posted(&mock).await;
+    assert!(
+        comments.is_empty(),
+        "a 503 get_repo must not POST could-not-start: {comments:?}"
+    );
+}
+
+#[tokio::test]
 async fn bot_fight_is_ignored() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
