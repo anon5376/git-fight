@@ -192,10 +192,9 @@ async fn later_round_gives_theirs_slot_to_that_hunk_author() {
         wait_type(&mut bob_stream, "hello").await["your_role"].as_str(),
         Some("theirs")
     );
-    assert_eq!(
-        wait_type(&mut carol_stream, "hello").await["your_role"].as_str(),
-        Some("spectator")
-    );
+    let carol_hello = wait_type(&mut carol_stream, "hello").await;
+    assert_eq!(carol_hello["your_role"].as_str(), Some("spectator"));
+    assert_eq!(carol_hello["you_are"].as_str(), Some("carol"));
 
     let mut next_send = 0u32;
     let mut confirmed: i32 = -1;

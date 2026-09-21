@@ -24,6 +24,7 @@ type Hello = {
   seed_hi: number;
   input_delay: number;
   your_role: string;
+  you_are?: string;
   ours: string;
   theirs: string;
   round: number;
@@ -217,10 +218,21 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     ui.onQuit();
   });
 
-  const ws = new WebSocket(wsUrl(matchId, token));
+  let ws: WebSocket | null = null;
+  let gen = 0;
+  let reconnectTimer: number | null = null;
+  let reconnectAttempts = 0;
+  const maxReconnects = 8;
+
+  const clearReconnect = () => {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
 
   const flush = (oursBtn: number, theirsBtn: number) => {
-    if (role === "spectator" || ws.readyState !== WebSocket.OPEN) {
+    if (role === "spectator" || !ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
     const horizon = Math.max(0, confirmed + 1) + delay;
@@ -240,21 +252,26 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     }
   };
 
-  ws.addEventListener("open", () => {
-    ui.wait.textContent = "waiting for opponent…";
-  });
-  ws.addEventListener("close", () => {
-    if (!finished && !stopped) {
-      ui.wait.classList.remove("hidden");
-      ui.wait.textContent = "disconnected — reconnecting in 2s";
-      window.setTimeout(() => {
-        if (!stopped && !finished) {
-          window.location.reload();
-        }
-      }, 2000);
+  const scheduleReconnect = (why: string) => {
+    if (stopped || finished) {
+      return;
     }
-  });
-  ws.addEventListener("message", (ev) => {
+    reconnectAttempts += 1;
+    if (reconnectAttempts > maxReconnects) {
+      ui.wait.classList.remove("hidden");
+      ui.wait.textContent = "desync — reloading";
+      window.location.reload();
+      return;
+    }
+    ui.wait.classList.remove("hidden");
+    ui.wait.textContent = why;
+    clearReconnect();
+    reconnectTimer = window.setTimeout(() => {
+      openSocket();
+    }, 400);
+  };
+
+  const onMessage = (ev: MessageEvent) => {
     const msg = JSON.parse(String(ev.data)) as ServerMsg;
     if (msg.type === "hello") {
       const hello = msg as Hello;
@@ -267,6 +284,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       totalRounds = hello.total_rounds ?? 1;
       nextSend = Math.max(0, confirmed + 1);
       finished = false;
+      reconnectAttempts = 0;
       ui.ko.classList.add("hidden");
       fight = fightFromWire(
         hello.seed_lo,
@@ -280,8 +298,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       );
       if (role === "spectator") {
         ui.wait.classList.remove("hidden");
-        ui.wait.textContent = "spectating";
-        void offerGithubLogin(matchId, ui);
+        if (!ui.wait.querySelector("[data-testid=\"github-login\"]")) {
+          ui.wait.textContent = "spectating";
+          void offerGithubLogin(matchId, ui);
+        }
       } else {
         ui.wait.textContent = "waiting for opponent…";
       }
@@ -302,8 +322,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       }
       if (hash.n !== fight.tick() || !hashesMatch(fight, hash.hi, hash.lo)) {
         ui.wait.classList.remove("hidden");
-        ui.wait.textContent = "desync — reloading";
-        window.location.reload();
+        ui.wait.textContent = "desync — reconnecting";
+        ws?.close();
       }
     } else if (msg.type === "snapshot") {
       const snap = msg as SnapshotMsg;
@@ -331,7 +351,39 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       ui.wait.classList.remove("hidden");
       ui.wait.textContent = err.message;
     }
-  });
+  };
+
+  const openSocket = () => {
+    if (stopped || finished) {
+      return;
+    }
+    gen += 1;
+    const myGen = gen;
+    const socket = new WebSocket(wsUrl(matchId, token));
+    ws = socket;
+    socket.addEventListener("open", () => {
+      if (myGen !== gen) {
+        return;
+      }
+      ui.wait.textContent = "waiting for opponent…";
+    });
+    socket.addEventListener("close", () => {
+      if (myGen !== gen) {
+        return;
+      }
+      if (!finished && !stopped) {
+        scheduleReconnect("disconnected — reconnecting");
+      }
+    });
+    socket.addEventListener("message", (ev) => {
+      if (myGen !== gen) {
+        return;
+      }
+      onMessage(ev);
+    });
+  };
+
+  openSocket();
 
   const loop = (now: number) => {
     if (stopped) {
@@ -379,8 +431,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   return {
     stop: () => {
       stopped = true;
+      clearReconnect();
+      gen += 1;
       keys.unbind();
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         ws.close();
       }
     },

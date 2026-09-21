@@ -159,6 +159,7 @@ pub enum ServerMsg {
         seed_hi: u32,
         input_delay: u32,
         your_role: String,
+        you_are: String,
         ours: String,
         theirs: String,
         round: u32,

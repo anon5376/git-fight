@@ -124,6 +124,8 @@ async fn hello_includes_stored_fighter_stats() {
     assert_eq!(hello["theirs_hp"].as_i64(), Some(80));
     assert_eq!(hello["theirs_armor"].as_bool(), Some(false));
     assert_eq!(hello["theirs_special"].as_bool(), Some(false));
+    assert_eq!(hello["you_are"].as_str(), Some(""));
+    assert_eq!(hello["your_role"].as_str(), Some("ours"));
 }
 
 #[tokio::test]
