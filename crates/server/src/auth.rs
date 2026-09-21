@@ -41,8 +41,7 @@ pub fn parse_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 pub fn sign(key: &[u8], value: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .unwrap_or_else(|_| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("hmac"));
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac-sha256 accepts any key length");
     mac.update(value.as_bytes());
     format!("{value}.{}", hex::encode(mac.finalize().into_bytes()))
 }
@@ -247,6 +246,20 @@ mod tests {
             pkce_challenge(verifier),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn sign_does_not_fall_back_to_a_zero_key() {
+        let signed = sign(b"session-key-session-key-session!", "sid");
+        let mut zero = Hmac::<Sha256>::new_from_slice(&[0u8; 32]).unwrap();
+        zero.update(b"sid");
+        let with_zeros = format!("sid.{}", hex::encode(zero.finalize().into_bytes()));
+        assert_ne!(signed, with_zeros);
+        assert_eq!(
+            verify_signed(b"session-key-session-key-session!", &signed).as_deref(),
+            Some("sid")
+        );
+        assert!(verify_signed(&[0u8; 32], &signed).is_none());
     }
 
     #[test]

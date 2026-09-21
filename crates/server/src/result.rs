@@ -2,12 +2,14 @@
 
 use crate::db::{self, HunkRow, MatchRow};
 use crate::gh::GitHub;
-use crate::gitutil;
+use crate::gitutil::{self, ExistingResult};
 use crate::limits::GIT_JOB_TIMEOUT;
 use git_fight_core::{ConflictFile, Pick};
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 #[derive(Clone)]
@@ -15,7 +17,33 @@ pub struct ResultCtx {
     pub gh: Option<GitHub>,
     pub pool: SqlitePool,
     pub public_url: String,
-    pub test_repos: std::collections::HashMap<String, PathBuf>,
+    pub test_repos: HashMap<String, PathBuf>,
+    /// One in-flight publish per match so boot retry and the room task cannot
+    /// both comment a skip after a successful create-only push.
+    pub publishing: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ResultCtx {
+    pub fn spawn_publish(&self, id: impl Into<String>) {
+        let id = id.into();
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            ctx.publish_claimed(&id).await;
+        });
+    }
+
+    pub async fn publish_claimed(&self, id: &str) {
+        {
+            let mut g = self.publishing.lock().await;
+            if !g.insert(id.to_string()) {
+                return;
+            }
+        }
+        if publish(self, id).await.is_err() {
+            eprintln!("git fight result failed");
+        }
+        self.publishing.lock().await.remove(id);
+    }
 }
 
 pub fn winner_tag(result: git_fight_core::RoundResult, forfeit: bool) -> &'static str {
@@ -119,9 +147,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             unresolved.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"),
             ctx.public_url.trim_end_matches('/'),
         );
-        comment(ctx, &row, &body).await;
-        let _ = db::set_result_branch(&ctx.pool, match_id, None, Some(reason)).await;
-        return Ok(());
+        return skip_push(ctx, &row, match_id, reason, body).await;
     }
 
     if !crate::gh::is_safe_github_name(&row.owner)
@@ -171,9 +197,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
                     "git fight: this fight used outdated code (PR head or base moved). Nothing was pushed. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
                     ctx.public_url.trim_end_matches('/'),
                 );
-                comment(ctx, &row, &body).await;
-                let _ = db::set_result_branch(&ctx.pool, match_id, None, Some("outdated")).await;
-                return Ok(());
+                return skip_push(ctx, &row, match_id, "outdated", body).await;
             }
             base_ref = pr.base.r#ref;
         }
@@ -272,17 +296,21 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     };
     match git {
         Ok(()) => {
-            let _ = db::set_result_branch(&ctx.pool, match_id, Some(&branch), None).await;
-            let public = ctx.public_url.trim_end_matches('/');
-            let compare = format!(
-                "https://github.com/{}/{}/compare/{}...{}",
-                row.owner, row.repo, row.pr_head_sha, branch
-            );
-            let body = format!(
-                "git fight finished.\n{}\nbranch: `{branch}`\ncompare: {compare}\nreplay: {public}/replay/{match_id}",
-                round_lines(&hunks)
-            );
-            comment(ctx, &row, &body).await;
+            if db::set_result_branch(&ctx.pool, match_id, Some(&branch), None)
+                .await
+                .unwrap_or(false)
+            {
+                let public = ctx.public_url.trim_end_matches('/');
+                let compare = format!(
+                    "https://github.com/{}/{}/compare/{}...{}",
+                    row.owner, row.repo, row.pr_head_sha, branch
+                );
+                let body = format!(
+                    "git fight finished.\n{}\nbranch: `{branch}`\ncompare: {compare}\nreplay: {public}/replay/{match_id}",
+                    round_lines(&hunks)
+                );
+                comment(ctx, &row, &body).await;
+            }
             Ok(())
         }
         Err((reason, body)) => skip_push(ctx, &row, match_id, reason, body).await,
@@ -309,6 +337,28 @@ async fn push_result_git(
                 "git fight: nothing pushed — could not clone to write the result branch. Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
             ),
         ));
+    }
+    match gitutil::inspect_result_ref(
+        dest,
+        url,
+        branch,
+        match_id,
+        &row.pr_head_sha,
+        &row.pr_base_sha,
+        bearer,
+    )
+    .await
+    {
+        Ok(ExistingResult::Ours) => return Ok(()),
+        Ok(ExistingResult::Foreign) => {
+            return Err((
+                "exists",
+                format!(
+                    "git fight: nothing pushed — `{branch}` already exists. The bot never overwrites a branch. Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
+                ),
+            ));
+        }
+        Ok(ExistingResult::Missing) | Err(_) => {}
     }
     if gitutil::fetch_pr_objects(
         dest,
@@ -464,8 +514,12 @@ async fn skip_push(
     reason: &str,
     body: String,
 ) -> Result<(), String> {
-    comment(ctx, row, &body).await;
-    let _ = db::set_result_branch(&ctx.pool, match_id, None, Some(reason)).await;
+    if db::set_result_branch(&ctx.pool, match_id, None, Some(reason))
+        .await
+        .unwrap_or(false)
+    {
+        comment(ctx, row, &body).await;
+    }
     Ok(())
 }
 

@@ -294,6 +294,7 @@ fn ctx(pool: sqlx::SqlitePool, mock: &MockServer, bare: PathBuf) -> ResultCtx {
         pool,
         public_url: "http://fight.test".into(),
         test_repos,
+        publishing: Default::default(),
     }
 }
 
@@ -881,6 +882,105 @@ async fn create_only_does_not_overwrite_existing_ref() {
 }
 
 #[tokio::test]
+async fn our_result_commit_is_success_on_retry() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base).await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    let ctx = ctx(pool.clone(), &mock, bare.clone());
+    git_fight_server::publish_result(&ctx, MATCH_ID)
+        .await
+        .unwrap();
+    let branch = format!("git-fight/pr-1-{MATCH_ID}");
+    let first = git_dir(&bare, &["rev-parse", &branch]);
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.result_branch.as_deref(), Some(branch.as_str()));
+    sqlx::query("UPDATE matches SET result_branch = NULL WHERE id = ?")
+        .bind(MATCH_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+    git_fight_server::publish_result(&ctx, MATCH_ID)
+        .await
+        .unwrap();
+    let second = git_dir(&bare, &["rev-parse", &branch]);
+    assert_eq!(first, second, "retry must not rewrite the result commit");
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.result_branch.as_deref(), Some(branch.as_str()));
+    assert!(row.abort_reason.is_none(), "{row:?}");
+}
+
+#[tokio::test]
+async fn unpublished_finished_match_is_pushed_on_boot() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base).await;
+    let dir = std::env::temp_dir().join(format!(
+        "gf-unpub-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    assert!(
+        git_fight_server::db::finish_open_match(&pool, MATCH_ID, "deadbeef")
+            .await
+            .unwrap()
+    );
+    let mut test_repos = HashMap::new();
+    test_repos.insert("acme/box".into(), bare.clone());
+    let cfg = Config {
+        instant: true,
+        github: Some(gh(&mock)),
+        auth: Auth {
+            session_key: KEY.to_vec(),
+            public_url: "http://fight.test".into(),
+        },
+        test_repos,
+        ..Config::default()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(listener, serve_pool, cfg)
+            .await
+            .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut branch = None;
+    for _ in 0..80 {
+        let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.result_branch.is_some() || row.abort_reason.is_some() {
+            branch = row.result_branch;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let branch = branch.expect("boot should retry the unpublished result");
+    assert!(branch.starts_with("git-fight/pr-1-"), "{branch}");
+    assert!(heads(&bare).iter().any(|r| r.ends_with(&branch)));
+}
+
+#[tokio::test]
 async fn push_create_only_never_uses_force() {
     let src =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gitutil.rs")).unwrap();
@@ -1061,6 +1161,7 @@ async fn local_match_does_not_push() {
         pool,
         public_url: "http://fight.test".into(),
         test_repos: HashMap::new(),
+        publishing: Default::default(),
     };
     git_fight_server::publish_result(&ctx, "aabbccdd")
         .await

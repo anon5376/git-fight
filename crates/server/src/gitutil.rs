@@ -906,6 +906,121 @@ pub async fn commit_tree(
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingResult {
+    Missing,
+    Ours,
+    Foreign,
+}
+
+/// First line of a result commit plus parents `(pr_head, pr_base)` and author.
+pub fn commit_is_match_result(raw: &str, match_id: &str, head: &str, base: &str) -> bool {
+    if !crate::protocol::is_match_id(match_id) || !is_safe_rev(head) || !is_safe_rev(base) {
+        return false;
+    }
+    let Some((headers, body)) = raw.split_once("\n\n") else {
+        return false;
+    };
+    let mut parents = Vec::new();
+    let mut author_ok = false;
+    for line in headers.lines() {
+        if let Some(p) = line.strip_prefix("parent ") {
+            parents.push(p.trim());
+        }
+        if let Some(rest) = line.strip_prefix("author ") {
+            author_ok = rest.starts_with("git-fight <git-fight@users.noreply.github.com>");
+        }
+    }
+    if !author_ok || parents.len() != 2 {
+        return false;
+    }
+    if !parents[0].eq_ignore_ascii_case(head) || !parents[1].eq_ignore_ascii_case(base) {
+        return false;
+    }
+    let expect = format!("git fight match {match_id}");
+    body.lines().next() == Some(expect.as_str())
+}
+
+async fn rev_parse_git_fight(
+    dir: &Path,
+    spec: &str,
+    bearer: Option<&str>,
+) -> Result<String, GitError> {
+    let ok = spec == "refs/git-fight-fetch/result"
+        || spec
+            .strip_prefix("refs/heads/")
+            .is_some_and(|r| r.starts_with("git-fight/") && is_safe_refname(r));
+    if !ok {
+        return Err(GitError::Command(
+            "refusing to inspect non git-fight ref".into(),
+        ));
+    }
+    let mut cmd = git_dir(dir, bearer);
+    cmd.args(["rev-parse", "--verify", spec]);
+    let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(git_err(&err));
+    }
+    let sha = String::from_utf8_lossy(&out).trim().to_string();
+    if !is_safe_rev(&sha) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    Ok(sha)
+}
+
+async fn cat_commit(dir: &Path, sha: &str, bearer: Option<&str>) -> Result<String, GitError> {
+    if !is_safe_rev(sha) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    let mut cmd = git_dir(dir, bearer);
+    cmd.args(["cat-file", "-p", sha]);
+    let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(git_err(&err));
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// After clone: the create-only ref is missing, already this match, or someone else's.
+pub async fn inspect_result_ref(
+    dir: &Path,
+    url: &str,
+    refname: &str,
+    match_id: &str,
+    head: &str,
+    base: &str,
+    bearer: Option<&str>,
+) -> Result<ExistingResult, GitError> {
+    if !refname.starts_with("git-fight/") || !is_safe_refname(refname) {
+        return Err(GitError::Command(
+            "refusing to inspect non git-fight ref".into(),
+        ));
+    }
+    let local = format!("refs/heads/{refname}");
+    let mut sha = rev_parse_git_fight(dir, &local, bearer).await.ok();
+    if sha.is_none() {
+        let spec = format!("+refs/heads/{refname}:refs/git-fight-fetch/result");
+        if fetch_refspec(dir, &spec, bearer).await.is_ok() {
+            sha = rev_parse_git_fight(dir, "refs/git-fight-fetch/result", bearer)
+                .await
+                .ok();
+        }
+    }
+    let Some(sha) = sha else {
+        return if ref_exists(url, refname, bearer).await? {
+            Ok(ExistingResult::Foreign)
+        } else {
+            Ok(ExistingResult::Missing)
+        };
+    };
+    let raw = cat_commit(dir, &sha, bearer).await?;
+    if commit_is_match_result(&raw, match_id, head, base) {
+        Ok(ExistingResult::Ours)
+    } else {
+        Ok(ExistingResult::Foreign)
+    }
+}
+
 pub async fn ref_exists(url: &str, refname: &str, bearer: Option<&str>) -> Result<bool, GitError> {
     if !is_safe_git_url(url) {
         return Err(GitError::Command("unsafe url".into()));
@@ -1066,6 +1181,23 @@ mod tests {
         assert!(result_ref(1, "../main").is_err());
         assert!(result_ref(1, "MAIN").is_err());
         assert!(result_ref(1, "dead/beef").is_err());
+    }
+
+    #[test]
+    fn result_commit_is_this_match_only() {
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = format!(
+            "tree {head}\nparent {head}\nparent {base}\nauthor git-fight <git-fight@users.noreply.github.com> 1 +0000\ncommitter git-fight <git-fight@users.noreply.github.com> 1 +0000\n\ngit fight match deadbeef\n\nround 1: lib.rs hunk 0 ours\n"
+        );
+        assert!(commit_is_match_result(&raw, "deadbeef", head, base));
+        assert!(!commit_is_match_result(&raw, "otherid", head, base));
+        assert!(!commit_is_match_result(&raw, "deadbeef", base, head));
+        let human = raw.replace(
+            "author git-fight <git-fight@users.noreply.github.com>",
+            "author alice <alice@example.com>",
+        );
+        assert!(!commit_is_match_result(&human, "deadbeef", head, base));
     }
 
     #[test]

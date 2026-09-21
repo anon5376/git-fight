@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,6 +112,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub config: Config,
     rooms: Arc<Mutex<HashMap<String, mpsc::Sender<RoomEvent>>>>,
+    publishing: Arc<Mutex<HashSet<String>>>,
     pub github: Option<GitHub>,
     pub auth: Auth,
     pub webhook_secret: Option<Vec<u8>>,
@@ -143,6 +144,29 @@ pub fn router(state: AppState) -> Router {
 }
 
 impl AppState {
+    fn result_ctx(&self) -> ResultCtx {
+        ResultCtx {
+            gh: self.github.clone(),
+            pool: self.pool.clone(),
+            public_url: self.auth.public_url.clone(),
+            test_repos: self.test_repos.clone(),
+            publishing: self.publishing.clone(),
+        }
+    }
+
+    fn retry_unpublished(&self) {
+        let ctx = self.result_ctx();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let Ok(ids) = db::list_unpublished_results(&pool).await else {
+                return;
+            };
+            for id in ids {
+                ctx.spawn_publish(id);
+            }
+        });
+    }
+
     async fn room_tx(&self, row: &MatchRow) -> Result<mpsc::Sender<RoomEvent>, String> {
         let Some(fresh) = db::get_match(&self.pool, &row.id).await.ok().flatten() else {
             return Err("not found".into());
@@ -163,12 +187,7 @@ impl AppState {
             RoomSettings {
                 instant: self.config.instant,
                 disconnect: self.config.disconnect,
-                result: Some(ResultCtx {
-                    gh: self.github.clone(),
-                    pool: self.pool.clone(),
-                    public_url: self.auth.public_url.clone(),
-                    test_repos: self.test_repos.clone(),
-                }),
+                result: Some(self.result_ctx()),
             },
             self.rooms.clone(),
         );
@@ -193,12 +212,14 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         test_repos: config.test_repos.clone(),
         config,
         rooms: Arc::new(Mutex::new(HashMap::new())),
+        publishing: Arc::new(Mutex::new(HashSet::new())),
     };
     if let Ok(rows) = db::list_live_matches(&state.pool).await {
         for row in rows {
             let _ = state.room_tx(&row).await;
         }
     }
+    state.retry_unpublished();
     let expirer = state.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(5));
@@ -208,18 +229,13 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
                 for id in ids {
                     if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
                         if row.status == "expired" {
-                            let ctx = ResultCtx {
-                                gh: expirer.github.clone(),
-                                pool: expirer.pool.clone(),
-                                public_url: expirer.auth.public_url.clone(),
-                                test_repos: expirer.test_repos.clone(),
-                            };
-                            crate::result::comment_expired(&ctx, &row).await;
+                            crate::result::comment_expired(&expirer.result_ctx(), &row).await;
                         }
                     }
                     expirer.close_room(&id).await;
                 }
             }
+            expirer.retry_unpublished();
             let _ = db::prune_deliveries(&expirer.pool, crate::limits::WEBHOOK_MAX_AGE_SECS).await;
             let _ = db::prune_sessions(&expirer.pool).await;
         }

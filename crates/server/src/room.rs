@@ -90,6 +90,7 @@ async fn run_room(
     let hunks = db::list_hunks(&pool, &row.id).await.unwrap_or_default();
     let github = db::github_identity(&row, &hunks);
     let total_rounds = u32::try_from(hunks.len()).unwrap_or(0).max(1);
+    let scored_all = !hunks.is_empty() && hunks.iter().all(|h| h.winner.is_some());
     let mut round: u32 = hunks
         .iter()
         .find(|h| h.winner.is_none())
@@ -124,9 +125,24 @@ async fn run_room(
     let mut pending_ours: BTreeMap<u32, u8> = BTreeMap::new();
     let mut pending_theirs: BTreeMap<u32, u8> = BTreeMap::new();
     let mut started_at: Option<Instant> = None;
-    let mut done = matches!(row.status.as_str(), "finished" | "expired" | "aborted");
-    let mut mirror = false;
     let id = row.id.clone();
+    let mut done = matches!(row.status.as_str(), "finished" | "expired" | "aborted");
+    if !done && scored_all {
+        if db::is_open_match(&pool, &id).await.unwrap_or(false) {
+            let last = total_rounds.saturating_sub(1);
+            let hash = hash_from_stored_round(&pool, &id, seed, &hunks, last).await;
+            if db::finish_open_match(&pool, &id, &hash)
+                .await
+                .unwrap_or(false)
+            {
+                if let Some(ctx) = settings.result.as_ref() {
+                    ctx.spawn_publish(id.clone());
+                }
+            }
+        }
+        done = true;
+    }
+    let mut mirror = false;
     let ours_name = row.ours_name.clone();
     let mut theirs_name = db::theirs_name_for_round(&hunks, round, &row.theirs_name);
     let expires_at = parse_rfc3339(&row.expires_at);
@@ -474,8 +490,12 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     let tag = result::winner_tag(result, forfeit);
     let ko =
         !forfeit && result != RoundResult::Draw && (a.sim.ours.hp <= 0 || a.sim.theirs.hp <= 0);
-    let _ = db::set_hunk_winner(a.pool, a.id, i64::from(*a.round), tag).await;
-    let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
+    let tagged = db::set_hunk_winner(a.pool, a.id, i64::from(*a.round), tag)
+        .await
+        .unwrap_or(false);
+    if tagged {
+        let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
+    }
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
     let hash_s = format!("{hi:08x}{lo:08x}");
@@ -484,18 +504,17 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
             .await
             .unwrap_or(false)
     {
-        if let Some(ctx) = a.result {
-            let id = a.id.to_string();
-            tokio::spawn(async move {
-                if result::publish(&ctx, &id).await.is_err() {
-                    eprintln!("git fight result failed");
-                }
-            });
+        if let Some(ctx) = a.result.as_ref() {
+            ctx.spawn_publish(a.id.to_string());
         }
     }
     let msg = encode(&end_msg(a.sim, result, *a.round, match_over));
     broadcast(a.conns, &msg).await;
     if match_over {
+        return true;
+    }
+    if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
+        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
         return true;
     }
     *a.round += 1;
@@ -539,6 +558,27 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
         let _ = conn.tx.send(encode(&hello)).await;
     }
     false
+}
+
+async fn hash_from_stored_round(
+    pool: &SqlitePool,
+    id: &str,
+    seed: u64,
+    hunks: &[db::HunkRow],
+    round: u32,
+) -> String {
+    let (ours_stats, theirs_stats) = db::stats_for_round(hunks, round);
+    let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
+    if let Ok(inputs) = db::load_inputs(pool, id, round).await {
+        for (_tick, ours, theirs) in inputs {
+            if sim.result.is_some() {
+                break;
+            }
+            sim.step(Input::from_u8(ours), Input::from_u8(theirs));
+        }
+    }
+    let (lo, hi) = split_hash(sim.state_hash());
+    format!("{hi:08x}{lo:08x}")
 }
 
 fn terminal_ws_error(row: &MatchRow) -> String {

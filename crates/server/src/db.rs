@@ -950,14 +950,17 @@ pub async fn set_hunk_winner(
     match_id: &str,
     round: i64,
     winner: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE match_hunks SET winner = ? WHERE match_id = ? AND round_index = ?")
-        .bind(winner)
-        .bind(match_id)
-        .bind(round)
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE match_hunks SET winner = ?
+         WHERE match_id = ? AND round_index = ? AND winner IS NULL",
+    )
+    .bind(winner)
+    .bind(match_id)
+    .bind(round)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub struct HunkRow {
@@ -1125,23 +1128,53 @@ pub async fn set_challenge_comment_id(
     Ok(())
 }
 
+/// Record the create-only branch or a skip reason. First writer wins.
+/// A successful branch is not overwritten by a later skip (or the reverse).
 pub async fn set_result_branch(
     pool: &SqlitePool,
     id: &str,
     branch: Option<&str>,
     abort: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE matches SET result_branch = COALESCE(?, result_branch),
-            abort_reason = COALESCE(?, abort_reason)
-         WHERE id = ?",
+) -> Result<bool, sqlx::Error> {
+    let res = if let Some(branch) = branch {
+        sqlx::query(
+            "UPDATE matches SET result_branch = ?
+             WHERE id = ? AND result_branch IS NULL AND abort_reason IS NULL
+               AND status NOT IN ('aborted', 'expired')",
+        )
+        .bind(branch)
+        .bind(id)
+        .execute(pool)
+        .await?
+    } else if let Some(abort) = abort {
+        sqlx::query(
+            "UPDATE matches SET abort_reason = COALESCE(abort_reason, ?)
+             WHERE id = ? AND result_branch IS NULL AND abort_reason IS NULL",
+        )
+        .bind(abort)
+        .bind(id)
+        .execute(pool)
+        .await?
+    } else {
+        return Ok(false);
+    };
+    Ok(res.rows_affected() > 0)
+}
+
+/// Finished GitHub fights that never stored a branch or skip reason (crash
+/// after `finish_open_match`, before publish completed).
+pub async fn list_unpublished_results(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM matches
+         WHERE status = 'finished'
+           AND pr_number > 0
+           AND owner != ''
+           AND result_branch IS NULL
+           AND abort_reason IS NULL",
     )
-    .bind(branch)
-    .bind(abort)
-    .bind(id)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(())
+    Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for HunkRow {
@@ -1527,6 +1560,124 @@ mod tests {
         let old = get_match(&pool, "old").await.unwrap().unwrap();
         assert_eq!(old.status, "aborted");
         assert_eq!(old.abort_reason.as_deref(), Some("outdated"));
+    }
+
+    #[tokio::test]
+    async fn hunk_winner_is_write_once() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "m1",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(set_hunk_winner(&pool, "m1", 0, "ours").await.unwrap());
+        assert!(!set_hunk_winner(&pool, "m1", 0, "theirs").await.unwrap());
+        let hunks = list_hunks(&pool, "m1").await.unwrap();
+        assert_eq!(hunks[0].winner.as_deref(), Some("ours"));
+    }
+
+    #[tokio::test]
+    async fn result_branch_is_not_clobbered_by_a_skip() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "fin1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(finish_open_match(&pool, "fin1", "deadbeef").await.unwrap());
+        assert!(
+            set_result_branch(&pool, "fin1", Some("git-fight/pr-1-fin1"), None)
+                .await
+                .unwrap()
+        );
+        assert!(!set_result_branch(&pool, "fin1", None, Some("exists"))
+            .await
+            .unwrap());
+        let row = get_match(&pool, "fin1").await.unwrap().unwrap();
+        assert_eq!(row.result_branch.as_deref(), Some("git-fight/pr-1-fin1"));
+        assert!(row.abort_reason.is_none());
+        assert_eq!(
+            list_unpublished_results(&pool).await.unwrap(),
+            Vec::<String>::new()
+        );
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "wait1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 2,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(finish_open_match(&pool, "wait1", "cafebabe").await.unwrap());
+        assert_eq!(
+            list_unpublished_results(&pool).await.unwrap(),
+            vec!["wait1".to_string()]
+        );
+        assert!(set_result_branch(&pool, "wait1", None, Some("draw"))
+            .await
+            .unwrap());
+        assert!(
+            !set_result_branch(&pool, "wait1", Some("git-fight/pr-2-wait1"), None)
+                .await
+                .unwrap()
+        );
+        let wait = get_match(&pool, "wait1").await.unwrap().unwrap();
+        assert!(wait.result_branch.is_none());
+        assert_eq!(wait.abort_reason.as_deref(), Some("draw"));
+        assert!(list_unpublished_results(&pool).await.unwrap().is_empty());
     }
 
     #[tokio::test]
