@@ -138,7 +138,7 @@ Needs git 2.38+. Exit `0` is a clean merge (comment and stop). Exit `1` is confl
 
 For each conflicted path, `git cat-file blob <tree>:<path>` and parse with core. Skip non-regular files (symlinks `120000`, gitlinks `160000`), paths with `..` or a `.git` component, absolute paths, and blobs over a size cap. Binary / modify-delete / file-directory conflicts have no fightable hunks and are skipped.
 
-Count fightable hunks. `0`: comment that the conflicts are not the kind git fight can play. `> 15`: comment that it is too many conflicts for one fight and stop. Otherwise one round per hunk, file path then hunk order, max 15.
+Count fightable hunks. `0`: comment that the conflicts are not the kind git fight can play. `> 15`: comment that it is too many conflicts for one fight and stop. Otherwise one round per hunk, file path then hunk order, max 15. A pull request with two conflicted files is two rounds; the result branch applies each round's pick to that path.
 
 Record `pr_head_sha` and `pr_base_sha` on the match **before** clone so a second `/fight` or a `synchronize` during git work still sees the open match. If clone or hunk collection fails, status becomes `aborted` and another `/fight` can start. Milestone 5 refuses to push if either SHA has moved.
 
