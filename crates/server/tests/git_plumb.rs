@@ -62,10 +62,12 @@ async fn merge_tree_finds_fightable_hunk() {
     let clone = dest.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, Some("ghs_test_token"))
+        .await
+        .unwrap();
     assert_eq!(code, 1);
     assert!(paths.contains("lib.rs"));
-    let hunks = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let hunks = gitutil::collect_hunks(&clone, &tree, &base, &paths, Some("ghs_test_token"))
         .await
         .unwrap();
     assert_eq!(hunks.len(), 1);
@@ -83,8 +85,8 @@ async fn fighter_stats_match_cli_formula() {
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
     let _ = gitutil::fetch_shas(&clone, &[&head, &base], None).await;
-    let ours = gitutil::fighter_stats(&clone, &head, "lib.rs", "alice").await;
-    let theirs = gitutil::fighter_stats(&clone, &base, "lib.rs", "bob").await;
+    let ours = gitutil::fighter_stats(&clone, &head, "lib.rs", "alice", None).await;
+    let theirs = gitutil::fighter_stats(&clone, &base, "lib.rs", "bob", None).await;
     assert_eq!(ours.hp, 120, "{ours:?}");
     assert!(!ours.armor, "{ours:?}");
     assert!(!ours.special, "{ours:?}");
@@ -92,13 +94,13 @@ async fn fighter_stats_match_cli_formula() {
     assert!(!theirs.armor);
     assert!(!theirs.special);
     assert_eq!(
-        gitutil::latest_author(&clone, &head, "lib.rs")
+        gitutil::latest_author(&clone, &head, "lib.rs", None)
             .await
             .as_deref(),
         Some("alice")
     );
     assert_eq!(
-        gitutil::latest_author(&clone, &base, "lib.rs")
+        gitutil::latest_author(&clone, &base, "lib.rs", None)
             .await
             .as_deref(),
         Some("bob")
@@ -191,8 +193,8 @@ async fn fighter_stats_armor_and_special() {
         .await
         .unwrap();
     let _ = gitutil::fetch_shas(&clone, &[&head, &base], None).await;
-    let ours = gitutil::fighter_stats(&clone, &head, "lib.rs", "alice").await;
-    let theirs = gitutil::fighter_stats(&clone, &base, "lib.rs", "bob").await;
+    let ours = gitutil::fighter_stats(&clone, &head, "lib.rs", "alice", None).await;
+    let theirs = gitutil::fighter_stats(&clone, &base, "lib.rs", "bob", None).await;
     assert_eq!(ours.hp, 120, "{ours:?}");
     assert!(ours.armor, "{ours:?}");
     assert!(ours.special, "{ours:?}");
@@ -264,9 +266,11 @@ async fn more_than_fifteen_hunks_is_too_many() {
     let clone = dest.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     assert_eq!(code, 1);
-    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
         .await
         .unwrap_err();
     match err {
@@ -321,9 +325,11 @@ async fn file_directory_conflict_has_no_fightable_hunks() {
     let clone = dest.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     assert_eq!(code, 1);
-    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
         .await
         .unwrap_err();
     match err {
@@ -385,9 +391,11 @@ async fn gitlink_conflict_has_no_fightable_hunks() {
     let clone = dest.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     assert_eq!(code, 1);
-    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
         .await
         .unwrap_err();
     match err {
@@ -440,9 +448,11 @@ async fn oversized_blob_has_no_fightable_hunks() {
     let clone = dest.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     assert_eq!(code, 1);
-    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
         .await
         .unwrap_err();
     match err {
@@ -454,7 +464,7 @@ async fn oversized_blob_has_no_fightable_hunks() {
 #[tokio::test]
 async fn git_rejects_option_injection_in_revs() {
     let dir = tempfile::tempdir().unwrap();
-    let err = gitutil::merge_tree(dir.path(), "--upload-pack=true", "aaaaaaaa")
+    let err = gitutil::merge_tree(dir.path(), "--upload-pack=true", "aaaaaaaa", None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unsafe revision"), "{err}");
@@ -466,4 +476,13 @@ async fn git_rejects_option_injection_in_revs() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unsafe revision"), "{err}");
+    let err = gitutil::cat_blob(
+        dir.path(),
+        "--upload-pack=true",
+        Some("ghs_live_token_secret"),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("unsafe revision"), "{err}");
+    assert!(!err.to_string().contains("ghs_live_token_secret"), "{err}");
 }

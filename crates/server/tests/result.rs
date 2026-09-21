@@ -407,9 +407,11 @@ async fn two_hunks_in_one_file_push_each_pick() {
     let clone = work.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     assert_eq!(code, 1);
-    let collected = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let collected = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
         .await
         .unwrap();
     assert_eq!(collected.len(), 2, "expected two fightable hunks in lib.rs");
@@ -477,7 +479,7 @@ async fn two_hunks_in_one_file_push_each_pick() {
         "missing {branch} in {:?}",
         heads(&bare)
     );
-    let merge_blob = gitutil::cat_blob(&clone, &format!("{tree}:lib.rs"))
+    let merge_blob = gitutil::cat_blob(&clone, &format!("{tree}:lib.rs"), None)
         .await
         .unwrap();
     let parsed = ConflictFile::parse(&merge_blob).unwrap();
@@ -503,9 +505,11 @@ async fn two_files_push_each_pick() {
     let clone = work.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     assert_eq!(code, 1);
-    let collected = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+    let collected = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
         .await
         .unwrap();
     assert_eq!(collected.len(), 2, "expected a.rs and b.rs");
@@ -893,17 +897,26 @@ async fn plumbing_hash_object_write_tree_commit() {
     let clone = dest.path().join("c.git");
     let url = format!("file://{}", bare.display());
     gitutil::clone_bare(&url, &clone, None).await.unwrap();
-    let (tree, ..) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    let (tree, ..) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
     let resolved = gitutil::build_resolved_tree(
         &clone,
         &tree,
         &[("lib.rs".into(), b"fn v() { 2 }\n".to_vec())],
+        None,
     )
     .await
     .unwrap();
-    let commit = gitutil::commit_tree(&clone, &resolved, &[&head, &base], "git fight match x\n")
-        .await
-        .unwrap();
+    let commit = gitutil::commit_tree(
+        &clone,
+        &resolved,
+        &[&head, &base],
+        "git fight match x\n",
+        None,
+    )
+    .await
+    .unwrap();
     gitutil::push_create_only(&clone, &url, &commit, "git-fight/pr-9-abc", None)
         .await
         .unwrap();

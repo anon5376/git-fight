@@ -168,14 +168,20 @@ pub async fn start_challenge(
     {
         return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
     }
-    let _ = gitutil::fetch_shas(&dest, &[&pr.head.sha, &pr.base.sha], bearer.as_deref()).await;
+    if gitutil::fetch_shas(&dest, &[&pr.head.sha, &pr.base.sha], bearer.as_deref())
+        .await
+        .is_err()
+    {
+        return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
+    }
 
-    let (tree, paths, code) = match gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha).await {
-        Ok(v) => v,
-        Err(_) => {
-            return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-        }
-    };
+    let (tree, paths, code) =
+        match gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha, bearer.as_deref()).await {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
+            }
+        };
     if code == 0 {
         return Ok(abort_start(
             &ctx.pool,
@@ -186,30 +192,31 @@ pub async fn start_challenge(
         .await);
     }
 
-    let hunks = match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths).await {
-        Ok(h) => h,
-        Err(gitutil::GitError::TooMany(n)) => {
-            return Ok(abort_start(
-                &ctx.pool,
-                &id,
-                "too_many",
-                format!("too many conflicts for one fight ({n}; max {MAX_HUNKS})"),
-            )
-            .await);
-        }
-        Err(gitutil::GitError::NothingToFight) => {
-            return Ok(abort_start(
-                &ctx.pool,
-                &id,
-                "nothing",
-                "the conflicts are not the kind git fight can play".into(),
-            )
-            .await);
-        }
-        Err(_) => {
-            return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-        }
-    };
+    let hunks =
+        match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths, bearer.as_deref()).await {
+            Ok(h) => h,
+            Err(gitutil::GitError::TooMany(n)) => {
+                return Ok(abort_start(
+                    &ctx.pool,
+                    &id,
+                    "too_many",
+                    format!("too many conflicts for one fight ({n}; max {MAX_HUNKS})"),
+                )
+                .await);
+            }
+            Err(gitutil::GitError::NothingToFight) => {
+                return Ok(abort_start(
+                    &ctx.pool,
+                    &id,
+                    "nothing",
+                    "the conflicts are not the kind git fight can play".into(),
+                )
+                .await);
+            }
+            Err(_) => {
+                return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
+            }
+        };
     if hunks.len() > MAX_HUNKS {
         return Ok(abort_start(
             &ctx.pool,
@@ -262,12 +269,25 @@ pub async fn start_challenge(
     }
 
     for (round, h) in hunks.iter().enumerate() {
-        let ours_author = gitutil::latest_author(&dest, &pr.head.sha, &h.path)
+        let ours_author = gitutil::latest_author(&dest, &pr.head.sha, &h.path, bearer.as_deref())
             .await
             .unwrap_or_else(|| ours_login.clone());
-        let ours_stats = gitutil::fighter_stats(&dest, &pr.head.sha, &h.path, &ours_author).await;
-        let theirs_stats =
-            gitutil::fighter_stats(&dest, &pr.base.sha, &h.path, &h.blame_name).await;
+        let ours_stats = gitutil::fighter_stats(
+            &dest,
+            &pr.head.sha,
+            &h.path,
+            &ours_author,
+            bearer.as_deref(),
+        )
+        .await;
+        let theirs_stats = gitutil::fighter_stats(
+            &dest,
+            &pr.base.sha,
+            &h.path,
+            &h.blame_name,
+            bearer.as_deref(),
+        )
+        .await;
         if db::insert_hunk(
             &ctx.pool,
             &db::NewHunk {

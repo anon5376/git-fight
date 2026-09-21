@@ -133,6 +133,17 @@ fn redact_git_text(s: &str) -> String {
     out
 }
 
+fn git_err(err: &[u8]) -> GitError {
+    GitError::Command(redact_git_text(&String::from_utf8_lossy(err)))
+}
+
+fn is_safe_blob_spec(spec: &str) -> bool {
+    match spec.split_once(':') {
+        Some((rev, path)) => is_safe_rev(rev) && is_safe_path(path),
+        None => is_safe_rev(spec),
+    }
+}
+
 pub async fn clone_bare(url: &str, dest: &Path, bearer: Option<&str>) -> Result<(), GitError> {
     let mut cmd = git_base();
     apply_auth(&mut cmd, url, bearer);
@@ -146,16 +157,20 @@ pub async fn clone_bare(url: &str, dest: &Path, bearer: Option<&str>) -> Result<
     ]);
     let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     Ok(())
 }
 
-fn git_dir(dir: &Path) -> Command {
+fn git_dir(dir: &Path, bearer: Option<&str>) -> Command {
     let mut c = git_base();
     c.arg("--git-dir").arg(dir);
+    // Partial clones lazy-fetch blobs over the origin URL (file:// tests, GitHub HTTPS).
+    c.arg("-c").arg("protocol.file.allow=always");
+    if let Some(token) = bearer {
+        c.arg("-c")
+            .arg(format!("http.extraHeader=Authorization: bearer {token}"));
+    }
     c
 }
 
@@ -163,11 +178,7 @@ pub async fn fetch_shas(dir: &Path, shas: &[&str], bearer: Option<&str>) -> Resu
     if shas.iter().any(|s| !is_safe_rev(s)) {
         return Err(GitError::Command("unsafe revision".into()));
     }
-    let mut cmd = git_dir(dir);
-    if let Some(token) = bearer {
-        cmd.arg("-c")
-            .arg(format!("http.extraHeader=Authorization: bearer {token}"));
-    }
+    let mut cmd = git_dir(dir, bearer);
     cmd.arg("fetch").arg("origin").args(shas.iter().copied());
     let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 {
@@ -251,24 +262,31 @@ pub async fn merge_tree(
     dir: &Path,
     base: &str,
     head: &str,
+    bearer: Option<&str>,
 ) -> Result<(String, BTreeSet<String>, i32), GitError> {
     if !is_safe_rev(base) || !is_safe_rev(head) {
         return Err(GitError::Command("unsafe revision".into()));
     }
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["merge-tree", "--write-tree", "-z", base, head]);
     let (code, out, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 && code != 1 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     let (tree, paths) = parse_merge_tree_output(&out)?;
     Ok((tree, paths, code))
 }
 
-async fn ls_tree_mode(dir: &Path, tree: &str, path: &str) -> Result<Option<String>, GitError> {
-    let mut cmd = git_dir(dir);
+async fn ls_tree_mode(
+    dir: &Path,
+    tree: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Result<Option<String>, GitError> {
+    if !is_safe_rev(tree) || !is_safe_path(path) {
+        return Ok(None);
+    }
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["ls-tree", tree, "--", path]);
     let (code, out, _) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
@@ -282,14 +300,15 @@ async fn ls_tree_mode(dir: &Path, tree: &str, path: &str) -> Result<Option<Strin
     Ok(Some(mode.to_string()))
 }
 
-async fn cat_file(dir: &Path, spec: &str) -> Result<Vec<u8>, GitError> {
-    let mut cmd = git_dir(dir);
+async fn cat_file(dir: &Path, spec: &str, bearer: Option<&str>) -> Result<Vec<u8>, GitError> {
+    if !is_safe_blob_spec(spec) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["cat-file", "blob", spec]);
     let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
-        return Err(GitError::Command(
-            String::from_utf8_lossy(&err).into_owned(),
-        ));
+        return Err(git_err(&err));
     }
     Ok(out)
 }
@@ -299,26 +318,30 @@ pub async fn collect_hunks(
     tree: &str,
     base_sha: &str,
     paths: &BTreeSet<String>,
+    bearer: Option<&str>,
 ) -> Result<Vec<FightHunk>, GitError> {
+    if !is_safe_rev(tree) || !is_safe_rev(base_sha) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
     let mut out = Vec::new();
     for path in paths {
         if !is_safe_path(path) {
             continue;
         }
-        let Some(mode) = ls_tree_mode(dir, tree, path).await? else {
+        let Some(mode) = ls_tree_mode(dir, tree, path, bearer).await? else {
             continue;
         };
         if mode != "100644" && mode != "100755" {
             continue;
         }
-        let blob = cat_file(dir, &format!("{tree}:{path}")).await?;
+        let blob = cat_file(dir, &format!("{tree}:{path}"), bearer).await?;
         if blob.len() > MAX_BLOB_BYTES {
             continue;
         }
         let Ok(parsed) = ConflictFile::parse(&blob) else {
             continue;
         };
-        let base_file = cat_file(dir, &format!("{base_sha}:{path}"))
+        let base_file = cat_file(dir, &format!("{base_sha}:{path}"), bearer)
             .await
             .unwrap_or_default();
         for i in 0..parsed.hunk_count() {
@@ -326,7 +349,7 @@ pub async fn collect_hunks(
             let game_ours = parsed.theirs(i).to_vec();
             let game_theirs = parsed.ours(i).to_vec();
             let (name, email, sha) =
-                blame_theirs(dir, base_sha, path, &base_file, &game_theirs).await;
+                blame_theirs(dir, base_sha, path, &base_file, &game_theirs, bearer).await;
             out.push(FightHunk {
                 path: path.clone(),
                 hunk_index: i,
@@ -357,9 +380,13 @@ async fn blame_theirs(
     path: &str,
     base_file: &[u8],
     needle: &[u8],
+    bearer: Option<&str>,
 ) -> (String, String, String) {
+    if !is_safe_rev(base_sha) || !is_safe_path(path) {
+        return ("theirs".into(), String::new(), String::new());
+    }
     let range = line_range(base_file, needle);
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.arg("blame").arg("--line-porcelain");
     if let Some((a, b)) = range {
         cmd.arg("-L").arg(format!("{a},{b}"));
@@ -368,7 +395,7 @@ async fn blame_theirs(
     if let Ok((0, out, _)) = run(cmd, Duration::from_secs(20)).await {
         return parse_blame_author(&out);
     }
-    fallback_author(dir, base_sha, path).await
+    fallback_author(dir, base_sha, path, bearer).await
 }
 
 fn line_range(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
@@ -417,11 +444,16 @@ fn parse_blame_author(porcelain: &[u8]) -> (String, String, String) {
     (name, email, sha)
 }
 
-async fn fallback_author(dir: &Path, base_sha: &str, path: &str) -> (String, String, String) {
+async fn fallback_author(
+    dir: &Path,
+    base_sha: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> (String, String, String) {
     if !is_safe_rev(base_sha) || !is_safe_path(path) {
         return ("theirs".into(), String::new(), String::new());
     }
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["log", "-1", "--format=%an%n%ae%n%H", base_sha, "--", path]);
     if let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await {
         let text = String::from_utf8_lossy(&out);
@@ -445,11 +477,16 @@ fn looks_like_test(path: &str) -> bool {
 }
 
 /// Latest commit author on `rev` that touched `path` (`git log -1 --format=%an`).
-pub async fn latest_author(dir: &Path, rev: &str, path: &str) -> Option<String> {
+pub async fn latest_author(
+    dir: &Path,
+    rev: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Option<String> {
     if !is_safe_rev(rev) || !is_safe_path(path) {
         return None;
     }
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["log", "-1", "--format=%an", rev, "--", path]);
     let (code, out, _) = run(cmd, Duration::from_secs(10)).await.ok()?;
     if code != 0 {
@@ -464,19 +501,25 @@ pub async fn latest_author(dir: &Path, rev: &str, path: &str) -> Option<String> 
 }
 
 /// CLI-equivalent HP / armor / special from git history. Falls back to defaults.
-pub async fn fighter_stats(dir: &Path, rev: &str, path: &str, author: &str) -> FighterStats {
+pub async fn fighter_stats(
+    dir: &Path,
+    rev: &str,
+    path: &str,
+    author: &str,
+    bearer: Option<&str>,
+) -> FighterStats {
     if !is_safe_rev(rev) || !is_safe_path(path) {
         return FighterStats::default();
     }
-    let hp = hp_from_blame(dir, rev, path, author).await;
-    let armor = armor_from_commit(dir, rev, path).await;
-    let special = special_from_log(dir, rev, author).await;
+    let hp = hp_from_blame(dir, rev, path, author, bearer).await;
+    let armor = armor_from_commit(dir, rev, path, bearer).await;
+    let special = special_from_log(dir, rev, author, bearer).await;
     FighterStats::clamped(hp, armor, special)
 }
 
-async fn hp_from_blame(dir: &Path, rev: &str, path: &str, name: &str) -> i32 {
-    let _ = cat_file(dir, &format!("{rev}:{path}")).await;
-    let mut cmd = git_dir(dir);
+async fn hp_from_blame(dir: &Path, rev: &str, path: &str, name: &str, bearer: Option<&str>) -> i32 {
+    let _ = cat_file(dir, &format!("{rev}:{path}"), bearer).await;
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["blame", "--line-porcelain", rev, "--", path]);
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(20)).await else {
         return 100;
@@ -498,8 +541,8 @@ async fn hp_from_blame(dir: &Path, rev: &str, path: &str, name: &str) -> i32 {
     80 + (mine * 40) / total
 }
 
-async fn armor_from_commit(dir: &Path, rev: &str, path: &str) -> bool {
-    let mut cmd = git_dir(dir);
+async fn armor_from_commit(dir: &Path, rev: &str, path: &str, bearer: Option<&str>) -> bool {
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["log", "-1", "--format=%H", rev, "--", path]);
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await else {
         return false;
@@ -508,7 +551,7 @@ async fn armor_from_commit(dir: &Path, rev: &str, path: &str) -> bool {
     if !is_safe_rev(&commit) {
         return false;
     }
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.args([
         "diff-tree",
         "--no-commit-id",
@@ -523,7 +566,7 @@ async fn armor_from_commit(dir: &Path, rev: &str, path: &str) -> bool {
     String::from_utf8_lossy(&out).lines().any(looks_like_test)
 }
 
-async fn special_from_log(dir: &Path, rev: &str, name: &str) -> bool {
+async fn special_from_log(dir: &Path, rev: &str, name: &str, bearer: Option<&str>) -> bool {
     let name = name.trim();
     if name.is_empty() || name.contains('\0') || name.contains('\n') || name.starts_with('-') {
         return false;
@@ -531,7 +574,7 @@ async fn special_from_log(dir: &Path, rev: &str, name: &str) -> bool {
     if !is_safe_rev(rev) {
         return false;
     }
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["log", "--since=7 days ago", "--format=%ad", "--date=short"]);
     cmd.arg(format!("--author={name}"));
     cmd.arg(rev);
@@ -563,14 +606,16 @@ pub fn result_ref(pr_number: i64, match_id: &str) -> Result<String, GitError> {
     Ok(format!("git-fight/pr-{pr_number}-{match_id}"))
 }
 
-pub async fn hash_object_w(dir: &Path, bytes: &[u8]) -> Result<String, GitError> {
-    let mut cmd = git_dir(dir);
+pub async fn hash_object_w(
+    dir: &Path,
+    bytes: &[u8],
+    bearer: Option<&str>,
+) -> Result<String, GitError> {
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["hash-object", "-w", "--stdin"]);
     let (code, out, err) = run_stdin(cmd, bytes, Duration::from_secs(15)).await?;
     if code != 0 {
-        return Err(GitError::Command(
-            String::from_utf8_lossy(&err).into_owned(),
-        ));
+        return Err(git_err(&err));
     }
     let oid = String::from_utf8_lossy(&out).trim().to_string();
     if oid.len() != 40 && oid.len() != 64 {
@@ -583,15 +628,21 @@ fn with_index(cmd: &mut Command, index: &Path) {
     cmd.env("GIT_INDEX_FILE", index);
 }
 
-pub async fn read_tree_index(dir: &Path, index: &Path, tree: &str) -> Result<(), GitError> {
-    let mut cmd = git_dir(dir);
+pub async fn read_tree_index(
+    dir: &Path,
+    index: &Path,
+    tree: &str,
+    bearer: Option<&str>,
+) -> Result<(), GitError> {
+    if !is_safe_rev(tree) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    let mut cmd = git_dir(dir, bearer);
     with_index(&mut cmd, index);
     cmd.args(["read-tree", tree]);
     let (code, _, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     Ok(())
 }
@@ -602,6 +653,7 @@ pub async fn update_index_cacheinfo(
     mode: &str,
     blob: &str,
     path: &str,
+    bearer: Option<&str>,
 ) -> Result<(), GitError> {
     if !is_safe_path(path) {
         return Err(GitError::Command("unsafe path".into()));
@@ -609,27 +661,30 @@ pub async fn update_index_cacheinfo(
     if mode != "100644" && mode != "100755" {
         return Err(GitError::Command("refusing non-regular mode".into()));
     }
-    let mut cmd = git_dir(dir);
+    if !is_safe_rev(blob) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    let mut cmd = git_dir(dir, bearer);
     with_index(&mut cmd, index);
     cmd.args(["update-index", "--add", "--cacheinfo", mode, blob, path]);
     let (code, _, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     Ok(())
 }
 
-pub async fn write_tree_index(dir: &Path, index: &Path) -> Result<String, GitError> {
-    let mut cmd = git_dir(dir);
+pub async fn write_tree_index(
+    dir: &Path,
+    index: &Path,
+    bearer: Option<&str>,
+) -> Result<String, GitError> {
+    let mut cmd = git_dir(dir, bearer);
     with_index(&mut cmd, index);
     cmd.arg("write-tree");
     let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
@@ -639,11 +694,12 @@ pub async fn commit_tree(
     tree: &str,
     parents: &[&str],
     message: &str,
+    bearer: Option<&str>,
 ) -> Result<String, GitError> {
     if !is_safe_rev(tree) || parents.iter().any(|p| !is_safe_rev(p)) {
         return Err(GitError::Command("unsafe revision".into()));
     }
-    let mut cmd = git_dir(dir);
+    let mut cmd = git_dir(dir, bearer);
     cmd.env("GIT_AUTHOR_NAME", "git-fight");
     cmd.env("GIT_AUTHOR_EMAIL", "git-fight@users.noreply.github.com");
     cmd.env("GIT_COMMITTER_NAME", "git-fight");
@@ -654,9 +710,7 @@ pub async fn commit_tree(
     }
     let (code, out, err) = run_stdin(cmd, message.as_bytes(), Duration::from_secs(15)).await?;
     if code != 0 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
@@ -697,20 +751,20 @@ pub async fn push_create_only(
             "refusing to push outside git-fight/*".into(),
         ));
     }
+    if !is_safe_rev(commit) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
     if ref_exists(url, refname, bearer).await? {
         return Err(GitError::Command(format!(
             "ref refs/heads/{refname} already exists"
         )));
     }
     let dest = format!("{commit}:refs/heads/{refname}");
-    let mut cmd = git_dir(dir);
-    apply_auth(&mut cmd, url, bearer);
+    let mut cmd = git_dir(dir, bearer);
     cmd.args(["push", "--", url, &dest]);
     let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 {
-        return Err(GitError::Command(redact_git_text(
-            &String::from_utf8_lossy(&err),
-        )));
+        return Err(git_err(&err));
     }
     Ok(())
 }
@@ -724,30 +778,31 @@ pub async fn build_resolved_tree(
     dir: &Path,
     merge_tree: &str,
     files: &[(String, Vec<u8>)],
+    bearer: Option<&str>,
 ) -> Result<String, GitError> {
     let index = temp_index_path(dir);
     let _ = tokio::fs::remove_file(&index).await;
-    read_tree_index(dir, &index, merge_tree).await?;
+    read_tree_index(dir, &index, merge_tree, bearer).await?;
     for (path, bytes) in files {
         if !is_safe_path(path) {
             continue;
         }
-        let mode = ls_tree_mode(dir, merge_tree, path)
+        let mode = ls_tree_mode(dir, merge_tree, path, bearer)
             .await?
             .unwrap_or_else(|| "100644".into());
         if mode != "100644" && mode != "100755" {
             continue;
         }
-        let blob = hash_object_w(dir, bytes).await?;
-        update_index_cacheinfo(dir, &index, &mode, &blob, path).await?;
+        let blob = hash_object_w(dir, bytes, bearer).await?;
+        update_index_cacheinfo(dir, &index, &mode, &blob, path, bearer).await?;
     }
-    let tree = write_tree_index(dir, &index).await?;
+    let tree = write_tree_index(dir, &index, bearer).await?;
     let _ = tokio::fs::remove_file(&index).await;
     Ok(tree)
 }
 
-pub async fn cat_blob(dir: &Path, spec: &str) -> Result<Vec<u8>, GitError> {
-    cat_file(dir, spec).await
+pub async fn cat_blob(dir: &Path, spec: &str, bearer: Option<&str>) -> Result<Vec<u8>, GitError> {
+    cat_file(dir, spec, bearer).await
 }
 
 #[cfg(test)]
@@ -774,6 +829,14 @@ mod tests {
         assert!(!is_safe_rev("../main"));
         assert!(!is_safe_rev("--upload-pack=true"));
         assert!(!is_safe_rev("-C"));
+        assert!(is_safe_blob_spec(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:lib.rs"
+        ));
+        assert!(!is_safe_blob_spec("HEAD:lib.rs"));
+        assert!(!is_safe_blob_spec("--upload-pack=true"));
+        assert!(!is_safe_blob_spec(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:../x"
+        ));
     }
 
     #[test]

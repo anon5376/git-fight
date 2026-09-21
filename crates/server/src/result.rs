@@ -214,15 +214,34 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         )
         .await;
     }
-    let _ = gitutil::fetch_shas(
+    if gitutil::fetch_shas(
         &dest,
         &[&row.pr_head_sha, &row.pr_base_sha],
         bearer.as_deref(),
     )
-    .await;
+    .await
+    .is_err()
+    {
+        return skip_push(
+            ctx,
+            &row,
+            match_id,
+            "push",
+            format!(
+                "git fight: nothing pushed — could not rebuild the merge. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                ctx.public_url.trim_end_matches('/')
+            ),
+        )
+        .await;
+    }
 
-    let (tree, paths, code) = match gitutil::merge_tree(&dest, &row.pr_base_sha, &row.pr_head_sha)
-        .await
+    let (tree, paths, code) = match gitutil::merge_tree(
+        &dest,
+        &row.pr_base_sha,
+        &row.pr_head_sha,
+        bearer.as_deref(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(_) => {
@@ -262,7 +281,9 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         if !gitutil::is_safe_path(path) {
             continue;
         }
-        let blob = match gitutil::cat_blob(&dest, &format!("{tree}:{path}")).await {
+        let blob = match gitutil::cat_blob(&dest, &format!("{tree}:{path}"), bearer.as_deref())
+            .await
+        {
             Ok(b) => b,
             Err(_) => {
                 return skip_push(
@@ -297,7 +318,8 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         files.push((path.clone(), parsed.resolve(picks)));
     }
 
-    let new_tree = match gitutil::build_resolved_tree(&dest, &tree, &files).await {
+    let new_tree = match gitutil::build_resolved_tree(&dest, &tree, &files, bearer.as_deref()).await
+    {
         Ok(t) => t,
         Err(_) => {
             return skip_push(
@@ -319,6 +341,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         &new_tree,
         &[&row.pr_head_sha, &row.pr_base_sha],
         &message,
+        bearer.as_deref(),
     )
     .await
     {
