@@ -296,7 +296,14 @@ async fn run_room(
                         if done || sim.result.is_some() {
                             continue;
                         }
-                        if input_round.is_some_and(|r| r != round) {
+                        // GitHub matches require the Hello round so a leftover
+                        // KO Input that omitted `round` cannot steer the next
+                        // conflict. Local demo still accepts omitted round.
+                        if github {
+                            if input_round != Some(round) {
+                                continue;
+                            }
+                        } else if input_round.is_some_and(|r| r != round) {
                             continue;
                         }
                         if tick < next_tick || tick > next_tick.saturating_add(INPUT_WINDOW) {

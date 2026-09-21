@@ -521,8 +521,9 @@ async fn live_match_records_stats() {
             Some("hello") => {
                 while next_send < 16 {
                     let punch = if next_send.is_multiple_of(8) { 1 } else { 0 };
-                    let body =
-                        format!(r#"{{"type":"input","tick":{next_send},"buttons":{punch}}}"#);
+                    let body = format!(
+                        r#"{{"type":"input","tick":{next_send},"buttons":{punch},"round":0}}"#
+                    );
                     sink.send(Message::Text(body.into())).await.unwrap();
                     next_send += 1;
                 }
@@ -531,8 +532,9 @@ async fn live_match_records_stats() {
                 let n = v["n"].as_u64().unwrap() as u32;
                 while next_send <= n + 8 {
                     let punch = if next_send.is_multiple_of(8) { 1 } else { 0 };
-                    let body =
-                        format!(r#"{{"type":"input","tick":{next_send},"buttons":{punch}}}"#);
+                    let body = format!(
+                        r#"{{"type":"input","tick":{next_send},"buttons":{punch},"round":0}}"#
+                    );
                     sink.send(Message::Text(body.into())).await.unwrap();
                     next_send += 1;
                 }

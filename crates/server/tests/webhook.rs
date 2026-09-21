@@ -652,11 +652,26 @@ fn spawn_hello_drain(mut stream: WsStream) -> tokio::sync::mpsc::Receiver<Value>
     rx
 }
 
-async fn send_buttons(alice: &mut WsSink, other: &mut WsSink, tick: u32, ours: u8, theirs: u8) {
-    let o = format!(r#"{{"type":"input","tick":{tick},"buttons":{ours}}}"#);
-    let t = format!(r#"{{"type":"input","tick":{tick},"buttons":{theirs}}}"#);
-    alice.send(Message::Text(o.into())).await.unwrap();
-    other.send(Message::Text(t.into())).await.unwrap();
+fn input_json(tick: u32, buttons: u8, round: u32) -> String {
+    format!(r#"{{"type":"input","tick":{tick},"buttons":{buttons},"round":{round}}}"#)
+}
+
+async fn send_buttons(
+    alice: &mut WsSink,
+    other: &mut WsSink,
+    tick: u32,
+    ours: u8,
+    theirs: u8,
+    round: u32,
+) {
+    alice
+        .send(Message::Text(input_json(tick, ours, round).into()))
+        .await
+        .unwrap();
+    other
+        .send(Message::Text(input_json(tick, theirs, round).into()))
+        .await
+        .unwrap();
 }
 
 struct MockOpts {
@@ -1024,6 +1039,7 @@ async fn fight_comment_two_files_plays_two_rounds_and_pushes_both() {
     let mut next_send = 0u32;
     let mut ends = 0u32;
     let mut hellos = 0u32;
+    let mut play_round = 0u32;
     loop {
         let msg = tokio::time::timeout_at(deadline, stream.next())
             .await
@@ -1039,9 +1055,10 @@ async fn fight_comment_two_files_plays_two_rounds_and_pushes_both() {
                 hellos += 1;
                 assert_eq!(v["your_role"].as_str(), Some("ours"), "{v}");
                 assert_eq!(v["total_rounds"].as_u64(), Some(2), "{v}");
+                play_round = v["round"].as_u64().unwrap_or(0) as u32;
                 next_send = 0;
                 while next_send < 16 {
-                    let body = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                    let body = input_json(next_send, 2, play_round);
                     sink.send(Message::Text(body.into())).await.unwrap();
                     next_send += 1;
                 }
@@ -1049,7 +1066,7 @@ async fn fight_comment_two_files_plays_two_rounds_and_pushes_both() {
             Some("tick") => {
                 let n = v["n"].as_u64().unwrap() as u32;
                 while next_send <= n + 8 {
-                    let body = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                    let body = input_json(next_send, 2, play_round);
                     sink.send(Message::Text(body.into())).await.unwrap();
                     next_send += 1;
                 }
@@ -1183,13 +1200,20 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
     let mut next_send = 0u32;
+    let mut play_round = 0u32;
     while next_send < 16 {
-        let ours = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
-        let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
-        alice_sink.send(Message::Text(ours.into())).await.unwrap();
-        bob_sink.send(Message::Text(idle.into())).await.unwrap();
-        let kick = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
-        carol_sink.send(Message::Text(kick.into())).await.unwrap();
+        alice_sink
+            .send(Message::Text(input_json(next_send, 2, play_round).into()))
+            .await
+            .unwrap();
+        bob_sink
+            .send(Message::Text(input_json(next_send, 0, play_round).into()))
+            .await
+            .unwrap();
+        carol_sink
+            .send(Message::Text(input_json(next_send, 2, play_round).into()))
+            .await
+            .unwrap();
         next_send += 1;
     }
     let mut ends = 0u32;
@@ -1206,17 +1230,27 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
         let v: Value = serde_json::from_str(&text).unwrap();
         match v["type"].as_str() {
             Some("hello") => {
+                play_round = v["round"].as_u64().unwrap_or(0) as u32;
                 next_send = 0;
                 while next_send < 16 {
-                    let ours = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
-                    let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
-                    alice_sink.send(Message::Text(ours.into())).await.unwrap();
+                    alice_sink
+                        .send(Message::Text(input_json(next_send, 2, play_round).into()))
+                        .await
+                        .unwrap();
                     if theirs_is_carol {
-                        carol_sink.send(Message::Text(idle.into())).await.unwrap();
+                        carol_sink
+                            .send(Message::Text(input_json(next_send, 0, play_round).into()))
+                            .await
+                            .unwrap();
                     } else {
-                        bob_sink.send(Message::Text(idle.into())).await.unwrap();
-                        let kick = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
-                        carol_sink.send(Message::Text(kick.into())).await.unwrap();
+                        bob_sink
+                            .send(Message::Text(input_json(next_send, 0, play_round).into()))
+                            .await
+                            .unwrap();
+                        carol_sink
+                            .send(Message::Text(input_json(next_send, 2, play_round).into()))
+                            .await
+                            .unwrap();
                     }
                     next_send += 1;
                 }
@@ -1224,15 +1258,24 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
             Some("tick") => {
                 let n = v["n"].as_u64().unwrap() as u32;
                 while next_send <= n + 8 {
-                    let ours = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
-                    let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
-                    alice_sink.send(Message::Text(ours.into())).await.unwrap();
+                    alice_sink
+                        .send(Message::Text(input_json(next_send, 2, play_round).into()))
+                        .await
+                        .unwrap();
                     if theirs_is_carol {
-                        carol_sink.send(Message::Text(idle.into())).await.unwrap();
+                        carol_sink
+                            .send(Message::Text(input_json(next_send, 0, play_round).into()))
+                            .await
+                            .unwrap();
                     } else {
-                        bob_sink.send(Message::Text(idle.into())).await.unwrap();
-                        let kick = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
-                        carol_sink.send(Message::Text(kick.into())).await.unwrap();
+                        bob_sink
+                            .send(Message::Text(input_json(next_send, 0, play_round).into()))
+                            .await
+                            .unwrap();
+                        carol_sink
+                            .send(Message::Text(input_json(next_send, 2, play_round).into()))
+                            .await
+                            .unwrap();
                     }
                     next_send += 1;
                 }
@@ -1432,6 +1475,7 @@ async fn fight_comment_two_authors_mixed_picks_push() {
     let mut ours_btn = 2u8;
     let mut theirs_btn = 0u8;
     let mut theirs_is_carol = false;
+    let mut play_round = 0u32;
     while next_send < 16 {
         send_buttons(
             &mut alice_sink,
@@ -1439,6 +1483,7 @@ async fn fight_comment_two_authors_mixed_picks_push() {
             next_send,
             ours_btn,
             theirs_btn,
+            play_round,
         )
         .await;
         next_send += 1;
@@ -1456,6 +1501,7 @@ async fn fight_comment_two_authors_mixed_picks_push() {
         let v: Value = serde_json::from_str(&text).unwrap();
         match v["type"].as_str() {
             Some("hello") => {
+                play_round = v["round"].as_u64().unwrap_or(0) as u32;
                 next_send = 0;
                 while next_send < 16 {
                     let other = if theirs_is_carol {
@@ -1463,7 +1509,15 @@ async fn fight_comment_two_authors_mixed_picks_push() {
                     } else {
                         &mut bob_sink
                     };
-                    send_buttons(&mut alice_sink, other, next_send, ours_btn, theirs_btn).await;
+                    send_buttons(
+                        &mut alice_sink,
+                        other,
+                        next_send,
+                        ours_btn,
+                        theirs_btn,
+                        play_round,
+                    )
+                    .await;
                     next_send += 1;
                 }
             }
@@ -1475,7 +1529,15 @@ async fn fight_comment_two_authors_mixed_picks_push() {
                     } else {
                         &mut bob_sink
                     };
-                    send_buttons(&mut alice_sink, other, next_send, ours_btn, theirs_btn).await;
+                    send_buttons(
+                        &mut alice_sink,
+                        other,
+                        next_send,
+                        ours_btn,
+                        theirs_btn,
+                        play_round,
+                    )
+                    .await;
                     next_send += 1;
                 }
             }
@@ -2668,20 +2730,20 @@ async fn fight_comment_plays_and_pushes_create_only_branch() {
         match v["type"].as_str() {
             Some("hello") => {
                 assert_eq!(v["your_role"].as_str(), Some("ours"), "{v}");
+                let play_round = v["round"].as_u64().unwrap_or(0) as u32;
                 while next_send < 16 {
                     let punch = if next_send.is_multiple_of(8) { 1 } else { 0 };
-                    let body =
-                        format!(r#"{{"type":"input","tick":{next_send},"buttons":{punch}}}"#);
+                    let body = input_json(next_send, punch, play_round);
                     sink.send(Message::Text(body.into())).await.unwrap();
                     next_send += 1;
                 }
             }
             Some("tick") => {
                 let n = v["n"].as_u64().unwrap() as u32;
+                let play_round = 0u32;
                 while next_send <= n + 8 {
                     let punch = if next_send.is_multiple_of(8) { 1 } else { 0 };
-                    let body =
-                        format!(r#"{{"type":"input","tick":{next_send},"buttons":{punch}}}"#);
+                    let body = input_json(next_send, punch, play_round);
                     sink.send(Message::Text(body.into())).await.unwrap();
                     next_send += 1;
                 }

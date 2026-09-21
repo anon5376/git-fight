@@ -287,7 +287,7 @@ async fn spectator_input_does_not_block_fighter() {
     let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let (mut sink, _stream) = ws.split();
     for i in 0..600u32 {
-        let body = format!(r#"{{"type":"input","tick":{i},"buttons":1}}"#);
+        let body = format!(r#"{{"type":"input","tick":{i},"buttons":1,"round":0}}"#);
         sink.send(Message::Text(body.into())).await.unwrap();
     }
     let role = tokio::time::timeout(
@@ -410,7 +410,7 @@ async fn later_round_gives_theirs_slot_to_that_hunk_author() {
     let end = loop {
         let horizon = u32::try_from(confirmed.saturating_add(1)).unwrap_or(0) + 24;
         while next_send <= horizon {
-            let msg = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
+            let msg = format!(r#"{{"type":"input","tick":{next_send},"buttons":0,"round":0}}"#);
             alice_sink
                 .send(Message::Text(msg.clone().into()))
                 .await
