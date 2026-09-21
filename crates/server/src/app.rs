@@ -117,6 +117,8 @@ pub struct AppState {
     /// SHA-drift aborts that exhausted the short retry loop. Restart loses
     /// this map; the next `synchronize` or 24h expiry covers leftover rows.
     pending_aborts: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// SHA-drift close-before-abort. Join must not respawn lockstep.
+    closing: Arc<std::sync::Mutex<HashSet<String>>>,
     pub(crate) comments: crate::challenge::CommentTrack,
     pub github: Option<GitHub>,
     pub auth: Auth,
@@ -169,6 +171,22 @@ impl AppState {
         if let Ok(mut map) = self.pending_aborts.lock() {
             map.remove(id);
         }
+    }
+
+    pub(crate) fn mark_closing(&self, id: &str) {
+        if let Ok(mut g) = self.closing.lock() {
+            g.insert(id.to_string());
+        }
+    }
+
+    pub(crate) fn unmark_closing(&self, id: &str) {
+        if let Ok(mut g) = self.closing.lock() {
+            g.remove(id);
+        }
+    }
+
+    fn is_closing(&self, id: &str) -> bool {
+        self.closing.lock().map(|g| g.contains(id)).unwrap_or(false)
     }
 
     async fn record_missing_stats(&self) {
@@ -234,6 +252,7 @@ impl AppState {
             match db::abort_open_match(&self.pool, &id, &reason).await {
                 Ok(true) => {
                     self.dequeue_abort(&id);
+                    self.unmark_closing(&id);
                     self.close_room(&id).await;
                     if let Ok(Some(row)) = db::get_match(&self.pool, &id).await {
                         crate::result::comment_outdated(&self.result_ctx(), &row).await;
@@ -241,6 +260,7 @@ impl AppState {
                 }
                 Ok(false) => {
                     self.dequeue_abort(&id);
+                    self.unmark_closing(&id);
                     self.close_room(&id).await;
                 }
                 Err(_) => {}
@@ -314,6 +334,13 @@ impl AppState {
                 hunks.len(),
             );
             self.comments.mark(&row.id);
+            match crate::webhook::open_for_comment_retry(&self.pool, &row.id).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    self.comments.unmark(&row.id);
+                    continue;
+                }
+            }
             let posted = gh
                 .comment(inst, &row.owner, &row.repo, row.pr_number as u64, &body)
                 .await
@@ -346,7 +373,11 @@ impl AppState {
             return Err("not found".into());
         };
         if let Some(message) = closed_ws_message(&fresh.status, fresh.abort_reason.as_deref()) {
+            self.unmark_closing(&fresh.id);
             return Err(message.to_string());
+        }
+        if self.is_closing(&fresh.id) {
+            return Err("outdated".into());
         }
         let mut rooms = self.rooms.lock().await;
         if let Some(existing) = rooms.get(&fresh.id) {
@@ -395,6 +426,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         rooms: Arc::new(Mutex::new(HashMap::new())),
         publishing: Arc::new(Mutex::new(HashSet::new())),
         pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         comments: crate::challenge::CommentTrack::default(),
     };
     if let Ok(rows) = db::list_live_matches(&state.pool).await {
@@ -717,6 +749,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         reject_socket(socket, message).await;
         return;
     }
+    if state.is_closing(&row.id) {
+        reject_socket(socket, "outdated").await;
+        return;
+    }
     let hunks = db::list_hunks(&state.pool, &row.id)
         .await
         .unwrap_or_default();
@@ -1006,6 +1042,7 @@ mod tests {
             rooms: Arc::new(Mutex::new(map)),
             publishing: Arc::new(Mutex::new(HashSet::new())),
             pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             comments: crate::challenge::CommentTrack::default(),
             github: None,
             auth: Auth::default(),
@@ -1024,6 +1061,7 @@ mod tests {
             rooms: Arc::new(Mutex::new(HashMap::new())),
             publishing: Arc::new(Mutex::new(HashSet::new())),
             pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             comments: crate::challenge::CommentTrack::default(),
             github: None,
             auth: Auth::default(),
@@ -1152,5 +1190,27 @@ mod tests {
         let row = crate::db::get_match(&pool, "prep2").await.unwrap().unwrap();
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("clone"));
+    }
+
+    #[tokio::test]
+    async fn close_room_does_not_expire_and_closing_blocks_respawn() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "cl1", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        let state = test_state(pool.clone());
+        let row = crate::db::get_match(&pool, "cl1").await.unwrap().unwrap();
+        state.room_tx(&row).await.expect("spawn room");
+        state.mark_closing("cl1");
+        assert_eq!(
+            state.room_tx(&row).await.unwrap_err(),
+            "outdated",
+            "Join must not respawn lockstep after a drift close"
+        );
+        state.close_room("cl1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let row = crate::db::get_match(&pool, "cl1").await.unwrap().unwrap();
+        assert_eq!(row.status, "pending", "Shutdown must not expire");
+        assert!(row.abort_reason.is_none());
     }
 }

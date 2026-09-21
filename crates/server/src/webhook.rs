@@ -203,6 +203,7 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
         Err(_) => {
             // Drift is known. Stop lockstep now; keep retrying abort so
             // rematch `/fight` is not stuck on a leftover open row.
+            state.mark_closing(&row.id);
             state.close_room(&row.id).await;
             schedule_outdated_abort(state.clone(), row.clone());
             return;
@@ -213,15 +214,20 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
 
 fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
     tokio::spawn(async move {
+        state.mark_closing(&row.id);
         state.close_room(&row.id).await;
         for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             match db::abort_open_match(&state.pool, &row.id, "outdated").await {
                 Ok(true) => {
+                    state.unmark_closing(&row.id);
                     close_and_comment_outdated(&state, &row).await;
                     return;
                 }
-                Ok(false) => return,
+                Ok(false) => {
+                    state.unmark_closing(&row.id);
+                    return;
+                }
                 Err(_) => {}
             }
         }
@@ -317,7 +323,10 @@ fn schedule_open_lookup(state: crate::app::AppState, owner: String, repo: String
 
 /// Retry once. `Ok(false)` means the row is already closed — do not post
 /// a fight link. `Err` is still unknown.
-async fn open_for_comment_retry(pool: &sqlx::SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+pub(crate) async fn open_for_comment_retry(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<bool, sqlx::Error> {
     match db::is_open_match(pool, id).await {
         Ok(v) => Ok(v),
         Err(_) => db::is_open_match(pool, id).await,
@@ -515,6 +524,24 @@ mod tests {
             Ok(true) => "close_and_comment",
             Ok(false) => "stop",
             Err(()) => "close_room_and_retry",
+        }
+    }
+
+    #[test]
+    fn expirer_fight_link_rechecks_open_immediately_before_post() {
+        assert_eq!(expirer_post_followup(Ok(true)), "post");
+        assert_eq!(expirer_post_followup(Ok(false)), "skip");
+        assert_eq!(
+            expirer_post_followup(Err(())),
+            "skip",
+            "busy final open-status must not POST a fight link"
+        );
+    }
+
+    fn expirer_post_followup(open: Result<bool, ()>) -> &'static str {
+        match open {
+            Ok(true) => "post",
+            Ok(false) | Err(()) => "skip",
         }
     }
 

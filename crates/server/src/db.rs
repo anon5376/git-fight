@@ -1421,7 +1421,8 @@ pub async fn set_challenge_comment_id(
     }
     let res = sqlx::query(
         "UPDATE matches SET challenge_comment_id = ?
-         WHERE id = ? AND challenge_comment_id IS NULL",
+         WHERE id = ? AND challenge_comment_id IS NULL
+           AND status IN ('pending', 'in_progress')",
     )
     .bind(comment_id)
     .bind(id)
@@ -1819,6 +1820,21 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn challenge_comment_id_is_not_set_after_abort() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "cmt2", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(abort_open_match(&pool, "cmt2", "outdated").await.unwrap());
+        assert!(
+            !set_challenge_comment_id(&pool, "cmt2", 99).await.unwrap(),
+            "a closed row must not store a fight-link id"
+        );
+        let row = get_match(&pool, "cmt2").await.unwrap().unwrap();
+        assert!(row.challenge_comment_id.is_none());
     }
 
     #[tokio::test]

@@ -213,8 +213,10 @@ async fn run_room(
                 let Some(ev) = ev else { break };
                 match ev {
                     RoomEvent::Shutdown => {
+                        // Drain sockets only. SHA-drift abort owns the
+                        // rematch comment; do not expire a still-open row.
                         if !done {
-                            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+                            drain_shutdown(&pool, &id, &conns).await;
                         }
                         break;
                     }
@@ -1186,6 +1188,20 @@ async fn drain_late_joins(rx: &mut mpsc::Receiver<RoomEvent>, pool: &SqlitePool,
             );
         }
     }
+}
+
+async fn drain_shutdown(pool: &SqlitePool, id: &str, conns: &BTreeMap<u64, Conn>) {
+    let row = db::get_match(pool, id).await.ok().flatten();
+    let message = row
+        .as_ref()
+        .and_then(|r| closed_ws_message(&r.status, r.abort_reason.as_deref()))
+        .unwrap_or("outdated");
+    broadcast_or_spawn(
+        conns,
+        &encode(&ServerMsg::Error {
+            message: message.to_string(),
+        }),
+    );
 }
 
 async fn expire_now(
