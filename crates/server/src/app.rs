@@ -1,10 +1,14 @@
+use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
+use crate::gh::GitHub;
 use crate::protocol::{ClientMsg, Role, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY};
+use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
+use crate::webhook;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,6 +30,10 @@ pub struct Config {
     pub static_dir: Option<PathBuf>,
     pub expire_secs: i64,
     pub disconnect: Duration,
+    pub github: Option<GitHub>,
+    pub auth: Auth,
+    pub webhook_secret: Option<Vec<u8>>,
+    pub test_repos: HashMap<String, PathBuf>,
 }
 
 impl Default for Config {
@@ -36,6 +44,10 @@ impl Default for Config {
             static_dir: None,
             expire_secs: EXPIRE_SECS,
             disconnect: Duration::from_secs(DISCONNECT_SECS),
+            github: None,
+            auth: Auth::default(),
+            webhook_secret: None,
+            test_repos: HashMap::new(),
         }
     }
 }
@@ -45,6 +57,10 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub config: Config,
     rooms: Arc<Mutex<HashMap<String, mpsc::Sender<RoomEvent>>>>,
+    pub github: Option<GitHub>,
+    pub auth: Auth,
+    pub webhook_secret: Option<Vec<u8>>,
+    pub test_repos: HashMap<String, PathBuf>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -54,8 +70,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/matches/{id}", get(get_match))
         .route("/api/replays/{id}", get(get_replay))
         .route("/ws", get(ws_upgrade))
+        .route("/webhooks/github", post(webhook::github_webhook))
+        .route("/auth/github", get(auth::start_auth))
+        .route("/auth/github/callback", get(auth::auth_callback))
+        .route("/api/me", get(auth::me))
         .route("/match/{id}", get(spa))
         .route("/replay/{id}", get(spa))
+        .route("/{owner}/{repo}/leaderboard", get(leaderboard))
+        .route("/badge/{owner}/{repo}/{user}", get(badge))
         .with_state(state.clone());
 
     if let Some(dir) = &state.config.static_dir {
@@ -68,6 +90,10 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> std::io::Result<()> {
     let state = AppState {
         pool: pool.clone(),
+        github: config.github.clone(),
+        auth: config.auth.clone(),
+        webhook_secret: config.webhook_secret.clone(),
+        test_repos: config.test_repos.clone(),
         config,
         rooms: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -105,6 +131,21 @@ struct CreateOut {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn leaderboard(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    crate::stats::leaderboard_response(&state.pool, &owner, &repo, &headers).await
+}
+
+async fn badge(
+    State(state): State<AppState>,
+    Path((owner, repo, user)): Path<(String, String, String)>,
+) -> Response {
+    crate::stats::badge_response(&state.pool, &owner, &repo, &user).await
 }
 
 async fn spa(State(state): State<AppState>) -> Response {
@@ -153,6 +194,8 @@ struct MatchPublic {
     seed: String,
     ours: String,
     theirs: String,
+    ours_login: Option<String>,
+    theirs_login: Option<String>,
     input_delay: i64,
     abort_reason: Option<String>,
 }
@@ -171,6 +214,8 @@ async fn get_match(
         seed: row.seed,
         ours: row.ours_name,
         theirs: row.theirs_name,
+        ours_login: row.ours_login,
+        theirs_login: row.theirs_login,
         input_delay: row.input_delay_ticks,
         abort_reason: row.abort_reason,
     }))
@@ -219,18 +264,20 @@ async fn ws_upgrade(
     ws: WebSocketUpgrade,
     Query(q): Query<WsQuery>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, q))
+    let login = auth::login_from_headers(&state.pool, &state.auth.session_key, &headers).await;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, q, login))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery) {
+async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Option<String>) {
     let Ok(Some(row)) = db::get_match(&state.pool, &q.match_id).await else {
         return;
     };
     if row.status == "expired" {
         return;
     }
-    let role = role_for(&row, q.token.as_deref());
+    let role = role_for(&row, q.token.as_deref(), login.as_deref());
     let tx = {
         let mut rooms = state.rooms.lock().await;
         rooms
@@ -242,6 +289,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery) {
                     RoomSettings {
                         instant: state.config.instant,
                         disconnect: state.config.disconnect,
+                        result: Some(ResultCtx {
+                            gh: state.github.clone(),
+                            pool: state.pool.clone(),
+                            public_url: state.auth.public_url.clone(),
+                            test_repos: state.test_repos.clone(),
+                        }),
                     },
                 )
             })
@@ -262,7 +315,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery) {
             if lag > Duration::ZERO {
                 tokio::time::sleep(lag).await;
             }
-            let Ok(ClientMsg::Input { tick, buttons }) = serde_json::from_str::<ClientMsg>(&text)
+            let Ok(ClientMsg::Input {
+                tick,
+                buttons,
+                theirs,
+            }) = serde_json::from_str::<ClientMsg>(&text)
             else {
                 continue;
             };
@@ -274,6 +331,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery) {
                     role,
                     tick,
                     buttons,
+                    theirs_buttons: theirs,
                 })
                 .await;
         }
@@ -294,7 +352,20 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery) {
     let _ = tokio::join!(read, write);
 }
 
-fn role_for(row: &MatchRow, token: Option<&str>) -> Role {
+fn role_for(row: &MatchRow, token: Option<&str>, login: Option<&str>) -> Role {
+    if row.ours_login.is_some() || row.theirs_login.is_some() {
+        let Some(login) = login else {
+            return Role::Spectator;
+        };
+        let ours = row.ours_login.as_deref() == Some(login);
+        let theirs = row.theirs_login.as_deref() == Some(login);
+        return match (ours, theirs) {
+            (true, true) => Role::Both,
+            (true, false) => Role::Ours,
+            (false, true) => Role::Theirs,
+            (false, false) => Role::Spectator,
+        };
+    }
     match token {
         Some(t) if row.ours_token.as_deref() == Some(t) => Role::Ours,
         Some(t) if row.theirs_token.as_deref() == Some(t) => Role::Theirs,

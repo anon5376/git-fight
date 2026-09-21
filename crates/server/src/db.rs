@@ -14,11 +14,20 @@ pub struct MatchRow {
     pub theirs_kind: String,
     pub ours_token: Option<String>,
     pub theirs_token: Option<String>,
+    pub ours_login: Option<String>,
+    pub theirs_login: Option<String>,
+    pub owner: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub pr_head_sha: String,
+    pub pr_base_sha: String,
+    pub installation_id: Option<i64>,
     pub input_delay_ticks: i64,
     pub created_at: String,
     pub expires_at: String,
     pub final_hash: Option<String>,
     pub abort_reason: Option<String>,
+    pub result_branch: Option<String>,
 }
 
 pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -77,6 +86,56 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS match_hunks (
+            match_id TEXT NOT NULL,
+            round_index INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            hunk_index INTEGER NOT NULL,
+            ours_bytes BLOB,
+            theirs_bytes BLOB,
+            base_bytes BLOB,
+            theirs_login TEXT,
+            theirs_name TEXT,
+            winner TEXT,
+            PRIMARY KEY (match_id, round_index)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            github_user_id INTEGER NOT NULL,
+            github_login TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            received_at TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS player_stats (
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            github_login TEXT NOT NULL,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            kos INTEGER NOT NULL DEFAULT 0,
+            conflicts_caused INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner, repo, github_login)
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -112,8 +171,10 @@ pub async fn insert_match(
 pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, sqlx::Error> {
     sqlx::query_as::<_, MatchRow>(
         "SELECT id, seed, status, ours_name, theirs_name, ours_kind, theirs_kind,
-                ours_token, theirs_token, input_delay_ticks, created_at, expires_at,
-                final_hash, abort_reason
+                ours_token, theirs_token, ours_login, theirs_login, owner, repo, pr_number,
+                pr_head_sha, pr_base_sha, installation_id,
+                input_delay_ticks, created_at, expires_at,
+                final_hash, abort_reason, result_branch
          FROM matches WHERE id = ?",
     )
     .bind(id)
@@ -206,6 +267,334 @@ pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Erro
     Ok(ids)
 }
 
+pub struct NewMatch {
+    pub id: String,
+    pub seed: u64,
+    pub delay: u32,
+    pub ours_name: String,
+    pub theirs_name: String,
+    pub ours_kind: String,
+    pub theirs_kind: String,
+    pub ours_login: Option<String>,
+    pub theirs_login: Option<String>,
+    pub ours_token: String,
+    pub theirs_token: String,
+    pub expire_secs: i64,
+    pub installation_id: Option<i64>,
+    pub owner: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub pr_head_sha: String,
+    pub pr_base_sha: String,
+}
+
+pub async fn insert_full_match(pool: &SqlitePool, m: &NewMatch) -> Result<(), sqlx::Error> {
+    let now = Utc::now();
+    let expires = now + Duration::seconds(m.expire_secs);
+    sqlx::query(
+        "INSERT INTO matches (
+            id, installation_id, owner, repo, pr_number, pr_head_sha, pr_base_sha,
+            seed, status, ours_login, theirs_login, ours_name, theirs_name,
+            ours_kind, theirs_kind, ours_token, theirs_token, input_delay_ticks,
+            created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&m.id)
+    .bind(m.installation_id)
+    .bind(&m.owner)
+    .bind(&m.repo)
+    .bind(m.pr_number)
+    .bind(&m.pr_head_sha)
+    .bind(&m.pr_base_sha)
+    .bind(m.seed.to_string())
+    .bind(&m.ours_login)
+    .bind(&m.theirs_login)
+    .bind(&m.ours_name)
+    .bind(&m.theirs_name)
+    .bind(&m.ours_kind)
+    .bind(&m.theirs_kind)
+    .bind(&m.ours_token)
+    .bind(&m.theirs_token)
+    .bind(i64::from(m.delay))
+    .bind(now.to_rfc3339())
+    .bind(expires.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub struct NewHunk<'a> {
+    pub match_id: &'a str,
+    pub round: i64,
+    pub path: &'a str,
+    pub hunk_index: i64,
+    pub ours: &'a [u8],
+    pub theirs: &'a [u8],
+    pub base: &'a [u8],
+    pub theirs_login: Option<&'a str>,
+    pub theirs_name: Option<&'a str>,
+}
+
+pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO match_hunks (
+            match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
+            theirs_login, theirs_name
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(h.match_id)
+    .bind(h.round)
+    .bind(h.path)
+    .bind(h.hunk_index)
+    .bind(h.ours)
+    .bind(h.theirs)
+    .bind(h.base)
+    .bind(h.theirs_login)
+    .bind(h.theirs_name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn open_match_for_pr(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM matches WHERE owner = ? AND repo = ? AND pr_number = ?
+         AND status IN ('pending', 'in_progress') LIMIT 1",
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(pr as i64)
+    .fetch_optional(pool)
+    .await
+    .map(|r| r.map(|x| x.0))
+}
+
+pub async fn record_delivery(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, received_at) VALUES (?, ?)",
+    )
+    .bind(id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn insert_session(
+    pool: &SqlitePool,
+    id: &str,
+    user_id: i64,
+    login: &str,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now();
+    let expires = now + Duration::days(14);
+    sqlx::query(
+        "INSERT INTO sessions (id, github_user_id, github_login, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(login)
+    .bind(now.to_rfc3339())
+    .bind(expires.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn session_login(pool: &SqlitePool, id: &str) -> Result<Option<String>, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query_as::<_, (String,)>(
+        "SELECT github_login FROM sessions WHERE id = ? AND expires_at > ?",
+    )
+    .bind(id)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    .map(|r| r.map(|x| x.0))
+}
+
+pub async fn set_hunk_winner(
+    pool: &SqlitePool,
+    match_id: &str,
+    round: i64,
+    winner: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE match_hunks SET winner = ? WHERE match_id = ? AND round_index = ?")
+        .bind(winner)
+        .bind(match_id)
+        .bind(round)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub struct HunkRow {
+    pub round_index: i64,
+    pub path: String,
+    pub hunk_index: i64,
+    pub winner: Option<String>,
+    pub theirs_name: Option<String>,
+    pub theirs_login: Option<String>,
+}
+
+pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login
+         FROM match_hunks WHERE match_id = ? ORDER BY round_index",
+    )
+    .bind(match_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(round_index, path, hunk_index, winner, theirs_name, theirs_login)| HunkRow {
+                round_index,
+                path,
+                hunk_index,
+                winner,
+                theirs_name,
+                theirs_login,
+            },
+        )
+        .collect())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerStat {
+    pub github_login: String,
+    pub wins: i64,
+    pub losses: i64,
+    pub kos: i64,
+    pub conflicts_caused: i64,
+}
+
+pub async fn add_player_stats(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    stat: &PlayerStat,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO player_stats (owner, repo, github_login, wins, losses, kos, conflicts_caused)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner, repo, github_login) DO UPDATE SET
+            wins = wins + excluded.wins,
+            losses = losses + excluded.losses,
+            kos = kos + excluded.kos,
+            conflicts_caused = conflicts_caused + excluded.conflicts_caused",
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(&stat.github_login)
+    .bind(stat.wins)
+    .bind(stat.losses)
+    .bind(stat.kos)
+    .bind(stat.conflicts_caused)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_player_stats(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<PlayerStat>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT github_login, wins, losses, kos, conflicts_caused
+         FROM player_stats
+         WHERE owner = ? AND repo = ?
+         ORDER BY wins DESC, kos DESC, conflicts_caused DESC, github_login COLLATE NOCASE ASC",
+    )
+    .bind(owner)
+    .bind(repo)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(github_login, wins, losses, kos, conflicts_caused)| PlayerStat {
+                github_login,
+                wins,
+                losses,
+                kos,
+                conflicts_caused,
+            },
+        )
+        .collect())
+}
+
+pub async fn get_player_stats(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    login: &str,
+) -> Result<PlayerStat, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT github_login, wins, losses, kos, conflicts_caused
+         FROM player_stats
+         WHERE owner = ? AND repo = ? AND github_login = ? COLLATE NOCASE",
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(login)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(
+            |(github_login, wins, losses, kos, conflicts_caused)| PlayerStat {
+                github_login,
+                wins,
+                losses,
+                kos,
+                conflicts_caused,
+            },
+        )
+        .unwrap_or(PlayerStat {
+            github_login: login.to_string(),
+            wins: 0,
+            losses: 0,
+            kos: 0,
+            conflicts_caused: 0,
+        }))
+}
+
+pub async fn set_result_branch(
+    pool: &SqlitePool,
+    id: &str,
+    branch: Option<&str>,
+    abort: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE matches SET result_branch = COALESCE(?, result_branch),
+            abort_reason = COALESCE(?, abort_reason)
+         WHERE id = ?",
+    )
+    .bind(branch)
+    .bind(abort)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -219,11 +608,20 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {
             theirs_kind: row.try_get("theirs_kind")?,
             ours_token: row.try_get("ours_token")?,
             theirs_token: row.try_get("theirs_token")?,
+            ours_login: row.try_get("ours_login")?,
+            theirs_login: row.try_get("theirs_login")?,
+            owner: row.try_get("owner")?,
+            repo: row.try_get("repo")?,
+            pr_number: row.try_get("pr_number")?,
+            pr_head_sha: row.try_get("pr_head_sha")?,
+            pr_base_sha: row.try_get("pr_base_sha")?,
+            installation_id: row.try_get("installation_id")?,
             input_delay_ticks: row.try_get("input_delay_ticks")?,
             created_at: row.try_get("created_at")?,
             expires_at: row.try_get("expires_at")?,
             final_hash: row.try_get("final_hash")?,
             abort_reason: row.try_get("abort_reason")?,
+            result_branch: row.try_get("result_branch")?,
         })
     }
 }

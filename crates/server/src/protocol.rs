@@ -11,6 +11,7 @@ pub const EXPIRE_SECS: i64 = 24 * 60 * 60;
 pub enum Role {
     Ours,
     Theirs,
+    Both,
     Spectator,
 }
 
@@ -19,6 +20,7 @@ impl Role {
         match self {
             Role::Ours => "ours",
             Role::Theirs => "theirs",
+            Role::Both => "both",
             Role::Spectator => "spectator",
         }
     }
@@ -27,7 +29,12 @@ impl Role {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    Input { tick: u32, buttons: u8 },
+    Input {
+        tick: u32,
+        buttons: u8,
+        #[serde(default)]
+        theirs: Option<u8>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -42,6 +49,7 @@ pub enum ServerMsg {
         ours: String,
         theirs: String,
         round: u32,
+        total_rounds: u32,
         confirmed_tick: i32,
     },
     Tick {
@@ -59,6 +67,8 @@ pub enum ServerMsg {
         hash_hi: u32,
         hash_lo: u32,
         tick: u32,
+        round: u32,
+        match_over: bool,
     },
     Error {
         message: String,
