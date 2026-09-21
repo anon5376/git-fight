@@ -233,7 +233,7 @@ A finished match already has `seed` and the full input log. `GET /replay/<id>` s
 
 ## Database tables
 
-SQLite via sqlx. Migrations run at server start. No secrets, no installation tokens, no OAuth tokens.
+SQLite via sqlx. Migrations run at server start on a single connection. No secrets, no installation tokens, no OAuth tokens. A crash mid-rebuild (`*_fk` / `*_nn` leftover, dest missing) is recovered on the next boot before `CREATE TABLE IF NOT EXISTS`.
 
 ### `matches`
 

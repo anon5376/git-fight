@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use git_fight_core::FighterStats;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite, SqlitePool};
 use std::str::FromStr;
 
@@ -47,6 +47,11 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
 }
 
 async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    migrate(&mut conn).await
+}
+
+async fn migrate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS matches (
             id TEXT PRIMARY KEY,
@@ -77,19 +82,20 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             challenge_comment_id INTEGER
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     let _ = sqlx::query("ALTER TABLE matches ADD COLUMN challenge_comment_id INTEGER")
-        .execute(pool)
+        .execute(&mut *conn)
         .await;
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS matches_one_open_per_pr
          ON matches(owner, repo, pr_number)
          WHERE status IN ('pending', 'in_progress') AND pr_number > 0 AND owner != ''",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    ensure_match_inputs(pool).await?;
+    ensure_match_inputs(conn).await?;
+    recover_rebuild_leftover(conn, "match_hunks_fk", "match_hunks").await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS match_hunks (
             match_id TEXT NOT NULL,
@@ -112,7 +118,7 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     for (col, ty) in [
         ("ours_hp", "INTEGER NOT NULL DEFAULT 100"),
@@ -123,9 +129,9 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         ("theirs_special", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let q = format!("ALTER TABLE match_hunks ADD COLUMN {col} {ty}");
-        let _ = sqlx::query(&q).execute(pool).await;
+        let _ = sqlx::query(&q).execute(&mut *conn).await;
     }
-    ensure_match_hunks_fk(pool).await?;
+    ensure_match_hunks_fk(conn).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -135,9 +141,9 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             expires_at TEXT NOT NULL
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    ensure_webhook_deliveries(pool).await?;
+    ensure_webhook_deliveries(conn).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS player_stats (
             owner TEXT NOT NULL,
@@ -150,23 +156,72 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             PRIMARY KEY (owner, repo, github_login)
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
-async fn ensure_match_inputs(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+async fn table_exists(
+    conn: &mut SqliteConnection,
+    name: &'static str,
+) -> Result<bool, sqlx::Error> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(name)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(n > 0)
+}
+
+/// Crash during CREATE/DROP/RENAME leaves `*_fk` / `*_nn` and a missing dest.
+async fn recover_rebuild_leftover(
+    conn: &mut SqliteConnection,
+    leftover: &'static str,
+    dest: &'static str,
+) -> Result<(), sqlx::Error> {
+    let (rename, drop) = match (leftover, dest) {
+        ("match_inputs_fk", "match_inputs") => (
+            "ALTER TABLE match_inputs_fk RENAME TO match_inputs",
+            "DROP TABLE match_inputs_fk",
+        ),
+        ("match_inputs_v2", "match_inputs") => (
+            "ALTER TABLE match_inputs_v2 RENAME TO match_inputs",
+            "DROP TABLE match_inputs_v2",
+        ),
+        ("match_hunks_fk", "match_hunks") => (
+            "ALTER TABLE match_hunks_fk RENAME TO match_hunks",
+            "DROP TABLE match_hunks_fk",
+        ),
+        ("webhook_deliveries_nn", "webhook_deliveries") => (
+            "ALTER TABLE webhook_deliveries_nn RENAME TO webhook_deliveries",
+            "DROP TABLE webhook_deliveries_nn",
+        ),
+        _ => unreachable!("known rebuild names"),
+    };
+    let has_left = table_exists(conn, leftover).await?;
+    let has_dest = table_exists(conn, dest).await?;
+    if has_left && !has_dest {
+        sqlx::query(rename).execute(&mut *conn).await?;
+    } else if has_left && has_dest {
+        sqlx::query(drop).execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_match_inputs(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    recover_rebuild_leftover(conn, "match_inputs_fk", "match_inputs").await?;
+    recover_rebuild_leftover(conn, "match_inputs_v2", "match_inputs").await?;
     let exists: Option<(String,)> = sqlx::query_as(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'match_inputs'",
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     if exists.is_none() {
-        sqlx::query(MATCH_INPUTS_DDL).execute(pool).await?;
+        sqlx::query(MATCH_INPUTS_DDL).execute(&mut *conn).await?;
         return Ok(());
     }
     let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('match_inputs')")
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
     if !cols.iter().any(|(n,)| n == "round_index") {
         sqlx::query(
@@ -180,21 +235,23 @@ async fn ensure_match_inputs(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
                 FOREIGN KEY (match_id) REFERENCES matches(id)
             )",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "INSERT INTO match_inputs_v2 (match_id, round_index, tick, ours, theirs)
              SELECT match_id, 0, tick, ours, theirs FROM match_inputs",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
-        sqlx::query("DROP TABLE match_inputs").execute(pool).await?;
+        sqlx::query("DROP TABLE match_inputs")
+            .execute(&mut *conn)
+            .await?;
         sqlx::query("ALTER TABLE match_inputs_v2 RENAME TO match_inputs")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         return Ok(());
     }
-    ensure_match_inputs_fk(pool).await
+    ensure_match_inputs_fk(conn).await
 }
 
 const WEBHOOK_DELIVERIES_DDL: &str = "CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -203,23 +260,26 @@ const WEBHOOK_DELIVERIES_DDL: &str = "CREATE TABLE IF NOT EXISTS webhook_deliver
             body_hash TEXT NOT NULL
         )";
 
-async fn webhook_body_hash_not_null(pool: &Pool<Sqlite>) -> Result<bool, sqlx::Error> {
+async fn webhook_body_hash_not_null(conn: &mut SqliteConnection) -> Result<bool, sqlx::Error> {
     let cols: Vec<(String, i64)> =
         sqlx::query_as("SELECT name, \"notnull\" FROM pragma_table_info('webhook_deliveries')")
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
     Ok(cols.iter().any(|(n, nn)| n == "body_hash" && *nn != 0))
 }
 
-async fn ensure_webhook_deliveries(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-    sqlx::query(WEBHOOK_DELIVERIES_DDL).execute(pool).await?;
+async fn ensure_webhook_deliveries(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    recover_rebuild_leftover(conn, "webhook_deliveries_nn", "webhook_deliveries").await?;
+    sqlx::query(WEBHOOK_DELIVERIES_DDL)
+        .execute(&mut *conn)
+        .await?;
     let _ = sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN body_hash TEXT")
-        .execute(pool)
+        .execute(&mut *conn)
         .await;
     sqlx::query("DELETE FROM webhook_deliveries WHERE body_hash IS NULL OR body_hash = ''")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
-    if !webhook_body_hash_not_null(pool).await? {
+    if !webhook_body_hash_not_null(conn).await? {
         sqlx::query(
             "CREATE TABLE webhook_deliveries_nn (
                 delivery_id TEXT PRIMARY KEY,
@@ -227,27 +287,27 @@ async fn ensure_webhook_deliveries(pool: &Pool<Sqlite>) -> Result<(), sqlx::Erro
                 body_hash TEXT NOT NULL
             )",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "INSERT INTO webhook_deliveries_nn (delivery_id, received_at, body_hash)
              SELECT delivery_id, received_at, body_hash FROM webhook_deliveries
              WHERE body_hash IS NOT NULL AND body_hash != ''",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query("DROP TABLE webhook_deliveries")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query("ALTER TABLE webhook_deliveries_nn RENAME TO webhook_deliveries")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
     }
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS webhook_deliveries_body_hash
          ON webhook_deliveries(body_hash)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -262,18 +322,18 @@ const MATCH_INPUTS_DDL: &str = "CREATE TABLE match_inputs (
                 FOREIGN KEY (match_id) REFERENCES matches(id)
             )";
 
-async fn fk_count(pool: &Pool<Sqlite>, table: &'static str) -> Result<i64, sqlx::Error> {
+async fn fk_count(conn: &mut SqliteConnection, table: &'static str) -> Result<i64, sqlx::Error> {
     let sql = match table {
         "match_hunks" => "SELECT COUNT(*) FROM pragma_foreign_key_list('match_hunks')",
         "match_inputs" => "SELECT COUNT(*) FROM pragma_foreign_key_list('match_inputs')",
         _ => unreachable!("known schema table"),
     };
-    let (n,): (i64,) = sqlx::query_as(sql).fetch_one(pool).await?;
+    let (n,): (i64,) = sqlx::query_as(sql).fetch_one(&mut *conn).await?;
     Ok(n)
 }
 
-async fn ensure_match_inputs_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-    if fk_count(pool, "match_inputs").await? > 0 {
+async fn ensure_match_inputs_fk(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    if fk_count(conn, "match_inputs").await? > 0 {
         return Ok(());
     }
     sqlx::query(
@@ -287,23 +347,26 @@ async fn ensure_match_inputs_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> 
                 FOREIGN KEY (match_id) REFERENCES matches(id)
             )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "INSERT INTO match_inputs_fk (match_id, round_index, tick, ours, theirs)
          SELECT match_id, round_index, tick, ours, theirs FROM match_inputs",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    sqlx::query("DROP TABLE match_inputs").execute(pool).await?;
+    sqlx::query("DROP TABLE match_inputs")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("ALTER TABLE match_inputs_fk RENAME TO match_inputs")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
-async fn ensure_match_hunks_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-    if fk_count(pool, "match_hunks").await? > 0 {
+async fn ensure_match_hunks_fk(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    recover_rebuild_leftover(conn, "match_hunks_fk", "match_hunks").await?;
+    if fk_count(conn, "match_hunks").await? > 0 {
         return Ok(());
     }
     sqlx::query(
@@ -328,7 +391,7 @@ async fn ensure_match_hunks_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "INSERT INTO match_hunks_fk (
@@ -341,11 +404,13 @@ async fn ensure_match_hunks_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
          FROM match_hunks",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    sqlx::query("DROP TABLE match_hunks").execute(pool).await?;
+    sqlx::query("DROP TABLE match_hunks")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("ALTER TABLE match_hunks_fk RENAME TO match_hunks")
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -1540,8 +1605,52 @@ mod tests {
             n, 0,
             "NULL body_hash cannot participate in replay protection"
         );
-        assert!(webhook_body_hash_not_null(&pool).await.unwrap());
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(webhook_body_hash_not_null(&mut conn).await.unwrap());
+        }
         assert!(record_delivery(&pool, "d1", "hash-a").await.unwrap());
         assert!(!record_delivery(&pool, "d2", "hash-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn leftover_rebuild_tables_are_recovered() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        sqlx::query("ALTER TABLE match_hunks RENAME TO match_hunks_fk")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE match_inputs RENAME TO match_inputs_fk")
+            .execute(&pool)
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(table_exists(&mut conn, "match_hunks").await.unwrap());
+            assert!(table_exists(&mut conn, "match_inputs").await.unwrap());
+            assert!(!table_exists(&mut conn, "match_hunks_fk").await.unwrap());
+            assert!(!table_exists(&mut conn, "match_inputs_fk").await.unwrap());
+        }
+        insert_match(&pool, "m1", 1, 3, "o", "t", 60).await.unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "m1",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        insert_input(&pool, "m1", 0, 0, 1, 2).await.unwrap();
     }
 }
