@@ -1029,11 +1029,13 @@ pub fn theirs_login_for_round<'a>(
     round: u32,
     fallback: Option<&'a str>,
 ) -> Option<&'a str> {
-    hunks
-        .iter()
-        .find(|h| h.round_index == i64::from(round))
-        .and_then(|h| h.theirs_login.as_deref())
-        .or(fallback)
+    // A CPU hunk (no GitHub login) must not inherit the match-level
+    // or previous-round author. Only a missing hunk (local demo)
+    // uses the fallback.
+    match hunks.iter().find(|h| h.round_index == i64::from(round)) {
+        Some(h) => h.theirs_login.as_deref(),
+        None => fallback,
+    }
 }
 
 pub fn theirs_name_for_round(hunks: &[HunkRow], round: u32, fallback: &str) -> String {
@@ -2826,6 +2828,44 @@ mod tests {
         assert_eq!(
             current_theirs_from_hunks(&[hunk(0, None, "bob")]).as_deref(),
             Some("bob")
+        );
+    }
+
+    #[test]
+    fn theirs_login_for_round_does_not_inherit_on_a_cpu_hunk() {
+        let hunk = |round: i64, login: Option<&str>| HunkRow {
+            round_index: round,
+            path: "a.rs".into(),
+            hunk_index: 0,
+            winner: None,
+            theirs_name: login.map(str::to_string).or_else(|| Some("dave".into())),
+            theirs_login: login.map(str::to_string),
+            ours_hp: 100,
+            ours_armor: false,
+            ours_special: false,
+            theirs_hp: 100,
+            theirs_armor: false,
+            theirs_special: false,
+            is_ko: false,
+        };
+        assert_eq!(
+            theirs_login_for_round(&[hunk(0, Some("bob")), hunk(1, None)], 1, Some("bob")),
+            None,
+            "a later-round CPU hunk must not inherit bob"
+        );
+        assert_eq!(
+            theirs_login_for_round(&[hunk(0, Some("bob"))], 0, Some("fallback")),
+            Some("bob")
+        );
+        assert_eq!(
+            theirs_login_for_round(&[], 0, Some("bob")),
+            Some("bob"),
+            "local demo with no hunks still uses the match-level login"
+        );
+        assert_eq!(
+            theirs_login_for_round(&[hunk(0, Some("bob"))], 1, Some("bob")),
+            Some("bob"),
+            "a missing hunk row still uses the fallback"
         );
     }
 

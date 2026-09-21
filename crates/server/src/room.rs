@@ -1990,6 +1990,107 @@ mod tests {
     }
 
     #[test]
+    fn later_round_cpu_does_not_inherit_previous_login() {
+        let row = MatchRow {
+            id: "m".into(),
+            seed: "1".into(),
+            status: "in_progress".into(),
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_token: None,
+            theirs_token: None,
+            ours_login: Some("alice".into()),
+            theirs_login: Some("bob".into()),
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+            installation_id: None,
+            input_delay_ticks: 3,
+            created_at: String::new(),
+            expires_at: String::new(),
+            result_branch: None,
+            final_hash: None,
+            abort_reason: None,
+            challenge_comment_id: None,
+            pending_forfeit: None,
+            pending_forfeit_round: None,
+        };
+        let hunks = vec![
+            db::HunkRow {
+                round_index: 0,
+                path: "a.rs".into(),
+                hunk_index: 0,
+                winner: Some("ours".into()),
+                theirs_name: Some("bob".into()),
+                theirs_login: Some("bob".into()),
+                ours_hp: 100,
+                ours_armor: false,
+                ours_special: false,
+                theirs_hp: 100,
+                theirs_armor: false,
+                theirs_special: false,
+                is_ko: false,
+            },
+            db::HunkRow {
+                round_index: 1,
+                path: "b.rs".into(),
+                hunk_index: 0,
+                winner: None,
+                theirs_name: Some("dave".into()),
+                theirs_login: None,
+                ours_hp: 100,
+                ours_armor: false,
+                ours_special: false,
+                theirs_hp: 100,
+                theirs_armor: false,
+                theirs_special: false,
+                is_ko: false,
+            },
+        ];
+        let mut ours = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: None,
+            forfeit_due: false,
+        };
+        let mut theirs = Slot {
+            kind_cpu: false,
+            seen: true,
+            disconnected_at: Some(Instant::now()),
+            forfeit_due: false,
+        };
+        let mut theirs_name = String::from("bob");
+        let mut mirror = false;
+        apply_round_identity(
+            &row,
+            &hunks,
+            1,
+            true,
+            &mut ours,
+            &mut theirs,
+            &mut theirs_name,
+            &mut mirror,
+            false,
+        );
+        assert!(theirs.kind_cpu, "a later-round CPU hunk is the computer");
+        assert!(theirs.seen);
+        assert!(theirs.disconnected_at.is_none());
+        apply_presence(&mut theirs, false);
+        assert!(
+            theirs.disconnected_at.is_none(),
+            "CPU must not inherit bob's 30s clock"
+        );
+        assert_eq!(
+            db::theirs_login_for_round(&hunks, 1, row.theirs_login.as_deref()),
+            None
+        );
+    }
+
+    #[test]
     fn finish_retries_when_winner_write_fails_and_nothing_is_stored() {
         assert_eq!(
             finish_after_write(true, MatchOpen::Open, StoredRound::Empty),
