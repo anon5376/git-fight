@@ -22,6 +22,12 @@ pub struct GitHub {
     poll_wait: Duration,
 }
 
+/// A 2xx comment POST without a positive id is not success — callers
+/// must not treat `0` as “retry POST”.
+pub(crate) fn posted_comment_id(id: Option<u64>) -> Result<u64, String> {
+    id.filter(|n| *n > 0).ok_or_else(|| "comment id".into())
+}
+
 /// Live GitHub often leaves `mergeable` null for seconds while it computes.
 const MERGEABLE_POLL_WAIT: Duration = Duration::from_secs(1);
 const MERGEABLE_POLL_CAP: Duration = Duration::from_secs(4);
@@ -293,10 +299,7 @@ impl GitHub {
         struct Id {
             id: u64,
         }
-        Ok(json_capped::<Id>(res, MAX_API_JSON)
-            .await
-            .map(|c| c.id)
-            .unwrap_or(0))
+        posted_comment_id(json_capped::<Id>(res, MAX_API_JSON).await.map(|c| c.id))
     }
 
     pub async fn edit_comment(
@@ -873,6 +876,13 @@ mod tests {
             "a failed PATCH must not POST a second outcome thread"
         );
         assert_eq!(issue_comment_followup(false, Err(())), "post");
+    }
+
+    #[test]
+    fn truncated_comment_json_is_not_a_zero_id() {
+        assert_eq!(posted_comment_id(Some(9)).unwrap(), 9);
+        assert!(posted_comment_id(Some(0)).is_err());
+        assert!(posted_comment_id(None).is_err());
     }
 
     fn issue_comment_followup(existing: bool, edit: Result<(), ()>) -> &'static str {

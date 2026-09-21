@@ -111,7 +111,8 @@ pub(crate) async fn persist_challenge_comment(
     posted: u64,
 ) {
     if posted == 0 {
-        comments.unmark(match_id);
+        // POST may already have created a thread whose id we could not
+        // parse. Hold inflight so the expirer does not POST a second link.
         return;
     }
     match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
@@ -922,6 +923,20 @@ mod tests {
 
     fn first_or_retry(first: Result<bool, ()>, retry: Result<bool, ()>) -> Result<bool, ()> {
         first.or(retry)
+    }
+
+    #[test]
+    fn missing_posted_id_holds_inflight() {
+        assert_eq!(posted_id_followup(0), "hold");
+        assert_eq!(posted_id_followup(7), "set");
+    }
+
+    fn posted_id_followup(posted: u64) -> &'static str {
+        if posted == 0 {
+            "hold"
+        } else {
+            "set"
+        }
     }
 
     #[test]
