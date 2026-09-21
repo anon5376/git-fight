@@ -156,6 +156,77 @@ async fn auto_challenge_skips_unsafe_ref() {
     assert!(!gh.auto_challenge_enabled(1, "acme", "box", "../main").await);
 }
 
+async fn auto_challenge_with(body: serde_json::Value) -> bool {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/contents/.github/git-fight.yml"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&mock)
+        .await;
+    client(&mock)
+        .auto_challenge_enabled(1, "acme", "box", "main")
+        .await
+}
+
+#[tokio::test]
+async fn auto_challenge_requires_small_base64_file() {
+    // `auto_challenge: true\n` as GitHub contents (base64, optional wrap newline).
+    let b64 = "YXV0b19jaGFsbGVuZ2U6IHRydWUK";
+    assert!(
+        auto_challenge_with(json!({
+            "type": "file",
+            "encoding": "base64",
+            "size": 21,
+            "content": format!("{b64}\n"),
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "type": "symlink",
+            "encoding": "base64",
+            "size": 21,
+            "content": b64,
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "type": "file",
+            "encoding": "utf-8",
+            "size": 21,
+            "content": "auto_challenge: true\n",
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "encoding": "base64",
+            "size": 21,
+            "content": b64,
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "type": "file",
+            "encoding": "base64",
+            "size": 1_000_000,
+            "content": b64,
+        }))
+        .await
+    );
+    assert!(!auto_challenge_with(json!([{ "type": "file" }])).await);
+}
+
 #[tokio::test]
 async fn login_for_email_rejects_injection() {
     let gh = GitHub::new(

@@ -185,10 +185,23 @@ pub async fn auth_callback(
 }
 
 fn sanitize_return(r: Option<&str>) -> String {
-    match r {
-        Some(s) if s.starts_with('/') && !s.starts_with("//") && !s.contains('\n') => s.to_string(),
-        _ => "/".into(),
+    let Some(s) = r else {
+        return "/".into();
+    };
+    if !s.starts_with('/')
+        || s.starts_with("//")
+        || s.contains("..")
+        || s.len() > 256
+        || s.bytes().any(|b| {
+            !matches!(
+                b,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.'
+            )
+        })
+    {
+        return "/".into();
     }
+    s.to_string()
 }
 
 fn cookie_attrs(public_url: &str, max_age: i64) -> String {
@@ -240,5 +253,23 @@ mod tests {
         assert!(https.contains("SameSite=Lax"), "{https}");
         let http = cookie_attrs("http://127.0.0.1:8080", 60);
         assert!(!http.contains("Secure"), "{http}");
+    }
+
+    #[test]
+    fn sanitize_return_stays_on_this_host() {
+        assert_eq!(sanitize_return(Some("/match/abc")), "/match/abc");
+        assert_eq!(
+            sanitize_return(Some("/acme/box/leaderboard")),
+            "/acme/box/leaderboard"
+        );
+        assert_eq!(sanitize_return(None), "/");
+        assert_eq!(sanitize_return(Some("https://evil.example")), "/");
+        assert_eq!(sanitize_return(Some("//evil.example")), "/");
+        assert_eq!(sanitize_return(Some("/\\evil.example")), "/");
+        assert_eq!(sanitize_return(Some("/; Domain=evil.example")), "/");
+        assert_eq!(sanitize_return(Some("/foo\r\nLocation: https://evil")), "/");
+        assert_eq!(sanitize_return(Some("/foo\nbar")), "/");
+        assert_eq!(sanitize_return(Some("/match/../auth")), "/");
+        assert_eq!(sanitize_return(Some(&format!("/{}", "a".repeat(300)))), "/");
     }
 }

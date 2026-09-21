@@ -710,8 +710,10 @@ async fn github_mocks(head: &str, base: &str, opts: MockOpts) -> MockServer {
         Mock::given(method("GET"))
             .and(path("/repos/acme/box/contents/.github/git-fight.yml"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "encoding": "utf-8",
-                "content": "auto_challenge: true\n"
+                "type": "file",
+                "encoding": "base64",
+                "size": 21,
+                "content": "YXV0b19jaGFsbGVuZ2U6IHRydWUK"
             })))
             .mount(&mock)
             .await;

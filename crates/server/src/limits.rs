@@ -19,6 +19,8 @@ pub const MAX_MATCHES_PER_PR_HOUR: i64 = 5;
 /// HTTP (mergeable poll, install token, comments) must not take a slot.
 /// A slot is held at most GIT_JOB_TIMEOUT.
 pub const MAX_CONCURRENT_GIT: usize = 2;
+/// `.github/git-fight.yml` is one key. Bigger is not a config file.
+pub const MAX_FIGHT_YML_BYTES: usize = 4096;
 
 pub fn git_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -40,5 +42,6 @@ mod tests {
         assert_eq!(MAX_CONCURRENT_GIT, 2);
         assert_eq!(MAX_MATCHES_PER_PR_HOUR, 5);
         assert_eq!(MAX_MATCHES_PER_INSTALL_HOUR, 20);
+        assert_eq!(MAX_FIGHT_YML_BYTES, 4096);
     }
 }

@@ -1,5 +1,6 @@
 //! GitHub App HTTP + in-memory installation tokens.
 
+use crate::limits::MAX_FIGHT_YML_BYTES;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,6 +25,8 @@ pub struct GitHub {
 const MERGEABLE_POLL_WAIT: Duration = Duration::from_secs(1);
 const MERGEABLE_POLL_CAP: Duration = Duration::from_secs(4);
 const MERGEABLE_POLL_TRIES: u32 = 8;
+/// Contents JSON for a 4 KiB yaml plus GitHub metadata. Bigger is not a config.
+const MAX_CONTENTS_JSON: usize = 16 * 1024;
 
 impl std::fmt::Debug for GitHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -325,26 +328,55 @@ impl GitHub {
         if !resp.status().is_success() {
             return false;
         }
-        #[derive(Deserialize)]
-        struct File {
-            content: Option<String>,
-            encoding: Option<String>,
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_CONTENTS_JSON as u64)
+        {
+            return false;
         }
-        let Ok(file) = resp.json::<File>().await else {
+        let Ok(bytes) = resp.bytes().await else {
             return false;
         };
+        if bytes.len() > MAX_CONTENTS_JSON {
+            return false;
+        }
+        #[derive(Deserialize)]
+        struct File {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            content: Option<String>,
+            encoding: Option<String>,
+            size: Option<u64>,
+        }
+        let Ok(file) = serde_json::from_slice::<File>(&bytes) else {
+            return false;
+        };
+        if file.kind.as_deref() != Some("file") {
+            return false;
+        }
+        if file.encoding.as_deref() != Some("base64") {
+            return false;
+        }
+        let size = file.size.unwrap_or(u64::MAX);
+        if size == 0 || size > MAX_FIGHT_YML_BYTES as u64 {
+            return false;
+        }
         let Some(content) = file.content else {
             return false;
         };
-        let decoded = if file.encoding.as_deref() == Some("base64") {
-            let clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
-            String::from_utf8(
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, clean)
-                    .unwrap_or_default(),
-            )
-            .unwrap_or_default()
-        } else {
-            content
+        if content.len() > MAX_FIGHT_YML_BYTES * 2 {
+            return false;
+        }
+        let clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+        let Ok(raw) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, clean)
+        else {
+            return false;
+        };
+        if raw.len() > MAX_FIGHT_YML_BYTES {
+            return false;
+        }
+        let Ok(decoded) = String::from_utf8(raw) else {
+            return false;
         };
         decoded.lines().any(|l| l.trim() == "auto_challenge: true")
     }
