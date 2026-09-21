@@ -841,6 +841,7 @@ fn apply_input_log(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_replay_round(
     pool: &SqlitePool,
     id: &str,
@@ -860,6 +861,7 @@ async fn try_replay_round(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_catch_up(
     tx: &mpsc::Sender<String>,
     match_id: &str,
