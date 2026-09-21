@@ -221,85 +221,109 @@ async fn run_room(
                     RoomEvent::Join { conn_id, login, token, tx } => {
                         if done {
                             send_closed(&tx, &pool, &id).await;
-                        } else if match_is_open(&pool, &id).await == MatchOpen::Closed {
-                            send_closed(&tx, &pool, &id).await;
-                            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
-                            done = true;
-                        } else if scored_all {
-                            // Do not insert: a fighter Join must not start
-                            // the disconnect clock while finish is retrying.
-                            done = try_finish_scored_all(
-                                &pool,
-                                &id,
-                                seed,
-                                &hunks,
-                                total_rounds,
-                                settings.result.as_ref(),
-                            )
-                            .await;
-                            if done {
-                                send_closed(&tx, &pool, &id).await;
-                            } else {
-                                // Drop `tx` after send so the WS write task
-                                // closes. Canvas reconnects only on close.
-                                try_send_or_spawn(
-                                    &tx,
-                                    encode(&ServerMsg::Error {
-                                        message: "preparing".into(),
-                                    }),
-                                );
-                            }
                         } else {
-                            let conn = Conn { login, token, tx: tx.clone() };
-                            let role = conn_role(&conn, &row, &hunks, round, github);
-                            let confirmed = if next_tick == 0 { -1 } else { next_tick as i32 - 1 };
-                            conns.insert(conn_id, conn);
-                            refresh_slots(
-                                &conns,
-                                &row,
-                                &hunks,
-                                round,
-                                github,
-                                &mut ours,
-                                &mut theirs,
-                            );
-                            if ours.seen && theirs.seen && started_at.is_none() {
-                                match db::start_open_match(&pool, &id).await {
-                                    Ok(true) => started_at = Some(Instant::now()),
-                                    Ok(false) => {
-                                        send_closed(&tx, &pool, &id).await;
-                                        expire_now(
-                                            &pool,
-                                            &id,
-                                            &conns,
-                                            settings.result.as_ref(),
-                                        )
-                                        .await;
-                                        done = true;
-                                    }
-                                    Err(_) => {}
+                            match join_admit(match_is_open(&pool, &id).await, scored_all) {
+                                JoinAdmit::Closed => {
+                                    send_closed(&tx, &pool, &id).await;
+                                    expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+                                    done = true;
                                 }
-                            }
-                            if !done && replay_ok {
-                                send_catch_up(
-                                    &tx,
-                                    &id,
-                                    seed,
-                                    delay,
-                                    role.as_str(),
-                                    conns
-                                        .get(&conn_id)
-                                        .and_then(|c| c.login.as_deref())
-                                        .unwrap_or(""),
-                                    &ours_name,
-                                    &theirs_name,
-                                    round,
-                                    total_rounds,
-                                    confirmed,
-                                    db::stats_for_round(&hunks, round),
-                                    &hunks,
-                                    &log,
-                                );
+                                JoinAdmit::Unknown => {
+                                    // Busy status read: do not Hello. Canvas
+                                    // reconnects on preparing + close.
+                                    try_send_or_spawn(
+                                        &tx,
+                                        encode(&ServerMsg::Error {
+                                            message: "preparing".into(),
+                                        }),
+                                    );
+                                }
+                                JoinAdmit::ScoredAll => {
+                                    // Do not insert: a fighter Join must not start
+                                    // the disconnect clock while finish is retrying.
+                                    done = try_finish_scored_all(
+                                        &pool,
+                                        &id,
+                                        seed,
+                                        &hunks,
+                                        total_rounds,
+                                        settings.result.as_ref(),
+                                    )
+                                    .await;
+                                    if done {
+                                        send_closed(&tx, &pool, &id).await;
+                                    } else {
+                                        // Drop `tx` after send so the WS write task
+                                        // closes. Canvas reconnects only on close.
+                                        try_send_or_spawn(
+                                            &tx,
+                                            encode(&ServerMsg::Error {
+                                                message: "preparing".into(),
+                                            }),
+                                        );
+                                    }
+                                }
+                                JoinAdmit::Enter => {
+                                    let conn = Conn {
+                                        login,
+                                        token,
+                                        tx: tx.clone(),
+                                    };
+                                    let role = conn_role(&conn, &row, &hunks, round, github);
+                                    let confirmed = if next_tick == 0 {
+                                        -1
+                                    } else {
+                                        next_tick as i32 - 1
+                                    };
+                                    conns.insert(conn_id, conn);
+                                    refresh_slots(
+                                        &conns,
+                                        &row,
+                                        &hunks,
+                                        round,
+                                        github,
+                                        &mut ours,
+                                        &mut theirs,
+                                    );
+                                    if ours.seen && theirs.seen && started_at.is_none() {
+                                        match db::start_open_match(&pool, &id).await {
+                                            Ok(true) => started_at = Some(Instant::now()),
+                                            Ok(false) => {
+                                                send_closed(&tx, &pool, &id).await;
+                                                expire_now(
+                                                    &pool,
+                                                    &id,
+                                                    &conns,
+                                                    settings.result.as_ref(),
+                                                )
+                                                .await;
+                                                done = true;
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    }
+                                    if !done && replay_ok {
+                                        send_catch_up(
+                                            &tx,
+                                            &id,
+                                            seed,
+                                            delay,
+                                            role.as_str(),
+                                            conns
+                                                .get(&conn_id)
+                                                .and_then(|c| c.login.as_deref())
+                                                .unwrap_or(""),
+                                            &ours_name,
+                                            &theirs_name,
+                                            round,
+                                            total_rounds,
+                                            confirmed,
+                                            db::stats_for_round(&hunks, round),
+                                            &hunks,
+                                            &log,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -686,6 +710,24 @@ enum MatchOpen {
     Open,
     Closed,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinAdmit {
+    Closed,
+    Unknown,
+    ScoredAll,
+    Enter,
+}
+
+/// A busy open-status read is not an open fight: do not Hello.
+fn join_admit(open: MatchOpen, scored_all: bool) -> JoinAdmit {
+    match open {
+        MatchOpen::Closed => JoinAdmit::Closed,
+        MatchOpen::Unknown => JoinAdmit::Unknown,
+        MatchOpen::Open if scored_all => JoinAdmit::ScoredAll,
+        MatchOpen::Open => JoinAdmit::Enter,
+    }
 }
 
 async fn match_is_open(pool: &SqlitePool, id: &str) -> MatchOpen {
@@ -1743,6 +1785,14 @@ mod tests {
             AfterNonFinal::Retry,
             "busy open-status must not broadcast End before the next Hello"
         );
+        assert_eq!(
+            join_admit(MatchOpen::Unknown, false),
+            JoinAdmit::Unknown,
+            "busy status must not insert or Hello"
+        );
+        assert_eq!(join_admit(MatchOpen::Open, false), JoinAdmit::Enter);
+        assert_eq!(join_admit(MatchOpen::Open, true), JoinAdmit::ScoredAll);
+        assert_eq!(join_admit(MatchOpen::Closed, false), JoinAdmit::Closed);
     }
 
     #[tokio::test]

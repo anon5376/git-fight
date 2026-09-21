@@ -1209,6 +1209,15 @@ pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
         .unwrap_or_else(|| (String::new(), 0))
 }
 
+/// First unscored hunk's blamed login. Same rule as `current_theirs_login`
+/// without a round-trip — used when that read fails.
+pub fn current_theirs_from_hunks(hunks: &[HunkRow]) -> Option<String> {
+    hunks
+        .iter()
+        .find(|h| h.winner.is_none())
+        .and_then(|h| h.theirs_login.clone())
+}
+
 /// Theirs login for the first unscored hunk. `None` if every hunk is scored
 /// or the match has no hunks yet (local demo).
 pub async fn current_theirs_login(
@@ -2413,6 +2422,40 @@ mod tests {
             current_theirs_login(&pool, "m-cur").await.unwrap(),
             None,
             "a fully scored match has no current theirs"
+        );
+        let scored = list_hunks(&pool, "m-cur").await.unwrap();
+        assert_eq!(
+            current_theirs_from_hunks(&scored),
+            None,
+            "from_hunks matches the scalar when every hunk is scored"
+        );
+    }
+
+    #[test]
+    fn current_theirs_from_hunks_is_the_first_unscored_login() {
+        let hunk = |round: i64, winner: Option<&str>, login: &str| HunkRow {
+            round_index: round,
+            path: "a.rs".into(),
+            hunk_index: 0,
+            winner: winner.map(str::to_string),
+            theirs_name: Some(login.into()),
+            theirs_login: Some(login.into()),
+            ours_hp: 100,
+            ours_armor: false,
+            ours_special: false,
+            theirs_hp: 100,
+            theirs_armor: false,
+            theirs_special: false,
+            is_ko: false,
+        };
+        assert_eq!(
+            current_theirs_from_hunks(&[hunk(0, Some("ours"), "bob"), hunk(1, None, "carol"),])
+                .as_deref(),
+            Some("carol")
+        );
+        assert_eq!(
+            current_theirs_from_hunks(&[hunk(0, None, "bob")]).as_deref(),
+            Some("bob")
         );
     }
 

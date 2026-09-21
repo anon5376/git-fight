@@ -585,10 +585,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
         return;
     }
     let github = db::github_identity(&row, &hunks);
-    let mut current_theirs = db::current_theirs_login(&state.pool, &row.id)
-        .await
-        .ok()
-        .flatten();
+    let mut current_theirs = match db::current_theirs_login(&state.pool, &row.id).await {
+        Ok(v) => v,
+        Err(_) => db::current_theirs_from_hunks(&hunks),
+    };
     let enqueue_join = can_enqueue_input(
         github,
         row.ours_login.as_deref(),

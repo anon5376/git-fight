@@ -10,6 +10,7 @@ use axum::http::StatusCode as HttpStatus;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 /// GitHub's `X-GitHub-Delivery` is a UUID. Reject junk so the PK cannot be a path.
 fn is_delivery_id(s: &str) -> bool {
@@ -184,12 +185,47 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
     if head.eq_ignore_ascii_case(&row.pr_head_sha) && base.eq_ignore_ascii_case(&row.pr_base_sha) {
         return;
     }
-    if !db::abort_open_match(&state.pool, &row.id, "outdated")
-        .await
-        .unwrap_or(false)
-    {
-        return;
+    match abort_open_retry(&state.pool, &row.id, "outdated").await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            schedule_outdated_abort(state.clone(), row.clone());
+            return;
+        }
     }
+    close_and_comment_outdated(state, row).await;
+}
+
+/// Retry once. `Ok(false)` means the row is already closed. `Err` is
+/// still unknown — do not treat that as a no-op.
+async fn abort_open_retry(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    match db::abort_open_match(pool, id, reason).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::abort_open_match(pool, id, reason).await,
+    }
+}
+
+fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
+    tokio::spawn(async move {
+        for delay_ms in [25_u64, 50, 100, 200] {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            match db::abort_open_match(&state.pool, &row.id, "outdated").await {
+                Ok(true) => {
+                    close_and_comment_outdated(&state, &row).await;
+                    return;
+                }
+                Ok(false) => return,
+                Err(_) => {}
+            }
+        }
+    });
+}
+
+async fn close_and_comment_outdated(state: &crate::app::AppState, row: &db::MatchRow) {
     state.close_room(&row.id).await;
     let Some(inst) = row.installation_id.filter(|i| *i > 0).map(|i| i as u64) else {
         return;
@@ -328,6 +364,21 @@ struct Sha {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abort_retry_does_not_treat_sql_error_as_already_closed() {
+        assert!(matches!(first_or_retry(Err(()), Ok(true)), Ok(true)));
+        assert!(matches!(first_or_retry(Err(()), Ok(false)), Ok(false)));
+        assert!(
+            first_or_retry(Err(()), Err(())).is_err(),
+            "two busy writes must retry later, not skip close_room"
+        );
+        assert!(matches!(first_or_retry(Ok(true), Err(())), Ok(true)));
+    }
+
+    fn first_or_retry(first: Result<bool, ()>, retry: Result<bool, ()>) -> Result<bool, ()> {
+        first.or(retry)
+    }
 
     #[test]
     fn webhook_timestamps_must_be_fresh() {
