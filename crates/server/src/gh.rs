@@ -298,15 +298,18 @@ impl GitHub {
         if !is_safe_github_name(owner) || !is_safe_github_name(repo) {
             return false;
         }
-        let res = self
-            .authed(
-                installation_id,
-                reqwest::Method::GET,
-                &format!(
-                    "/repos/{owner}/{repo}/contents/.github/git-fight.yml?ref={}",
-                    urlencoding(r#ref)
-                ),
+        let path = if r#ref.is_empty() {
+            format!("/repos/{owner}/{repo}/contents/.github/git-fight.yml")
+        } else if !is_safe_git_ref(r#ref) {
+            return false;
+        } else {
+            format!(
+                "/repos/{owner}/{repo}/contents/.github/git-fight.yml?ref={}",
+                urlencoding(r#ref)
             )
+        };
+        let res = self
+            .authed(installation_id, reqwest::Method::GET, &path)
             .await;
         let Ok(builder) = res else {
             return false;
@@ -348,7 +351,10 @@ impl GitHub {
         repo: &str,
         sha: &str,
     ) -> Option<String> {
-        if sha.is_empty() {
+        if !is_safe_github_name(owner)
+            || !is_safe_github_name(repo)
+            || !crate::gitutil::is_safe_rev(sha)
+        {
             return None;
         }
         let res = self
@@ -386,7 +392,7 @@ impl GitHub {
         repo: &str,
         email: &str,
     ) -> Option<String> {
-        if email.is_empty() {
+        if email.is_empty() || !is_safe_github_name(owner) || !is_safe_github_name(repo) {
             return None;
         }
         let res = self
@@ -502,6 +508,15 @@ pub fn is_safe_github_name(s: &str) -> bool {
         && !s.contains("..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn is_safe_git_ref(s: &str) -> bool {
+    let n = s.len();
+    (1..=255).contains(&n)
+        && !s.starts_with('-')
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
 }
 
 fn urlencoding(s: &str) -> String {

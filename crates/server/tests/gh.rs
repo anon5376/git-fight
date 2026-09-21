@@ -109,3 +109,49 @@ fn github_names_reject_host_tricks() {
     assert!(!is_safe_github_name("acme/../x"));
     assert!(!is_safe_github_name("https://github.com"));
 }
+
+#[tokio::test]
+async fn login_for_commit_rejects_option_shas() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(gh
+        .login_for_commit(1, "acme", "box", "HEAD")
+        .await
+        .is_none());
+    assert!(gh
+        .login_for_commit(1, "acme", "box", "--upload-pack=true")
+        .await
+        .is_none());
+    assert!(gh
+        .login_for_commit(
+            1,
+            "acme/other",
+            "box",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn auto_challenge_skips_unsafe_ref() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(
+        !gh.auto_challenge_enabled(1, "acme", "box", "--upload-pack=true")
+            .await
+    );
+    assert!(!gh.auto_challenge_enabled(1, "acme", "box", "../main").await);
+}

@@ -114,9 +114,21 @@ fn apply_auth(cmd: &mut Command, url: &str, bearer: Option<&str>) {
     if url.starts_with("file://") || Path::new(url).is_absolute() {
         cmd.arg("-c").arg("protocol.file.allow=always");
     }
+    apply_git_bearer(cmd, bearer);
+}
+
+/// GitHub App git HTTPS uses Basic `x-access-token:<installation token>`, not REST Bearer.
+fn github_git_auth_header(token: &str) -> String {
+    let basic = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("x-access-token:{token}"),
+    );
+    format!("http.extraHeader=Authorization: Basic {basic}")
+}
+
+fn apply_git_bearer(cmd: &mut Command, bearer: Option<&str>) {
     if let Some(token) = bearer {
-        cmd.arg("-c")
-            .arg(format!("http.extraHeader=Authorization: bearer {token}"));
+        cmd.arg("-c").arg(github_git_auth_header(token));
     }
 }
 
@@ -167,10 +179,7 @@ fn git_dir(dir: &Path, bearer: Option<&str>) -> Command {
     c.arg("--git-dir").arg(dir);
     // Partial clones lazy-fetch blobs over the origin URL (file:// tests, GitHub HTTPS).
     c.arg("-c").arg("protocol.file.allow=always");
-    if let Some(token) = bearer {
-        c.arg("-c")
-            .arg(format!("http.extraHeader=Authorization: bearer {token}"));
-    }
+    apply_git_bearer(&mut c, bearer);
     c
 }
 
@@ -466,7 +475,7 @@ async fn fallback_author(
     ("theirs".into(), String::new(), base_sha.into())
 }
 
-fn is_safe_rev(rev: &str) -> bool {
+pub fn is_safe_rev(rev: &str) -> bool {
     let n = rev.len();
     (8..=64).contains(&n) && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -883,12 +892,27 @@ Auto-merging lib.rs\n";
 
     #[test]
     fn redacts_authorization_from_git_text() {
-        let raw = "fatal: could not read\nAuthorization: bearer ghs_live_token\nx-access-token: abc\nerror: failed\n";
+        let raw = "fatal: could not read\nAuthorization: bearer ghs_live_token\nAuthorization: Basic dGVzdA==\nx-access-token: abc\nerror: failed\n";
         let out = redact_git_text(raw);
         assert!(!out.to_ascii_lowercase().contains("authorization"));
         assert!(!out.contains("ghs_live_token"));
+        assert!(!out.contains("dGVzdA=="));
         assert!(!out.contains("x-access-token"));
         assert!(out.contains("error: failed"));
+    }
+
+    #[test]
+    fn github_git_auth_uses_basic_x_access_token() {
+        let header = github_git_auth_header("ghs_live_token_secret");
+        assert!(
+            header.starts_with("http.extraHeader=Authorization: Basic "),
+            "{header}"
+        );
+        assert!(!header.to_ascii_lowercase().contains("bearer"));
+        assert!(!header.contains("ghs_live_token_secret"));
+        let b64 = header.rsplit(' ').next().expect("b64");
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+        assert_eq!(raw, b"x-access-token:ghs_live_token_secret");
     }
 
     #[tokio::test]
