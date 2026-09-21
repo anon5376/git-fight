@@ -751,7 +751,7 @@ fn after_non_final(open: MatchOpen) -> AfterNonFinal {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum StoredRound {
     Winner { tag: String, ko: bool },
     Empty,
