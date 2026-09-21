@@ -98,7 +98,7 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     if let Ok(Some(row)) =
         db::open_match_for_pr(&state.pool, &repo.owner.login, &repo.name, pr.number).await
     {
-        notice_if_outdated(state, &hook, &row, pr).await;
+        notice_if_outdated(state, &row, pr).await;
         return HttpStatus::OK;
     }
     if !matches!(action, "opened" | "reopened" | "synchronize") {
@@ -119,12 +119,7 @@ async fn handle_pull(state: &crate::app::AppState, hook: Hook) -> HttpStatus {
     spawn_challenge(state, &hook, pr.number).await
 }
 
-async fn notice_if_outdated(
-    state: &crate::app::AppState,
-    hook: &Hook,
-    row: &db::MatchRow,
-    pr: &Pr,
-) {
+async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr: &Pr) {
     if row.abort_reason.as_deref() == Some("outdated") {
         return;
     }
@@ -153,7 +148,7 @@ async fn notice_if_outdated(
     {
         return;
     }
-    let Some(inst) = hook.installation.as_ref().map(|i| i.id) else {
+    let Some(inst) = row.installation_id.filter(|i| *i > 0).map(|i| i as u64) else {
         state.close_room(&row.id).await;
         return;
     };
@@ -161,10 +156,10 @@ async fn notice_if_outdated(
         state.close_room(&row.id).await;
         return;
     };
-    let Some(repo) = &hook.repository else {
+    if row.pr_number <= 0 {
         state.close_room(&row.id).await;
         return;
-    };
+    }
     let public = state.auth.public_url.trim_end_matches('/');
     let body = format!(
         "git fight: this fight used outdated code (PR head or base moved). Nothing will be pushed. Comment `/fight` for a rematch.\nopen match: {public}/match/{}",
@@ -173,9 +168,9 @@ async fn notice_if_outdated(
     let _ = gh
         .issue_comment(
             inst,
-            &repo.owner.login,
-            &repo.name,
-            pr.number,
+            &row.owner,
+            &row.repo,
+            row.pr_number as u64,
             row.challenge_comment_id,
             &body,
         )

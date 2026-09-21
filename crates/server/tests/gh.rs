@@ -402,3 +402,31 @@ async fn login_for_commit_drops_unsafe_login() {
     let gh = client(&mock);
     assert!(gh.login_for_commit(1, "acme", "box", sha).await.is_none());
 }
+
+#[tokio::test]
+async fn github_http_does_not_follow_redirects() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("Location", format!("{}/stolen", mock.uri())),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/stolen"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "size": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert!(gh.get_repo(1, "acme", "box").await.is_err());
+}

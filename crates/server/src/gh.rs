@@ -56,6 +56,7 @@ impl GitHub {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("http client"),
             api_base: api_base.trim_end_matches('/').to_string(),
@@ -73,6 +74,11 @@ impl GitHub {
     pub fn with_poll_wait(mut self, poll_wait: Duration) -> Self {
         self.poll_wait = poll_wait;
         self
+    }
+
+    /// Live GitHub App HTTP is HTTPS (or loopback HTTP for tests). Never cleartext.
+    pub fn endpoints_are_safe(&self) -> bool {
+        is_safe_github_endpoint(&self.api_base) && is_safe_github_endpoint(&self.oauth_base)
     }
 
     fn encoding_key(&self) -> Result<EncodingKey, String> {
@@ -589,6 +595,31 @@ fn require_names(owner: &str, repo: &str) -> Result<(), String> {
     }
 }
 
+/// API/OAuth base URL. HTTPS anywhere, or HTTP only to loopback (wiremock).
+pub fn is_safe_github_endpoint(url: &str) -> bool {
+    let url = url.trim();
+    if !(8..=200).contains(&url.len()) {
+        return false;
+    }
+    if url.contains(|c: char| c.is_ascii_whitespace() || matches!(c, '\\' | '?' | '#' | '@')) {
+        return false;
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        return !host.is_empty() && host != "0.0.0.0" && host != "*" && !host.starts_with('-');
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let hostport = rest.split('/').next().unwrap_or("");
+    let host = if let Some(inner) = hostport.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 /// GitHub owner or repo name. Used in clone URLs and API paths — never a slash or host.
 pub fn is_safe_github_name(s: &str) -> bool {
     let n = s.len();
@@ -675,5 +706,17 @@ mod tests {
         assert!(MERGEABLE_POLL_WAIT >= Duration::from_secs(1));
         assert!(MERGEABLE_POLL_CAP >= Duration::from_secs(4));
         assert_eq!(MERGEABLE_POLL_TRIES, 8);
+    }
+
+    #[test]
+    fn github_endpoints_https_or_loopback_http() {
+        assert!(is_safe_github_endpoint("https://api.github.com"));
+        assert!(is_safe_github_endpoint("https://github.com"));
+        assert!(is_safe_github_endpoint("http://127.0.0.1:1234"));
+        assert!(is_safe_github_endpoint("http://localhost/"));
+        assert!(!is_safe_github_endpoint("http://evil.example"));
+        assert!(!is_safe_github_endpoint("http://api.github.com"));
+        assert!(!is_safe_github_endpoint("https://evil@api.github.com"));
+        assert!(!is_safe_github_endpoint("ftp://api.github.com"));
     }
 }
