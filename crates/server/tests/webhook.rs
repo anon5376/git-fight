@@ -247,6 +247,45 @@ fn symlink_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     (tmp, bare, head, base)
 }
 
+fn file_directory_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 1 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    git(&work, &["rm", "-q", "lib.rs"]);
+    std::fs::create_dir(work.join("lib.rs")).unwrap();
+    std::fs::write(work.join("lib.rs").join("mod.rs"), "mod inner;\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr-dir"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 3 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 fn write_hunk_fns(work: &Path, n: usize, body: i32) {
     let mut src = String::new();
     for i in 0..n {
@@ -359,16 +398,25 @@ async fn http(
 }
 
 fn fight_body() -> Vec<u8> {
+    comment_body("created", true, "/fight\n")
+}
+
+fn comment_body(action: &str, on_pr: bool, text: &str) -> Vec<u8> {
+    let issue = if on_pr {
+        json!({ "number": 1, "pull_request": {} })
+    } else {
+        json!({ "number": 1 })
+    };
     serde_json::to_vec(&json!({
-        "action": "created",
+        "action": action,
         "installation": { "id": 1 },
         "repository": {
             "name": "box",
             "owner": { "login": "acme" },
             "default_branch": "main"
         },
-        "issue": { "number": 1, "pull_request": {} },
-        "comment": { "body": "/fight\n", "user": { "login": "carol", "type": "User" } },
+        "issue": issue,
+        "comment": { "body": text, "user": { "login": "carol", "type": "User" } },
         "sender": { "login": "carol", "type": "User" }
     }))
     .unwrap()
@@ -1552,6 +1600,32 @@ async fn symlink_conflict_is_not_fightable() {
 }
 
 #[tokio::test]
+async fn file_directory_conflict_is_not_fightable() {
+    let (_keep, bare, head, base) = file_directory_conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-file-dir", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("not the kind git fight can play")
+                || t.contains("no conflicts to fight")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "file/directory conflicts must not leave a pending match"
+    );
+}
+
+#[tokio::test]
 async fn same_login_is_a_mirror_match() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(
@@ -1617,6 +1691,87 @@ async fn bot_fight_is_ignored() {
     .unwrap();
     let status = post_signed(addr, "issue_comment", "deliv-bot", &body).await;
     assert_eq!(status, 200);
+    let comments = settle_posted(&mock).await;
+    assert!(comments.is_empty(), "{comments:?}");
+}
+
+#[tokio::test]
+async fn edited_fight_comment_starts_challenge() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(
+            addr,
+            "issue_comment",
+            "deliv-edited",
+            &comment_body("edited", true, "/fight\n")
+        )
+        .await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments.iter().any(|t| t.contains("/match/")),
+        "{comments:?}"
+    );
+    let id = match_id_from(&comments);
+    assert_eq!(wait_challenge_comment_id(&pool, &id).await, Some(99));
+}
+
+#[tokio::test]
+async fn fight_on_plain_issue_is_ignored() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(
+            addr,
+            "issue_comment",
+            "deliv-issue",
+            &comment_body("created", false, "/fight\n")
+        )
+        .await,
+        200
+    );
+    let comments = settle_posted(&mock).await;
+    assert!(comments.is_empty(), "{comments:?}");
+}
+
+#[tokio::test]
+async fn fight_not_first_line_is_ignored() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(
+            addr,
+            "issue_comment",
+            "deliv-not-first",
+            &comment_body("created", true, "please /fight\n")
+        )
+        .await,
+        200
+    );
+    let comments = settle_posted(&mock).await;
+    assert!(comments.is_empty(), "{comments:?}");
+}
+
+#[tokio::test]
+async fn deleted_fight_comment_is_ignored() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(
+            addr,
+            "issue_comment",
+            "deliv-deleted",
+            &comment_body("deleted", true, "/fight\n")
+        )
+        .await,
+        200
+    );
     let comments = settle_posted(&mock).await;
     assert!(comments.is_empty(), "{comments:?}");
 }
