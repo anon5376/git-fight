@@ -155,3 +155,68 @@ async fn auto_challenge_skips_unsafe_ref() {
     );
     assert!(!gh.auto_challenge_enabled(1, "acme", "box", "../main").await);
 }
+
+#[tokio::test]
+async fn login_for_email_rejects_injection() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(gh
+        .login_for_email(1, "acme", "box", "x@y.com&per_page=100")
+        .await
+        .is_none());
+    assert!(gh
+        .login_for_email(1, "acme", "box", "x@y.com\nAuthorization: bearer x")
+        .await
+        .is_none());
+    assert!(gh
+        .login_for_email(1, "acme/other", "box", "bob@example.com")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn login_for_email_queries_author() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "author": { "login": "bob" },
+            "commit": { "author": { "email": "bob@example.com" } }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "bob@example.com")
+            .await
+            .as_deref(),
+        Some("bob")
+    );
+    let asked = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|r| {
+            r.method.as_str() == "GET"
+                && r.url.path() == "/repos/acme/box/commits"
+                && r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "author" && v == "bob@example.com")
+        });
+    assert!(asked, "commits list must filter by author email");
+}

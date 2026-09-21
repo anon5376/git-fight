@@ -118,12 +118,13 @@ fn apply_auth(cmd: &mut Command, url: &str, bearer: Option<&str>) {
 }
 
 /// GitHub App git HTTPS uses Basic `x-access-token:<installation token>`, not REST Bearer.
+/// Scoped to github.com so a redirect cannot collect the installation token.
 fn github_git_auth_header(token: &str) -> String {
     let basic = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         format!("x-access-token:{token}"),
     );
-    format!("http.extraHeader=Authorization: Basic {basic}")
+    format!("http.https://github.com/.extraHeader=Authorization: Basic {basic}")
 }
 
 fn apply_git_bearer(cmd: &mut Command, bearer: Option<&str>) {
@@ -905,9 +906,10 @@ Auto-merging lib.rs\n";
     fn github_git_auth_uses_basic_x_access_token() {
         let header = github_git_auth_header("ghs_live_token_secret");
         assert!(
-            header.starts_with("http.extraHeader=Authorization: Basic "),
+            header.starts_with("http.https://github.com/.extraHeader=Authorization: Basic "),
             "{header}"
         );
+        assert!(!header.contains("http.extraHeader="), "{header}");
         assert!(!header.to_ascii_lowercase().contains("bearer"));
         assert!(!header.contains("ghs_live_token_secret"));
         let b64 = header.rsplit(' ').next().expect("b64");

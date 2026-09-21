@@ -392,14 +392,17 @@ impl GitHub {
         repo: &str,
         email: &str,
     ) -> Option<String> {
-        if email.is_empty() || !is_safe_github_name(owner) || !is_safe_github_name(repo) {
+        if !is_safe_email(email) || !is_safe_github_name(owner) || !is_safe_github_name(repo) {
             return None;
         }
         let res = self
             .authed(
                 installation_id,
                 reqwest::Method::GET,
-                &format!("/repos/{owner}/{repo}/commits?per_page=30"),
+                &format!(
+                    "/repos/{owner}/{repo}/commits?author={}&per_page=1",
+                    urlencoding(email)
+                ),
             )
             .await
             .ok()?
@@ -517,6 +520,16 @@ fn is_safe_git_ref(s: &str) -> bool {
         && !s.contains("..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+}
+
+fn is_safe_email(s: &str) -> bool {
+    let n = s.len();
+    (3..=254).contains(&n)
+        && s.contains('@')
+        && !s.starts_with('-')
+        && s.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'?' | b'&' | b'#' | b'\\' | b'"' | b'\'')
+        })
 }
 
 fn urlencoding(s: &str) -> String {
