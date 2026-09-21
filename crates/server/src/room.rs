@@ -180,6 +180,41 @@ async fn run_room(
         true,
     );
 
+    // Replay can already have a KO. Finish before the first Join so
+    // catch-up is the next conflict (or send_closed), not Hello+Snapshot
+    // of a decided round. scored_all stays on try_finish_scored_all.
+    if replay_ok && !done && !scored_all && sim.result.is_some() {
+        done = advance(Advance {
+            sim: &mut sim,
+            next_tick: &mut next_tick,
+            log: &mut log,
+            pending_ours: &mut pending_ours,
+            pending_theirs: &mut pending_theirs,
+            ours: &mut ours,
+            theirs: &mut theirs,
+            conns: &conns,
+            pool: &pool,
+            id: &id,
+            started_at: &mut started_at,
+            instant: settings.instant,
+            disconnect: settings.disconnect,
+            round: &mut round,
+            total_rounds,
+            seed,
+            delay,
+            ours_name: &ours_name,
+            theirs_name: &mut theirs_name,
+            hunks: &hunks,
+            match_id: &id,
+            result: settings.result.clone(),
+            mirror: &mut mirror,
+            row: &row,
+            github,
+            forfeit_pending: &mut forfeit_pending,
+        })
+        .await;
+    }
+
     let mut clock = tokio::time::interval(Duration::from_millis(1000 / 30));
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -428,7 +463,10 @@ async fn run_room(
                 &mut next_tick,
             )
             .await;
-            if replay_ok {
+            if !replay_ok {
+                continue;
+            }
+            if sim.result.is_none() {
                 let confirmed = if next_tick == 0 {
                     -1
                 } else {
@@ -454,7 +492,6 @@ async fn run_room(
                     );
                 }
             }
-            continue;
         }
 
         done = advance(Advance {

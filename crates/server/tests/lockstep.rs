@@ -407,6 +407,121 @@ async fn resume_after_stored_round_result_starts_next_round() {
 }
 
 #[tokio::test]
+async fn replayed_ko_is_scored_before_first_join() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = git_fight_server::test_tmp_dir("gf-boot-finish");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "bootfinishbootfinishbootfinishboo";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    for round in 0..2 {
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: id,
+                round,
+                path: "lib.rs",
+                hunk_index: round,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let seed = git_fight_server::protocol::round_seed(11, 0);
+    let mut sim = FightState::new(seed, FighterStats::default(), FighterStats::default());
+    let mut tick = 0u32;
+    while sim.result.is_none() {
+        let ours = if tick.is_multiple_of(14) { 1 } else { 0 };
+        sim.step(Input::from_u8(ours), Input::from_u8(0));
+        git_fight_server::db::insert_input(&pool, id, 0, tick, ours, 0)
+            .await
+            .unwrap();
+        tick = tick.saturating_add(1);
+        assert!(tick < 20_000, "round 0 never ended");
+    }
+    git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
+        .await
+        .unwrap();
+    let serve_pool = pool.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut winner = None;
+    for _ in 0..50 {
+        let hunks = git_fight_server::db::list_hunks(&pool, id).await.unwrap();
+        winner = hunks
+            .into_iter()
+            .find(|h| h.round_index == 0)
+            .and_then(|h| h.winner);
+        if winner.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        winner.is_some(),
+        "boot must persist the replayed KO before anyone joins"
+    );
+    let url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let hello = wait_type(&mut stream, "hello").await;
+    assert_eq!(
+        hello["round"].as_u64(),
+        Some(1),
+        "first Join must land on the next conflict, not the decided round"
+    );
+}
+
+#[tokio::test]
 async fn scored_rounds_resume_finishes_without_replaying() {
     use git_fight_server::db::{NewHunk, NewMatch};
     let dir = std::env::temp_dir().join(format!(

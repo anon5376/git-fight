@@ -163,19 +163,30 @@ fn already_open_note(ctx: &ChallengeCtx, id: &str) -> ChallengeStart {
     ))
 }
 
+async fn open_match_for_pr_retry(
+    pool: &SqlitePool,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Option<db::MatchRow>, sqlx::Error> {
+    match db::open_match_for_pr(pool, owner, repo, number).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::open_match_for_pr(pool, owner, repo, number).await,
+    }
+}
+
+/// Unique-collision `/fight` already proved another row. Busy lookup
+/// must still comment "already open", never a generic could-not-start.
 async fn already_open_now(
     ctx: &ChallengeCtx,
     owner: &str,
     repo: &str,
     number: u64,
-) -> Result<ChallengeStart, String> {
-    if let Some(existing) = db::open_match_for_pr(&ctx.pool, owner, repo, number)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        return Ok(already_open_note(ctx, &existing.id));
+) -> ChallengeStart {
+    match open_match_for_pr_retry(&ctx.pool, owner, repo, number).await {
+        Ok(Some(existing)) => already_open_note(ctx, &existing.id),
+        Ok(None) | Err(_) => note("a fight is already open"),
     }
-    Ok(note("a fight is already open"))
 }
 
 async fn abort_start(ctx: &ChallengeCtx, id: &str, reason: &str, body: String) -> ChallengeStart {
@@ -224,11 +235,10 @@ pub async fn start_challenge(
     }
     let owner = crate::gh::fold_github_name(owner);
     let repo = crate::gh::fold_github_name(repo);
-    if let Some(existing) = db::open_match_for_pr(&ctx.pool, &owner, &repo, number)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        return Ok(already_open_note(ctx, &existing.id));
+    match open_match_for_pr_retry(&ctx.pool, &owner, &repo, number).await {
+        Ok(Some(existing)) => return Ok(already_open_note(ctx, &existing.id)),
+        Ok(None) => {}
+        Err(_) => return Ok(note("a fight is already open")),
     }
 
     let recent_pr = db::count_recent_matches_for_pr(&ctx.pool, &owner, &repo, number, 3600)
@@ -302,7 +312,7 @@ pub async fn start_challenge(
     {
         Ok(()) => {}
         Err(e) if db::is_unique_violation(&e) => {
-            return already_open_now(ctx, &owner, &repo, number).await;
+            return Ok(already_open_now(ctx, &owner, &repo, number).await);
         }
         Err(e) => return Err(e.to_string()),
     }
@@ -799,6 +809,80 @@ mod tests {
             Ok(false) => "silent",
             Err(()) => "queue",
         }
+    }
+
+    #[test]
+    fn unique_collision_busy_lookup_stays_already_open() {
+        assert_eq!(already_open_followup(Ok(Some("m1"))), "link");
+        assert_eq!(already_open_followup(Ok(None)), "note");
+        assert_eq!(
+            already_open_followup(Err(())),
+            "note",
+            "unique collision already proved another row; busy lookup must not become could-not-start"
+        );
+    }
+
+    fn already_open_followup(lookup: Result<Option<&'static str>, ()>) -> &'static str {
+        match lookup {
+            Ok(Some(_)) => "link",
+            Ok(None) | Err(()) => "note",
+        }
+    }
+
+    #[test]
+    fn busy_pre_insert_open_lookup_does_not_spawn() {
+        assert_eq!(pre_insert_open_followup(Ok(Some("m1"))), "link");
+        assert_eq!(pre_insert_open_followup(Ok(None)), "insert");
+        assert_eq!(
+            pre_insert_open_followup(Err(())),
+            "note",
+            "busy open_match_for_pr must not fall through to insert"
+        );
+    }
+
+    fn pre_insert_open_followup(lookup: Result<Option<&'static str>, ()>) -> &'static str {
+        match lookup {
+            Ok(Some(_)) => "link",
+            Ok(None) => "insert",
+            Err(()) => "note",
+        }
+    }
+
+    #[tokio::test]
+    async fn already_open_now_links_the_existing_fight() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "m1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "alice".into(),
+                theirs_name: "theirs".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: Some("alice".into()),
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "a".repeat(40),
+                pr_base_sha: "b".repeat(40),
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = test_ctx(pool);
+        let start = already_open_now(&ctx, "acme", "box", 1).await;
+        assert!(
+            start.body.contains("already open") && start.body.contains("/match/m1"),
+            "{}",
+            start.body
+        );
     }
 
     #[test]

@@ -573,7 +573,9 @@ pub async fn persist_input(
     }
     let exists: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM match_inputs
-         WHERE match_id = ? AND round_index = ? AND tick = ?",
+         JOIN matches ON matches.id = match_inputs.match_id
+         WHERE match_inputs.match_id = ? AND match_inputs.round_index = ? AND match_inputs.tick = ?
+           AND matches.status IN ('pending', 'in_progress')",
     )
     .bind(id)
     .bind(i64::from(round))
@@ -3238,5 +3240,20 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(load_inputs(&pool, "m1", 0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_input_existing_row_is_not_durable_after_abort() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(persist_input(&pool, "m1", 0, 0, 1, 2).await.unwrap());
+        assert!(abort_open_match(&pool, "m1", "outdated").await.unwrap());
+        assert!(
+            !persist_input(&pool, "m1", 0, 0, 1, 2).await.unwrap(),
+            "a closed match must not treat a leftover tick as durable"
+        );
+        assert_eq!(load_inputs(&pool, "m1", 0).await.unwrap(), vec![(0, 1, 2)]);
     }
 }
