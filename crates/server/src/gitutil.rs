@@ -440,7 +440,7 @@ async fn ensure_commit(dir: &Path, sha: &str, bearer: Option<&str>) -> Result<()
         return Err(GitError::Command("unsafe revision".into()));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["cat-file", "-t", sha]);
+    cmd.args(["cat-file", "-t", "--", sha]);
     let (code, out, err) = run(cmd, Duration::from_secs(20)).await?;
     if code != 0 {
         return Err(git_err(&err));
@@ -558,7 +558,7 @@ pub async fn merge_tree(
         return Err(GitError::Command("unsafe revision".into()));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["merge-tree", "--write-tree", "-z", base, head]);
+    cmd.args(["merge-tree", "--write-tree", "-z", "--", base, head]);
     let (code, out, err) = match run(cmd, CLONE_TIMEOUT).await {
         Err(GitError::OutputTooLarge) => {
             return Err(GitError::TooMany(MAX_CONFLICT_PATHS.saturating_add(1)));
@@ -600,7 +600,7 @@ async fn cat_file(dir: &Path, spec: &str, bearer: Option<&str>) -> Result<Vec<u8
         return Err(GitError::Command("unsafe revision".into()));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["cat-file", "blob", spec]);
+    cmd.args(["cat-file", "blob", "--", spec]);
     let (code, out, err) = run_capped(cmd, Duration::from_secs(15), MAX_BLOB_BYTES).await?;
     if code != 0 {
         return Err(git_err(&err));
@@ -880,6 +880,7 @@ async fn armor_from_commit(dir: &Path, rev: &str, path: &str, bearer: Option<&st
         "--name-only",
         "-r",
         "--root",
+        "--",
         &commit,
     ]);
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await else {
@@ -900,6 +901,7 @@ async fn special_from_log(dir: &Path, rev: &str, name: &str, bearer: Option<&str
     cmd.args(["log", "--since=7 days ago", "--format=%ad", "--date=short"]);
     cmd.arg(format!("--author={name}"));
     cmd.arg(rev);
+    cmd.arg("--");
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(15)).await else {
         return false;
     };
@@ -1082,7 +1084,7 @@ async fn rev_parse_git_fight(
         ));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["rev-parse", "--verify", spec]);
+    cmd.args(["rev-parse", "--verify", "--", spec]);
     let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
         return Err(git_err(&err));
@@ -1099,7 +1101,7 @@ async fn cat_commit(dir: &Path, sha: &str, bearer: Option<&str>) -> Result<Strin
         return Err(GitError::Command("unsafe revision".into()));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["cat-file", "-p", sha]);
+    cmd.args(["cat-file", "-p", "--", sha]);
     let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
     if code != 0 {
         return Err(git_err(&err));

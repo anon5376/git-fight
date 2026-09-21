@@ -155,7 +155,7 @@ Insert the match (status `pending`, `expires_at` = now + 24 hours, random seed, 
 
 ### 7. Play
 
-Players log in with GitHub. Only the two fighter logins can take a slot; everyone else spectates. Seed, stats, and hunk metadata go to every client. Lockstep runs as in [Netcode](#netcode). Each round's winner is `ours`, `theirs`, or `draw`. A fighter who disconnects has 30 seconds to rejoin, then loses the **current** round. If a fighter never shows up, the match expires at 24 hours with no result and no push. An aborted or expired row stops confirming ticks on the next sim step, even if Shutdown is still queued.
+Players log in with GitHub. Only the two fighter logins can take a slot; everyone else spectates. Seed, stats, and hunk metadata go to every client. Lockstep runs as in [Netcode](#netcode). Each round's winner is `ours`, `theirs`, or `draw`. A fighter who disconnects has 30 seconds to rejoin, then loses the **current** round. If a fighter never shows up, the match expires at 24 hours with no result and no push. An aborted or expired row stops confirming ticks on the next sim step, even if Shutdown is still queued. `--instant` re-checks before each step in a burst. A round that already ended in the sim does not write End or a hunk winner after the row is closed.
 
 ### 8. Result
 
@@ -190,7 +190,7 @@ On WebSocket connect the server reads the session, then sends:
 Hello { match_id, seed, input_delay, your_role, ours, theirs, round, confirmed_tick, you_are, path, hunk_index }
 ```
 
-`your_role` is `ours`, `theirs`, `both` (mirror), or `spectator`. Spectators never have a fighter slot. Outbound Tick/Hash/End/Hello are non-blocking so a client who stops reading cannot stall confirm; they resync from Snapshot on reconnect.
+`your_role` is `ours`, `theirs`, `both` (mirror), or `spectator`. Spectators never have a fighter slot. Outbound Tick/Hash/End/Hello (including join Hello/Snapshot and closed-room Error) are non-blocking so a client who stops reading cannot stall confirm; they resync from Snapshot on reconnect.
 
 ### Inputs
 
@@ -287,7 +287,7 @@ Replay log and lockstep resume.
 | `ours` | `INTEGER` | Packed buttons. |
 | `theirs` | `INTEGER` | Packed buttons. |
 
-Primary key `(match_id, round_index, tick)`. Append-only (`INSERT OR IGNORE`; the first confirmed tick wins).
+Primary key `(match_id, round_index, tick)`. Append-only (`INSERT OR IGNORE`; the first confirmed tick wins). Inserts only while the match is `pending` or `in_progress`.
 
 ### `sessions`
 
@@ -359,7 +359,7 @@ A repo can be huge, contain symlink farms, `.git` path tricks, enormous blobs, o
 **Mitigation:**
 
 - Skip when GitHub `size` > 1 GiB; clone timeout 60 seconds; `--filter=blob:none`; bare repo; no checkout of a worktree used as a cwd for user code.
-- `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`. Git is invoked with argument lists, never a shell string built from paths. Object SHAs are passed after `--`.
+- `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`. Git is invoked with argument lists, never a shell string built from paths. Object SHAs are passed after `--`. `git log --author=` takes the revision, then `--`.
 - Paths from merge-tree (`-z`) must be relative, with no `..` or `.git` component, no control characters, no option-like (`-`) names, and no component over 255 bytes or path over 4096 bytes. Only regular-file modes. Do not follow symlinks. Cap blob bytes (skip that path; other fightable files still start a match). Cap git stdout/stderr so a huge blob or merge-tree list cannot fill RAM. Blame locates a hunk with a bounded search so a 1 MiB conflict cannot be quadratic against the file. Git author names and emails are length-capped so a hostile commit cannot bloat Hello or challenge comments. Cap 15 hunks.
 - Never `cargo test`, never a repo `Dockerfile`, never `git submodule update`, never a post-checkout hook.
 

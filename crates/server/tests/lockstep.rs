@@ -57,6 +57,9 @@ async fn reconnect_after_finish_is_not_a_room() {
         play(addr, &id, &theirs_token, false),
     );
 
+    let url = format!("ws://{addr}/ws?match={id}&token={ours_token}");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
     let err = wait_type(&mut stream, "error").await;
     assert_eq!(err["message"].as_str(), Some("finished"), "{err}");
 }
@@ -153,9 +156,22 @@ async fn abort_stops_lockstep_before_the_round_ends() {
             .unwrap()
     );
 
-    let err = tokio::time::timeout(Duration::from_secs(2), wait_type(&mut ours_stream, "error"))
-        .await
-        .expect("aborted match should stop the room without waiting for the round timer");
+    let err = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = ours_stream.next().await.unwrap().unwrap();
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&text).unwrap();
+            match v["type"].as_str() {
+                Some("end") => panic!("aborted match must not send End {v}"),
+                Some("error") => return v,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("aborted match should stop the room without waiting for the round timer");
     assert_eq!(err["message"].as_str(), Some("outdated"), "{err}");
     let row = git_fight_server::db::get_match(&pool, id)
         .await

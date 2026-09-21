@@ -523,13 +523,16 @@ pub async fn insert_input(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT OR IGNORE INTO match_inputs (match_id, round_index, tick, ours, theirs)
-         VALUES (?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?
+         FROM matches
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
     )
     .bind(id)
     .bind(i64::from(round))
     .bind(i64::from(tick))
     .bind(i64::from(ours))
     .bind(i64::from(theirs))
+    .bind(id)
     .execute(pool)
     .await?;
     Ok(())
@@ -1623,8 +1626,13 @@ mod tests {
         .unwrap();
         assert!(abort_open_match(&pool, "m-ab", "outdated").await.unwrap());
         assert!(!set_hunk_winner(&pool, "m-ab", 0, "ours").await.unwrap());
+        insert_input(&pool, "m-ab", 0, 0, 1, 2).await.unwrap();
         let hunks = list_hunks(&pool, "m-ab").await.unwrap();
         assert!(hunks[0].winner.is_none());
+        assert!(
+            load_inputs(&pool, "m-ab", 0).await.unwrap().is_empty(),
+            "aborted matches must not grow the input log"
+        );
     }
 
     #[tokio::test]
@@ -1795,10 +1803,11 @@ mod tests {
         .await
         .unwrap_err();
         assert!(is_fk(&err), "{err}");
-        let err = insert_input(&pool, "missing", 0, 0, 1, 2)
-            .await
-            .unwrap_err();
-        assert!(is_fk(&err), "{err}");
+        insert_input(&pool, "missing", 0, 0, 1, 2).await.unwrap();
+        assert!(
+            load_inputs(&pool, "missing", 0).await.unwrap().is_empty(),
+            "ticks are not stored unless the match row is still open"
+        );
     }
 
     #[tokio::test]

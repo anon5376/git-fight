@@ -246,7 +246,7 @@ async fn run_room(
                                     db::stats_for_round(&hunks, round),
                                     &hunks,
                                 );
-                                let _ = tx.send(encode(&hello)).await;
+                                let _ = tx.try_send(encode(&hello));
                                 let snap = snapshot_msg(
                                     round_seed(seed, round),
                                     round,
@@ -255,14 +255,12 @@ async fn run_room(
                                     &log,
                                     &hunks,
                                 );
-                                let _ = tx.send(encode(&snap)).await;
+                                let _ = tx.try_send(encode(&snap));
                                 if let Some(result) = sim.result {
                                     let match_over = round + 1 >= total_rounds;
-                                    let _ = tx
-                                        .send(encode(&end_msg(
-                                            &sim, result, round, match_over,
-                                        )))
-                                        .await;
+                                    let _ = tx.try_send(encode(&end_msg(
+                                        &sim, result, round, match_over,
+                                    )));
                                 }
                             }
                         }
@@ -453,6 +451,10 @@ async fn advance(a: Advance<'_>) -> bool {
                 break;
             }
         }
+        if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
+            expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+            return true;
+        }
         let ours_btn = if a.ours.kind_cpu {
             a.sim.cpu_input(Side::Ours).as_u8()
         } else {
@@ -504,6 +506,9 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
         .unwrap_or(false);
     if tagged {
         let _ = crate::stats::record_round(a.pool, a.id, i64::from(*a.round), tag, ko).await;
+    } else if !db::is_open_match(a.pool, a.id).await.unwrap_or(false) {
+        expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+        return true;
     }
     let match_over = *a.round + 1 >= a.total_rounds;
     let (lo, hi) = split_hash(a.sim.state_hash());
@@ -605,18 +610,16 @@ async fn closed_message(pool: &SqlitePool, id: &str) -> String {
 
 async fn send_closed(tx: &mpsc::Sender<String>, pool: &SqlitePool, id: &str) {
     let message = closed_message(pool, id).await;
-    let _ = tx.send(encode(&ServerMsg::Error { message })).await;
+    let _ = tx.try_send(encode(&ServerMsg::Error { message }));
 }
 
 async fn drain_late_joins(rx: &mut mpsc::Receiver<RoomEvent>, pool: &SqlitePool, id: &str) {
     let message = closed_message(pool, id).await;
     while let Ok(ev) = rx.try_recv() {
         if let RoomEvent::Join { tx, .. } = ev {
-            let _ = tx
-                .send(encode(&ServerMsg::Error {
-                    message: message.clone(),
-                }))
-                .await;
+            let _ = tx.try_send(encode(&ServerMsg::Error {
+                message: message.clone(),
+            }));
         }
     }
 }
