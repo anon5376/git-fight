@@ -244,6 +244,7 @@ async fn run_room(
     clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut drain_until: Option<tokio::time::Instant> = None;
+    let mut expiry_due = false;
     loop {
         if done {
             let until = *drain_until
@@ -451,6 +452,7 @@ async fn run_room(
                 if !done {
                     if let Some(exp) = expires_at {
                         if Utc::now() >= exp && !scored_all {
+                            expiry_due = true;
                             expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
                             // expire_open_match no-ops a fully scored row;
                             // stay in the room so last-round finish can retry.
@@ -462,6 +464,11 @@ async fn run_room(
         }
 
         if done {
+            continue;
+        }
+        if expiry_due && !scored_all {
+            expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
+            done = match_is_open(&pool, &id).await == MatchOpen::Closed;
             continue;
         }
         if scored_all {
@@ -957,12 +964,14 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     match finish_after_write(tagged, open, stored) {
         FinishAfterWrite::Proceed { record: true } => {
             *a.forfeit_pending = false;
+            let _ = db::clear_pending_forfeit(a.pool, a.id, *a.round).await;
             let _ =
                 crate::stats::record_round(a.pool, a.id, i64::from(*a.round), &stats_tag, stats_ko)
                     .await;
         }
         FinishAfterWrite::Proceed { record: false } => {
             *a.forfeit_pending = false;
+            let _ = db::clear_pending_forfeit(a.pool, a.id, *a.round).await;
             let _ =
                 crate::stats::record_round(a.pool, a.id, i64::from(*a.round), &stats_tag, stats_ko)
                     .await;
@@ -1664,6 +1673,27 @@ mod tests {
         };
         assert!(!slot.latch_forfeit(Duration::from_secs(30)));
         assert!(!slot.forfeit_due);
+    }
+
+    #[test]
+    fn expiry_due_does_not_confirm_ticks() {
+        assert_eq!(expiry_due_followup(false, false), "advance");
+        assert_eq!(expiry_due_followup(true, true), "finish");
+        assert_eq!(
+            expiry_due_followup(true, false),
+            "retry_expire",
+            "a busy expire write must not keep confirming past expires_at"
+        );
+    }
+
+    fn expiry_due_followup(due: bool, scored_all: bool) -> &'static str {
+        if scored_all {
+            "finish"
+        } else if due {
+            "retry_expire"
+        } else {
+            "advance"
+        }
     }
 
     #[test]

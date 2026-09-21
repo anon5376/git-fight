@@ -1458,8 +1458,9 @@ pub async fn set_challenge_comment_id(
 }
 
 /// Latch a disconnect forfeit before the hunk winner is durable.
-/// Write-once and only while the match is still open. The same tag+round
-/// already stored counts as durable so persist can retry `set_hunk_winner`.
+/// Write-once per round and only while the match is still open. A later
+/// round may replace a leftover latch. The same tag+round already stored
+/// counts as durable so persist can retry `set_hunk_winner`.
 pub async fn set_pending_forfeit(
     pool: &SqlitePool,
     id: &str,
@@ -1472,12 +1473,13 @@ pub async fn set_pending_forfeit(
     }
     let res = sqlx::query(
         "UPDATE matches SET pending_forfeit = ?, pending_forfeit_round = ?
-         WHERE id = ? AND pending_forfeit IS NULL
-           AND status IN ('pending', 'in_progress')",
+         WHERE id = ? AND status IN ('pending', 'in_progress')
+           AND (pending_forfeit IS NULL OR pending_forfeit_round != ?)",
     )
     .bind(tag)
     .bind(i64::from(round))
     .bind(id)
+    .bind(i64::from(round))
     .execute(pool)
     .await?;
     if res.rows_affected() > 0 {
@@ -1495,6 +1497,23 @@ pub async fn set_pending_forfeit(
         Some((Some(t), Some(r)))
             if t == tag && r == i64::from(round)
     ))
+}
+
+/// Drop a scored-round latch so a later conflict can forfeit again.
+pub async fn clear_pending_forfeit(
+    pool: &SqlitePool,
+    id: &str,
+    round: u32,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE matches SET pending_forfeit = NULL, pending_forfeit_round = NULL
+         WHERE id = ? AND pending_forfeit_round = ?",
+    )
+    .bind(id)
+    .bind(i64::from(round))
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Record the create-only branch or a skip reason. First writer wins.
@@ -3346,6 +3365,18 @@ mod tests {
         );
         let row = get_match(&pool, "m1").await.unwrap().unwrap();
         assert_eq!(row.pending_forfeit_for(0), Some("forfeit_ours"));
+        assert!(row.pending_forfeit_for(1).is_none());
+        assert!(
+            set_pending_forfeit(&pool, "m1", 1, "forfeit_theirs")
+                .await
+                .unwrap(),
+            "a later round must replace the scored-round latch"
+        );
+        let row = get_match(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(row.pending_forfeit_for(1), Some("forfeit_theirs"));
+        assert!(row.pending_forfeit_for(0).is_none());
+        assert!(clear_pending_forfeit(&pool, "m1", 1).await.unwrap());
+        let row = get_match(&pool, "m1").await.unwrap().unwrap();
         assert!(row.pending_forfeit_for(1).is_none());
         assert!(abort_open_match(&pool, "m1", "outdated").await.unwrap());
         assert!(
