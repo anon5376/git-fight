@@ -135,14 +135,23 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
 
   const ws = new WebSocket(wsUrl(matchId, token));
 
-  const flush = (latest: number) => {
+  const flush = (oursBtn: number, theirsBtn: number) => {
     if (role === "spectator" || ws.readyState !== WebSocket.OPEN) {
       return;
     }
     const horizon = Math.max(0, confirmed + 1) + delay;
     while (nextSend <= horizon) {
-      const buttons = nextSend === horizon ? latest : 0;
-      ws.send(JSON.stringify({ type: "input", tick: nextSend, buttons }));
+      const buttons = nextSend === horizon ? oursBtn : 0;
+      const theirs = nextSend === horizon ? theirsBtn : 0;
+      const payload: { type: string; tick: number; buttons: number; theirs?: number } = {
+        type: "input",
+        tick: nextSend,
+        buttons,
+      };
+      if (role === "both") {
+        payload.theirs = theirs;
+      }
+      ws.send(JSON.stringify(payload));
       nextSend += 1;
     }
   };
@@ -173,6 +182,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       fight = WasmFight.from_seed(hello.seed_lo, hello.seed_hi);
       if (role === "spectator") {
         ui.wait.textContent = "spectating";
+        void offerGithubLogin(matchId, ui);
       }
     } else if (msg.type === "tick") {
       const tick = msg as TickMsg;
@@ -206,14 +216,24 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     while (leftover >= tickMs) {
       leftover -= tickMs;
       const queued = keys.poll();
-      const latest = buttonsForRole(role, queued) || held;
-      if (role !== "spectator") {
+      if (role === "both") {
         const horizon = Math.max(0, confirmed + 1) + delay;
         if (nextSend <= horizon) {
-          flush(latest);
+          flush(queued.ours || held, queued.theirs);
           held = 0;
         } else {
-          held = latest;
+          held = queued.ours || held;
+        }
+      } else {
+        const latest = buttonsForRole(role, queued) || held;
+        if (role !== "spectator") {
+          const horizon = Math.max(0, confirmed + 1) + delay;
+          if (nextSend <= horizon) {
+            flush(latest, 0);
+            held = 0;
+          } else {
+            held = latest;
+          }
         }
       }
     }
@@ -300,6 +320,32 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
       keys.unbind();
     },
   };
+}
+
+async function offerGithubLogin(matchId: string, ui: OnlineUi): Promise<void> {
+  try {
+    const info = await fetch(`/api/matches/${matchId}`, { credentials: "include" });
+    if (!info.ok) {
+      return;
+    }
+    const body = (await info.json()) as { ours_login?: string; theirs_login?: string };
+    if (!body.ours_login && !body.theirs_login) {
+      return;
+    }
+    const me = await fetch("/api/me", { credentials: "include" });
+    if (me.ok) {
+      return;
+    }
+    ui.wait.textContent = "";
+    const a = document.createElement("a");
+    a.href = `/auth/github?return=/match/${matchId}`;
+    a.textContent = "log in with GitHub to take a fighter slot";
+    a.dataset.testid = "github-login";
+    ui.wait.appendChild(a);
+    ui.wait.classList.remove("hidden");
+  } catch {
+    /* offline */
+  }
 }
 
 export async function hostMatch(): Promise<void> {

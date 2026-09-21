@@ -22,6 +22,7 @@ pub enum RoomEvent {
         role: Role,
         tick: u32,
         buttons: u8,
+        theirs_buttons: Option<u8>,
     },
     Shutdown,
 }
@@ -153,6 +154,14 @@ async fn run_room(
                                 theirs.tx = Some(tx);
                                 theirs.disconnected_at = None;
                             }
+                            Role::Both => {
+                                ours.seen = true;
+                                theirs.seen = true;
+                                ours.tx = Some(tx.clone());
+                                theirs.tx = Some(tx);
+                                ours.disconnected_at = None;
+                                theirs.disconnected_at = None;
+                            }
                             Role::Spectator => spectators.push(tx),
                         }
                         if !done && ours.seen && theirs.seen && started_at.is_none() {
@@ -176,12 +185,23 @@ async fn run_room(
                                 theirs.disconnected_at = Some(Instant::now());
                             }
                         }
+                        Role::Both => {
+                            ours.tx = None;
+                            theirs.tx = None;
+                            if !done && ours.seen && !ours.kind_cpu {
+                                ours.disconnected_at = Some(Instant::now());
+                            }
+                            if !done && theirs.seen && !theirs.kind_cpu {
+                                theirs.disconnected_at = Some(Instant::now());
+                            }
+                        }
                         Role::Spectator => {}
                     },
                     RoomEvent::Input {
                         role,
                         tick,
                         buttons,
+                        theirs_buttons,
                     } => {
                         if done || sim.result.is_some() {
                             continue;
@@ -195,6 +215,12 @@ async fn run_room(
                             }
                             Role::Theirs => {
                                 pending_theirs.entry(tick).or_insert(buttons);
+                            }
+                            Role::Both => {
+                                pending_ours.entry(tick).or_insert(buttons);
+                                pending_theirs
+                                    .entry(tick)
+                                    .or_insert(theirs_buttons.unwrap_or(0));
                             }
                             Role::Spectator => {}
                         }
