@@ -880,7 +880,6 @@ async fn armor_from_commit(dir: &Path, rev: &str, path: &str, bearer: Option<&st
         "--name-only",
         "-r",
         "--root",
-        "--",
         &commit,
     ]);
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await else {
