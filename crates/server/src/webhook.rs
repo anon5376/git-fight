@@ -191,23 +191,28 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
     };
     let owner = repo.owner.login.clone();
     let name = repo.name.clone();
-    let start = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
-        Ok(msg) => msg,
-        Err(e) => challenge::ChallengeStart {
-            body: format!("git fight could not start: {e}"),
-            match_id: None,
-        },
-    };
-    let posted = ctx
-        .gh
-        .comment(inst, &owner, &name, number, &start.body)
-        .await
-        .unwrap_or(0);
-    if let Some(match_id) = start.match_id {
-        if posted > 0 {
-            let _ = db::set_challenge_comment_id(&ctx.pool, &match_id, posted as i64).await;
+    tokio::spawn(async move {
+        let Ok(_permit) = crate::limits::git_slots().acquire().await else {
+            return;
+        };
+        let start = match challenge::start_challenge(&ctx, inst, &owner, &name, number).await {
+            Ok(msg) => msg,
+            Err(e) => challenge::ChallengeStart {
+                body: format!("git fight could not start: {e}"),
+                match_id: None,
+            },
+        };
+        let posted = ctx
+            .gh
+            .comment(inst, &owner, &name, number, &start.body)
+            .await
+            .unwrap_or(0);
+        if let Some(match_id) = start.match_id {
+            if posted > 0 {
+                let _ = db::set_challenge_comment_id(&ctx.pool, &match_id, posted as i64).await;
+            }
         }
-    }
+    });
     HttpStatus::OK
 }
 

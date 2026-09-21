@@ -11,3 +11,10 @@ pub const MAX_BLOB_BYTES: usize = 1_048_576;
 pub const MAX_MATCHES_PER_INSTALL_HOUR: i64 = 20;
 /// New `/fight` (and auto-challenge) starts per pull request per hour.
 pub const MAX_MATCHES_PER_PR_HOUR: i64 = 5;
+/// Clone / merge-tree / push jobs at once (webhook returns 200 before git work).
+pub const MAX_CONCURRENT_GIT: usize = 2;
+
+pub fn git_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_GIT))
+}

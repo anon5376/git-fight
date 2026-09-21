@@ -70,6 +70,10 @@ fn round_lines(hunks: &[HunkRow]) -> String {
 }
 
 pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
+    let _permit = crate::limits::git_slots()
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
     let row = db::get_match(&ctx.pool, match_id)
         .await
         .map_err(|e| e.to_string())?

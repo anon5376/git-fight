@@ -231,6 +231,73 @@ fn patched_comments(rec: &[wiremock::Request]) -> Vec<String> {
         .collect()
 }
 
+async fn wait_until(
+    mock: &MockServer,
+    min: usize,
+    pick: fn(&[wiremock::Request]) -> Vec<String>,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let rec = mock.received_requests().await.unwrap_or_default();
+        let got = pick(&rec);
+        if got.len() >= min {
+            return got;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+}
+
+async fn wait_posted(mock: &MockServer, min: usize) -> Vec<String> {
+    wait_until(mock, min, posted_comments).await
+}
+
+async fn wait_patched(mock: &MockServer, min: usize) -> Vec<String> {
+    wait_until(mock, min, patched_comments).await
+}
+
+async fn settle_posted(mock: &MockServer) -> Vec<String> {
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    posted_comments(&mock.received_requests().await.unwrap_or_default())
+}
+
+async fn settle_patched(mock: &MockServer) -> Vec<String> {
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    patched_comments(&mock.received_requests().await.unwrap_or_default())
+}
+
+async fn wait_challenge_comment_id(pool: &sqlx::SqlitePool, match_id: &str) -> Option<i64> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(Some(row)) = git_fight_server::db::get_match(pool, match_id).await {
+            if row.challenge_comment_id.is_some() {
+                return row.challenge_comment_id;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return match git_fight_server::db::get_match(pool, match_id).await {
+                Ok(Some(row)) => row.challenge_comment_id,
+                _ => None,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn match_id_from(comments: &[String]) -> String {
+    comments
+        .iter()
+        .find_map(|t| {
+            t.split("/match/")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .expect("challenge comment with /match/")
+}
+
 struct MockOpts {
     commit_author: Value,
     size: u64,
@@ -415,25 +482,17 @@ async fn valid_fight_comments_challenge() {
     let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
     let status = post_signed(addr, "issue_comment", "deliv-1", &fight_body()).await;
     assert_eq!(status, 200);
-    let rec = mock.received_requests().await.unwrap();
-    let comments = posted_comments(&rec);
-    assert!(!comments.is_empty(), "expected a PR comment, got {rec:?}");
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        !comments.is_empty(),
+        "expected a PR comment, got {comments:?}"
+    );
     let text = &comments[0];
     assert!(text.contains("git fight"), "{text}");
     assert!(text.contains("/match/"), "{text}");
     assert!(text.contains("CPU"), "{text}");
-    let id = text
-        .split("/match/")
-        .nth(1)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap();
-    let row = git_fight_server::db::get_match(&pool, id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.challenge_comment_id, Some(99));
+    let id = match_id_from(&comments);
+    assert_eq!(wait_challenge_comment_id(&pool, &id).await, Some(99));
 }
 
 #[tokio::test]
@@ -453,7 +512,7 @@ async fn same_login_is_a_mirror_match() {
     let addr = spawn(cfg_for(&mock, bare)).await;
     let status = post_signed(addr, "issue_comment", "deliv-mirror", &fight_body()).await;
     assert_eq!(status, 200);
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     assert!(
         comments.iter().any(|t| t.contains("mirror")),
         "{comments:?}"
@@ -476,7 +535,7 @@ async fn oversized_repo_is_skipped() {
     let addr = spawn(cfg_for(&mock, PathBuf::from("/nope"))).await;
     let status = post_signed(addr, "issue_comment", "deliv-big", &fight_body()).await;
     assert_eq!(status, 200);
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     assert!(comments.iter().any(|t| t.contains("1 GB")), "{comments:?}");
 }
 
@@ -500,7 +559,7 @@ async fn bot_fight_is_ignored() {
     .unwrap();
     let status = post_signed(addr, "issue_comment", "deliv-bot", &body).await;
     assert_eq!(status, 200);
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = settle_posted(&mock).await;
     assert!(comments.is_empty(), "{comments:?}");
 }
 
@@ -511,7 +570,7 @@ async fn auto_challenge_stays_off_without_yaml() {
     let addr = spawn(cfg_for(&mock, bare)).await;
     let status = post_signed(addr, "pull_request", "deliv-pr", &pr_opened_body()).await;
     assert_eq!(status, 200);
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = settle_posted(&mock).await;
     assert!(comments.is_empty(), "{comments:?}");
 }
 
@@ -532,7 +591,7 @@ async fn auto_challenge_starts_when_yaml_set() {
     let addr = spawn(cfg_for(&mock, bare)).await;
     let status = post_signed(addr, "pull_request", "deliv-auto", &pr_opened_body()).await;
     assert_eq!(status, 200);
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     assert!(
         comments.iter().any(|t| t.contains("/match/")),
         "{comments:?}"
@@ -554,7 +613,7 @@ async fn blame_email_maps_through_commits_api() {
     let addr = spawn(cfg_for(&mock, bare)).await;
     let status = post_signed(addr, "issue_comment", "deliv-email", &fight_body()).await;
     assert_eq!(status, 200);
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     assert!(
         comments
             .iter()
@@ -572,8 +631,8 @@ async fn pr_synchronize_same_sha_does_not_comment() {
         post_signed(addr, "issue_comment", "deliv-fight", &fight_body()).await,
         200
     );
-    let after_fight = posted_comments(&mock.received_requests().await.unwrap()).len();
-    assert_eq!(after_fight, 1, "expected one challenge comment");
+    let after_fight = wait_posted(&mock, 1).await;
+    assert_eq!(after_fight.len(), 1, "expected one challenge comment");
     assert_eq!(
         post_signed(
             addr,
@@ -584,19 +643,23 @@ async fn pr_synchronize_same_sha_does_not_comment() {
         .await,
         200
     );
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
-    assert_eq!(comments.len(), after_fight, "{comments:?}");
+    let comments = settle_posted(&mock).await;
+    assert_eq!(comments.len(), 1, "{comments:?}");
 }
 
 #[tokio::test]
 async fn pr_synchronize_moved_sha_comments_once() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
-    let addr = spawn(cfg_for(&mock, bare)).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
     assert_eq!(
         post_signed(addr, "issue_comment", "deliv-fight2", &fight_body()).await,
         200
     );
+    let comments = wait_posted(&mock, 1).await;
+    assert_eq!(comments.len(), 1, "challenge stays one POST: {comments:?}");
+    let id = match_id_from(&comments);
+    assert_eq!(wait_challenge_comment_id(&pool, &id).await, Some(99));
     assert_eq!(
         post_signed(
             addr,
@@ -611,10 +674,7 @@ async fn pr_synchronize_moved_sha_comments_once() {
         .await,
         200
     );
-    let rec = mock.received_requests().await.unwrap();
-    let comments = posted_comments(&rec);
-    assert_eq!(comments.len(), 1, "challenge stays one POST: {comments:?}");
-    let patched = patched_comments(&rec);
+    let patched = wait_patched(&mock, 1).await;
     assert_eq!(patched.len(), 1, "{patched:?}");
     assert!(
         patched[0].contains("outdated") && patched[0].contains("/fight"),
@@ -634,18 +694,17 @@ async fn pr_synchronize_moved_sha_comments_once() {
         .await,
         200
     );
-    let rec = mock.received_requests().await.unwrap();
+    let comments = settle_posted(&mock).await;
+    let patched = settle_patched(&mock).await;
     assert_eq!(
-        posted_comments(&rec).len(),
+        comments.len(),
         1,
-        "outdated notice must not post again: {:?}",
-        posted_comments(&rec)
+        "outdated notice must not post again: {comments:?}"
     );
     assert_eq!(
-        patched_comments(&rec).len(),
+        patched.len(),
         1,
-        "outdated notice must not edit again: {:?}",
-        patched_comments(&rec)
+        "outdated notice must not edit again: {patched:?}"
     );
 }
 
@@ -687,7 +746,7 @@ async fn installation_rate_limit_skips_clone() {
         post_signed(addr, "issue_comment", "deliv-rate", &fight_body()).await,
         200
     );
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     assert!(
         comments.iter().any(|t| t.contains("too many fights")),
         "{comments:?}"
@@ -736,7 +795,7 @@ async fn pr_rate_limit_skips_clone() {
         post_signed(addr, "issue_comment", "deliv-pr-rate", &fight_body()).await,
         200
     );
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     assert!(
         comments
             .iter()
@@ -767,7 +826,7 @@ async fn each_hunk_stores_blamed_author_login() {
         post_signed(addr, "issue_comment", "deliv-hunks", &fight_body()).await,
         200
     );
-    let comments = posted_comments(&mock.received_requests().await.unwrap());
+    let comments = wait_posted(&mock, 1).await;
     let text = comments
         .iter()
         .find(|t| t.contains("/match/"))
