@@ -1868,6 +1868,26 @@ async fn slash_in_owner_does_not_clone() {
 }
 
 #[tokio::test]
+async fn unsafe_pr_shas_do_not_insert_a_match() {
+    let mock = github_mocks("--upload-pack=true", "HEAD", cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, PathBuf::from("/nonexistent"))).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-bad-sha", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments.iter().any(|t| t.contains("could not start")),
+        "{comments:?}"
+    );
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM matches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "unsafe SHAs must not insert a pending row");
+}
+
+#[tokio::test]
 async fn edited_fight_comment_starts_challenge() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;

@@ -623,6 +623,11 @@ pub fn is_safe_rev(rev: &str) -> bool {
     (8..=64).contains(&n) && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// GitHub commit SHAs are 40 hex chars. Shorter or option-like values never reach git.
+pub fn is_github_sha(rev: &str) -> bool {
+    rev.len() == 40 && is_safe_rev(rev)
+}
+
 fn looks_like_test(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains("test") || lower.contains("spec")
@@ -977,7 +982,10 @@ mod tests {
         assert!(looks_like_test("web/spec/a.ts"));
         assert!(!looks_like_test("src/lib.rs"));
         assert!(is_safe_rev("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(is_github_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!is_github_sha("aaaaaaaa"));
         assert!(!is_safe_rev("HEAD"));
+        assert!(!is_github_sha("HEAD"));
         assert!(!is_safe_rev("../main"));
         assert!(!is_safe_rev("--upload-pack=true"));
         assert!(!is_safe_rev("-C"));

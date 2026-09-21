@@ -418,7 +418,9 @@ impl GitHub {
         if !got.eq_ignore_ascii_case(sha) {
             return None;
         }
-        row.author.and_then(|a| a.login)
+        row.author
+            .and_then(|a| a.login)
+            .filter(|l| is_safe_github_name(l))
     }
 
     pub async fn login_for_email(
@@ -468,7 +470,11 @@ impl GitHub {
         let rows: Vec<Row> = json_capped(res, MAX_COMMITS_JSON).await?;
         for row in rows {
             if row.commit.author.and_then(|a| a.email).as_deref() == Some(email) {
-                if let Some(login) = row.author.and_then(|a| a.login) {
+                if let Some(login) = row
+                    .author
+                    .and_then(|a| a.login)
+                    .filter(|l| is_safe_github_name(l))
+                {
                     return Some(login);
                 }
             }
@@ -525,6 +531,9 @@ impl GitHub {
             login: String,
         }
         let user: User = user_res.json().await.map_err(|e| e.to_string())?;
+        if !is_safe_github_name(&user.login) {
+            return Err("bad login".into());
+        }
         Ok((user.id, user.login))
     }
 

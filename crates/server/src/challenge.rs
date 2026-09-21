@@ -108,6 +108,12 @@ pub async fn start_challenge(
         None => return Ok(note("could not determine mergeability")),
         Some(false) => {}
     }
+    if !gitutil::is_github_sha(&pr.head.sha)
+        || !gitutil::is_github_sha(&pr.base.sha)
+        || !crate::gh::is_safe_github_name(&pr.user.login)
+    {
+        return Ok(note("git fight could not start"));
+    }
 
     let ours_login = pr.user.login.clone();
     let id = uuid::Uuid::new_v4().simple().to_string();
