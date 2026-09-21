@@ -937,7 +937,7 @@ async fn unfinished_match_has_no_replay() {
 
 #[tokio::test]
 async fn pending_match_expires_without_result() {
-    let dir = std::env::temp_dir().join(format!("git-fight-exp-{}", std::process::id()));
+    let dir = git_fight_server::test_tmp_dir("git-fight-exp");
     std::fs::create_dir_all(&dir).unwrap();
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
@@ -1437,10 +1437,16 @@ async fn spawn_server(cfg: Config) -> std::net::SocketAddr {
 }
 
 fn uuid_like() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (std::process::id() as u64).wrapping_shl(32)
+        ^ (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64)
 }
 
 async fn play(addr: std::net::SocketAddr, id: &str, token: &str, is_ours: bool) -> u64 {

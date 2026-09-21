@@ -202,15 +202,7 @@ async fn cpu_side_without_login_is_skipped() {
 
 #[tokio::test]
 async fn leaderboard_and_badge_http() {
-    let dir = std::env::temp_dir().join(format!(
-        "gf-lb-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = git_fight_server::test_tmp_dir("gf-lb");
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     seed(&pool, "m7", Some("alice"), Some("bob"), "acme", "box").await;
@@ -289,15 +281,7 @@ async fn leaderboard_and_badge_http() {
 
 #[tokio::test]
 async fn live_match_records_stats() {
-    let dir = std::env::temp_dir().join(format!(
-        "gf-live-stats-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = git_fight_server::test_tmp_dir("gf-live-stats");
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     seed(&pool, MATCH_ID, Some("alice"), Some("bob"), "acme", "box").await;

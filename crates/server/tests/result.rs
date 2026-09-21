@@ -746,15 +746,7 @@ async fn expired_pending_match_comments_and_skips_push() {
     let (_keep, bare, head, base) = conflict_bare();
     let before = heads(&bare);
     let mock = github_mocks(&head, &base).await;
-    let dir = std::env::temp_dir().join(format!(
-        "gf-expire-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = git_fight_server::test_tmp_dir("gf-expire");
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     seed_match(&pool, &head, &base, None).await;
@@ -929,15 +921,7 @@ async fn our_result_commit_is_success_on_retry() {
 async fn unpublished_finished_match_is_pushed_on_boot() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base).await;
-    let dir = std::env::temp_dir().join(format!(
-        "gf-unpub-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = git_fight_server::test_tmp_dir("gf-unpub");
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     seed_match(&pool, &head, &base, Some("ours")).await;
@@ -1039,15 +1023,7 @@ async fn plumbing_hash_object_write_tree_commit() {
 async fn live_match_vs_cpu_pushes_after_last_round() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base).await;
-    let dir = std::env::temp_dir().join(format!(
-        "gf-res-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = git_fight_server::test_tmp_dir("gf-res");
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     seed_match(&pool, &head, &base, None).await;

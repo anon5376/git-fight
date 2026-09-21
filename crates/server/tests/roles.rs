@@ -25,15 +25,7 @@ async fn spawn() -> (std::net::SocketAddr, sqlx::SqlitePool) {
 }
 
 async fn spawn_cfg(cfg: Config) -> (std::net::SocketAddr, sqlx::SqlitePool) {
-    let dir = std::env::temp_dir().join(format!(
-        "gf-roles-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = git_fight_server::test_tmp_dir("gf-roles");
     let db = format!("sqlite://{}/m.db", dir.display());
     let pool = git_fight_server::db_connect(&db).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
