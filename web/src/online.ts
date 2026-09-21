@@ -442,12 +442,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       if (myGen !== gen || finished) {
         return;
       }
+      // Hello or Error owns the banner. A TCP open during clone must not
+      // flash "waiting for opponent…" over preparing/connecting.
       if (preparing) {
         ui.wait.textContent = "preparing match…";
-        return;
-      }
-      if (ui.wait.textContent === "connecting…" || ui.wait.textContent === "disconnected — reconnecting") {
-        ui.wait.textContent = "waiting for opponent…";
       }
     });
     socket.addEventListener("close", () => {

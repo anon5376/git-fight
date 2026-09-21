@@ -37,6 +37,7 @@ function attachGithubMatch(
   matchId: string,
   theirs: { kind: "cpu" | "github" | "mirror"; login: string | null },
   hunks?: GithubHunk[],
+  prNumber = 0,
 ): void {
   const oursLogin = theirs.kind === "mirror" ? (theirs.login ?? "alice") : "alice";
   const oursKind = theirs.kind === "mirror" ? "mirror" : "github";
@@ -55,7 +56,7 @@ UPDATE matches SET
   ours_login = ${sqlStr(oursLogin)}, theirs_login = ${sqlStr(theirs.login)},
   ours_name = '${oursLogin}', theirs_name = '${rounds[0]?.name ?? "bob"}',
   ours_kind = '${oursKind}', theirs_kind = '${theirs.kind}',
-  owner = 'acme', repo = 'box', pr_number = 0
+  owner = 'acme', repo = 'box', pr_number = ${prNumber}
 WHERE id = '${matchId}';
 DELETE FROM match_inputs WHERE match_id = '${matchId}';
 DELETE FROM match_hunks WHERE match_id = '${matchId}';
@@ -320,7 +321,11 @@ test("mirror GitHub session plays both slots with 2P keys", async ({ context, pa
   expect(ticks.some((t) => t[1] === 1)).toBeTruthy();
 });
 
-test("preparing PR match stays on preparing, not reconnecting", async ({ page, request }) => {
+test("preparing PR match stays on preparing until hunks exist", async ({
+  context,
+  page,
+  request,
+}) => {
   const matchId = await createMatch(request);
   execFileSync(
     "sqlite3",
@@ -331,6 +336,7 @@ test("preparing PR match stays on preparing, not reconnecting", async ({ page, r
     ],
     { stdio: "pipe" },
   );
+  await context.addCookies([sidCookie("sid-alice")]);
   await page.goto(`/match/${matchId}`);
   const wait = page.getByTestId("wait");
   await expect(wait).toContainText(/preparing match/i, { timeout: 10_000 });
@@ -339,6 +345,14 @@ test("preparing PR match stays on preparing, not reconnecting", async ({ page, r
   await expect(wait).not.toContainText(/reconnecting/i);
   await expect(wait).not.toContainText(/reloading/i);
   await expect(wait).not.toContainText(/waiting for opponent/i);
+
+  attachGithubMatch(matchId, { kind: "cpu", login: null }, undefined, 1);
+  const stage = page.getByTestId("stage");
+  await expect(stage).toHaveAttribute("data-role", "ours", { timeout: 10_000 });
+  await expect(stage).toHaveAttribute("data-you-are", "alice");
+  await expect(stage).toHaveAttribute("data-path", /a\.rs|b\.rs/);
+  await expect(wait).not.toContainText(/preparing match/i);
+  await expect(wait).not.toContainText(/reconnecting/i);
 });
 
 test("expired match shows expiry and does not reconnect", async ({ page, request }) => {

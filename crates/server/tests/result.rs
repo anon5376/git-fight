@@ -89,6 +89,43 @@ fn conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     (tmp, bare, head, base)
 }
 
+fn two_hunk_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("lib.rs"), "fn a() { 0 }\nfn b() { 0 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::write(work.join("lib.rs"), "fn a() { 1 }\nfn b() { 3 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("lib.rs"), "fn a() { 2 }\nfn b() { 4 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 async fn github_mocks(head: &str, base: &str) -> MockServer {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
@@ -307,6 +344,103 @@ async fn theirs_win_keeps_base_side() {
     let branch = format!("git-fight/pr-1-{MATCH_ID}");
     let blob = git_dir(&bare, &["show", &format!("{branch}:lib.rs")]);
     assert_eq!(blob, "fn v() { 3 }");
+}
+
+#[tokio::test]
+async fn two_hunks_in_one_file_push_each_pick() {
+    use git_fight_core::{ConflictFile, Pick};
+    const ID: &str = "cafe0002cafe0002cafe0002cafe0002";
+    let (_keep, bare, head, base) = two_hunk_conflict_bare();
+    let work = tempfile::tempdir().unwrap();
+    let clone = work.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head).await.unwrap();
+    assert_eq!(code, 1);
+    let collected = gitutil::collect_hunks(&clone, &tree, &base, &paths)
+        .await
+        .unwrap();
+    assert_eq!(collected.len(), 2, "expected two fightable hunks in lib.rs");
+    assert!(collected.iter().all(|h| h.path == "lib.rs"));
+
+    let mock = github_mocks(&head, &base).await;
+    let pool = pool().await;
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: ID.into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: Some("alice".into()),
+            theirs_login: None,
+            ours_token: "o".into(),
+            theirs_token: "t".into(),
+            expire_secs: 3600,
+            installation_id: Some(1),
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: 1,
+            pr_head_sha: head.clone(),
+            pr_base_sha: base.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    for (round, h) in collected.iter().enumerate() {
+        git_fight_server::db::insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: ID,
+                round: round as i64,
+                path: &h.path,
+                hunk_index: h.hunk_index as i64,
+                ours: &h.ours,
+                theirs: &h.theirs,
+                base: &h.base,
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: Default::default(),
+                theirs_stats: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let winner = if round == 0 { "ours" } else { "theirs" };
+        git_fight_server::db::set_hunk_winner(&pool, ID, round as i64, winner)
+            .await
+            .unwrap();
+    }
+    let ctx = ctx(pool.clone(), &mock, bare.clone());
+    git_fight_server::publish_result(&ctx, ID).await.unwrap();
+
+    let branch = format!("git-fight/pr-1-{ID}");
+    assert!(
+        heads(&bare)
+            .iter()
+            .any(|r| r == &format!("refs/heads/{branch}")),
+        "missing {branch} in {:?}",
+        heads(&bare)
+    );
+    let merge_blob = gitutil::cat_blob(&clone, &format!("{tree}:lib.rs"))
+        .await
+        .unwrap();
+    let parsed = ConflictFile::parse(&merge_blob).unwrap();
+    assert_eq!(parsed.hunk_count(), 2);
+    let expected = parsed.resolve(&[Some(Pick::Theirs), Some(Pick::Ours)]);
+    let blob = git_dir(&bare, &["show", &format!("{branch}:lib.rs")]);
+    assert_eq!(blob, String::from_utf8_lossy(&expected).trim(), "{blob}");
+    let msg = git_dir(&bare, &["log", "-1", "--format=%s%n%b", &branch]);
+    assert!(msg.contains("round 1"), "{msg}");
+    assert!(msg.contains("round 2"), "{msg}");
+    let row = git_fight_server::db::get_match(&pool, ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.result_branch.as_deref(), Some(branch.as_str()));
 }
 
 #[tokio::test]
