@@ -644,7 +644,11 @@ async fn expire_now(
         return;
     }
     if let (Some(ctx), Some(row)) = (result, row.as_ref()) {
-        result::comment_expired(ctx, row).await;
+        let ctx = ctx.clone();
+        let row = row.clone();
+        tokio::spawn(async move {
+            result::comment_expired(&ctx, &row).await;
+        });
     }
     let msg = encode(&ServerMsg::Error {
         message: "expired".into(),

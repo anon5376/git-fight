@@ -45,8 +45,15 @@ impl std::fmt::Display for GitError {
     }
 }
 
+/// Git PATH_MAX is typically 4096. A 2 MiB merge-tree path must not reach Hello or argv.
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_PATH_COMPONENT: usize = 255;
+const MAX_AUTHOR_NAME: usize = 256;
+const MAX_AUTHOR_EMAIL: usize = 254;
+
 pub fn is_safe_path(path: &str) -> bool {
     if path.is_empty()
+        || path.len() > MAX_PATH_BYTES
         || path.starts_with('/')
         || path.starts_with('\\')
         || path.starts_with('-')
@@ -64,7 +71,8 @@ pub fn is_safe_path(path: &str) -> bool {
                 let Some(t) = s.to_str() else {
                     return false;
                 };
-                if t == ".git" || t.is_empty() || t.starts_with('-') {
+                if t == ".git" || t.is_empty() || t.len() > MAX_PATH_COMPONENT || t.starts_with('-')
+                {
                     return false;
                 }
             }
@@ -72,6 +80,36 @@ pub fn is_safe_path(path: &str) -> bool {
         }
     }
     true
+}
+
+fn clip_author_name(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() || t.len() > MAX_AUTHOR_NAME || t.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        "theirs".into()
+    } else {
+        t.to_string()
+    }
+}
+
+fn clip_author_email(s: &str) -> String {
+    let t = s.trim();
+    if !(3..=MAX_AUTHOR_EMAIL).contains(&t.len())
+        || !t.contains('@')
+        || t.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        String::new()
+    } else {
+        t.to_string()
+    }
+}
+
+fn sanitize_blame(name: String, email: String, sha: String) -> (String, String, String) {
+    let sha = if is_safe_rev(&sha) {
+        sha
+    } else {
+        String::new()
+    };
+    (clip_author_name(&name), clip_author_email(&email), sha)
 }
 
 fn ssl_ca_bundle() -> Option<&'static str> {
@@ -720,7 +758,7 @@ fn parse_blame_author(porcelain: &[u8]) -> (String, String, String) {
     if name.is_empty() {
         name = "theirs".into();
     }
-    (name, email, sha)
+    sanitize_blame(name, email, sha)
 }
 
 async fn fallback_author(
@@ -740,7 +778,7 @@ async fn fallback_author(
         let name = lines.next().unwrap_or("theirs").to_string();
         let email = lines.next().unwrap_or("").to_string();
         let sha = lines.next().unwrap_or(base_sha).to_string();
-        return (name, email, sha);
+        return sanitize_blame(name, email, sha);
     }
     ("theirs".into(), String::new(), base_sha.into())
 }
@@ -776,11 +814,11 @@ pub async fn latest_author(
     if code != 0 {
         return None;
     }
-    let name = String::from_utf8_lossy(&out).trim().to_string();
-    if name.is_empty() {
+    let raw = String::from_utf8_lossy(&out);
+    if raw.trim().is_empty() {
         None
     } else {
-        Some(name)
+        Some(clip_author_name(&raw))
     }
 }
 
@@ -814,7 +852,7 @@ async fn hp_from_blame(dir: &Path, rev: &str, path: &str, name: &str, bearer: Op
     for line in text.lines() {
         if let Some(author) = line.strip_prefix("author ") {
             total += 1;
-            if author == name {
+            if clip_author_name(author) == clip_author_name(name) {
                 mine += 1;
             }
         }
@@ -1218,8 +1256,28 @@ mod tests {
         assert!(!is_safe_path("src/\nlib.rs"));
         assert!(!is_safe_path("-dash.rs"));
         assert!(!is_safe_path("src/-opt.rs"));
+        assert!(!is_safe_path(&"a".repeat(256)));
+        assert!(!is_safe_path(&format!("src/{}", "b".repeat(256))));
+        assert!(!is_safe_path(&"c".repeat(4097)));
+        assert!(is_safe_path(&"d".repeat(255)));
         assert!(is_safe_path("src/lib.rs"));
         assert!(is_safe_path("a/b.c"));
+    }
+
+    #[test]
+    fn blame_author_is_length_capped() {
+        let sha = "a".repeat(40);
+        let mut porcelain = format!("{sha} 1 1 1\nauthor ").into_bytes();
+        porcelain.extend(std::iter::repeat_n(b'x', 300));
+        porcelain.extend(b"\nauthor-mail <ok@example.com>\n");
+        let (name, email, got) = parse_blame_author(&porcelain);
+        assert_eq!(name, "theirs");
+        assert_eq!(email, "ok@example.com");
+        assert_eq!(got, sha);
+        let short = format!("{sha} 1 1 1\nauthor Ada\nauthor-mail <ada@ex.com>\n");
+        let (name, email, _) = parse_blame_author(short.as_bytes());
+        assert_eq!(name, "Ada");
+        assert_eq!(email, "ada@ex.com");
     }
 
     #[test]

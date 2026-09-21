@@ -227,12 +227,15 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
             iv.tick().await;
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
                 for id in ids {
-                    if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
-                        if row.status == "expired" {
-                            crate::result::comment_expired(&expirer.result_ctx(), &row).await;
-                        }
-                    }
                     expirer.close_room(&id).await;
+                    let expirer = expirer.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
+                            if row.status == "expired" {
+                                crate::result::comment_expired(&expirer.result_ctx(), &row).await;
+                            }
+                        }
+                    });
                 }
             }
             expirer.retry_unpublished();
