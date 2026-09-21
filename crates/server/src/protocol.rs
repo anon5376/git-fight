@@ -74,6 +74,7 @@ pub fn role_for(
 /// Whether this socket may put `Input` on the room queue.
 /// GitHub: session login is ours, match theirs, or any hunk theirs (later rounds).
 /// Local: a non-empty share token that owns a slot. Spectators never enqueue.
+#[allow(clippy::too_many_arguments)]
 pub fn can_enqueue_input(
     github: bool,
     ours_login: Option<&str>,
@@ -91,7 +92,7 @@ pub fn can_enqueue_input(
         if ours_login == Some(login) || match_theirs_login == Some(login) {
             return true;
         }
-        return hunk_theirs_logins.iter().any(|h| *h == login);
+        return hunk_theirs_logins.contains(&login);
     }
     role_for(false, None, None, login, token, ours_token, theirs_token) != Role::Spectator
 }
