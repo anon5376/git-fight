@@ -72,7 +72,7 @@ impl Config {
             return Err("GIT_FIGHT_PUBLIC_URL");
         }
         if let Some(gh) = &self.github {
-            if !gh.endpoints_are_safe() {
+            if !gh.endpoints_are_github() {
                 return Err("GITHUB_API_URL");
             }
         }
@@ -585,6 +585,15 @@ mod tests {
         );
         cfg.auth.public_url = "https://fight.example".into();
         assert!(cfg.require_live_github_secrets().is_ok());
+        cfg.github = Some(GitHub::new(
+            "https://evil.example".into(),
+            "https://github.com".into(),
+            1,
+            include_str!("../tests/fixtures/app_key.txt").into(),
+            "cid".into(),
+            "csec".into(),
+        ));
+        assert_eq!(cfg.require_live_github_secrets(), Err("GITHUB_API_URL"));
         cfg.github = Some(GitHub::new(
             "http://evil.example".into(),
             "https://github.com".into(),

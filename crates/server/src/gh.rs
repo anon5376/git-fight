@@ -81,6 +81,13 @@ impl GitHub {
         is_safe_github_endpoint(&self.api_base) && is_safe_github_endpoint(&self.oauth_base)
     }
 
+    /// Production talks only to github.com, not an arbitrary HTTPS host.
+    pub fn endpoints_are_github(&self) -> bool {
+        self.endpoints_are_safe()
+            && is_github_dot_com_api(&self.api_base)
+            && is_github_dot_com_oauth(&self.oauth_base)
+    }
+
     fn encoding_key(&self) -> Result<EncodingKey, String> {
         EncodingKey::from_rsa_pem(self.pem.as_bytes()).map_err(|e| e.to_string())
     }
@@ -630,6 +637,14 @@ pub fn is_safe_github_endpoint(url: &str) -> bool {
     host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
+fn is_github_dot_com_api(url: &str) -> bool {
+    url.trim().trim_end_matches('/') == "https://api.github.com"
+}
+
+fn is_github_dot_com_oauth(url: &str) -> bool {
+    url.trim().trim_end_matches('/') == "https://github.com"
+}
+
 /// GitHub owner or repo name. Used in clone URLs and API paths — never a slash or host.
 pub fn is_safe_github_name(s: &str) -> bool {
     let n = s.len();
@@ -728,5 +743,10 @@ mod tests {
         assert!(!is_safe_github_endpoint("http://api.github.com"));
         assert!(!is_safe_github_endpoint("https://evil@api.github.com"));
         assert!(!is_safe_github_endpoint("ftp://api.github.com"));
+        assert!(is_github_dot_com_api("https://api.github.com"));
+        assert!(is_github_dot_com_oauth("https://github.com"));
+        assert!(!is_github_dot_com_api("https://evil.example"));
+        assert!(!is_github_dot_com_oauth("https://api.github.com"));
+        assert!(!is_github_dot_com_api("http://api.github.com"));
     }
 }

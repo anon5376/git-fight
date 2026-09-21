@@ -36,6 +36,7 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -107,7 +108,8 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             theirs_hp INTEGER NOT NULL DEFAULT 100,
             theirs_armor INTEGER NOT NULL DEFAULT 0,
             theirs_special INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (match_id, round_index)
+            PRIMARY KEY (match_id, round_index),
+            FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
     )
     .execute(pool)
@@ -123,6 +125,7 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         let q = format!("ALTER TABLE match_hunks ADD COLUMN {col} {ty}");
         let _ = sqlx::query(&q).execute(pool).await;
     }
+    ensure_match_hunks_fk(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -137,8 +140,18 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
             delivery_id TEXT PRIMARY KEY,
-            received_at TEXT NOT NULL
+            received_at TEXT NOT NULL,
+            body_hash TEXT NOT NULL
         )",
+    )
+    .execute(pool)
+    .await?;
+    let _ = sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN body_hash TEXT")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS webhook_deliveries_body_hash
+         ON webhook_deliveries(body_hash)",
     )
     .execute(pool)
     .await?;
@@ -166,46 +179,134 @@ async fn ensure_match_inputs(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     .fetch_optional(pool)
     .await?;
     if exists.is_none() {
-        sqlx::query(
-            "CREATE TABLE match_inputs (
-                match_id TEXT NOT NULL,
-                round_index INTEGER NOT NULL,
-                tick INTEGER NOT NULL,
-                ours INTEGER NOT NULL,
-                theirs INTEGER NOT NULL,
-                PRIMARY KEY (match_id, round_index, tick)
-            )",
-        )
-        .execute(pool)
-        .await?;
+        sqlx::query(MATCH_INPUTS_DDL).execute(pool).await?;
         return Ok(());
     }
     let cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('match_inputs')")
         .fetch_all(pool)
         .await?;
-    if cols.iter().any(|(n,)| n == "round_index") {
+    if !cols.iter().any(|(n,)| n == "round_index") {
+        sqlx::query(
+            "CREATE TABLE match_inputs_v2 (
+                match_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                tick INTEGER NOT NULL,
+                ours INTEGER NOT NULL,
+                theirs INTEGER NOT NULL,
+                PRIMARY KEY (match_id, round_index, tick),
+                FOREIGN KEY (match_id) REFERENCES matches(id)
+            )",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO match_inputs_v2 (match_id, round_index, tick, ours, theirs)
+             SELECT match_id, 0, tick, ours, theirs FROM match_inputs",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("DROP TABLE match_inputs").execute(pool).await?;
+        sqlx::query("ALTER TABLE match_inputs_v2 RENAME TO match_inputs")
+            .execute(pool)
+            .await?;
+        return Ok(());
+    }
+    ensure_match_inputs_fk(pool).await
+}
+
+const MATCH_INPUTS_DDL: &str = "CREATE TABLE match_inputs (
+                match_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                tick INTEGER NOT NULL,
+                ours INTEGER NOT NULL,
+                theirs INTEGER NOT NULL,
+                PRIMARY KEY (match_id, round_index, tick),
+                FOREIGN KEY (match_id) REFERENCES matches(id)
+            )";
+
+async fn fk_count(pool: &Pool<Sqlite>, table: &'static str) -> Result<i64, sqlx::Error> {
+    let sql = match table {
+        "match_hunks" => "SELECT COUNT(*) FROM pragma_foreign_key_list('match_hunks')",
+        "match_inputs" => "SELECT COUNT(*) FROM pragma_foreign_key_list('match_inputs')",
+        _ => unreachable!("known schema table"),
+    };
+    let (n,): (i64,) = sqlx::query_as(sql).fetch_one(pool).await?;
+    Ok(n)
+}
+
+async fn ensure_match_inputs_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    if fk_count(pool, "match_inputs").await? > 0 {
         return Ok(());
     }
     sqlx::query(
-        "CREATE TABLE match_inputs_v2 (
+        "CREATE TABLE match_inputs_fk (
+                match_id TEXT NOT NULL,
+                round_index INTEGER NOT NULL,
+                tick INTEGER NOT NULL,
+                ours INTEGER NOT NULL,
+                theirs INTEGER NOT NULL,
+                PRIMARY KEY (match_id, round_index, tick),
+                FOREIGN KEY (match_id) REFERENCES matches(id)
+            )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO match_inputs_fk (match_id, round_index, tick, ours, theirs)
+         SELECT match_id, round_index, tick, ours, theirs FROM match_inputs",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("DROP TABLE match_inputs").execute(pool).await?;
+    sqlx::query("ALTER TABLE match_inputs_fk RENAME TO match_inputs")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn ensure_match_hunks_fk(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    if fk_count(pool, "match_hunks").await? > 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "CREATE TABLE match_hunks_fk (
             match_id TEXT NOT NULL,
             round_index INTEGER NOT NULL,
-            tick INTEGER NOT NULL,
-            ours INTEGER NOT NULL,
-            theirs INTEGER NOT NULL,
-            PRIMARY KEY (match_id, round_index, tick)
+            path TEXT NOT NULL,
+            hunk_index INTEGER NOT NULL,
+            ours_bytes BLOB,
+            theirs_bytes BLOB,
+            base_bytes BLOB,
+            theirs_login TEXT,
+            theirs_name TEXT,
+            winner TEXT,
+            ours_hp INTEGER NOT NULL DEFAULT 100,
+            ours_armor INTEGER NOT NULL DEFAULT 0,
+            ours_special INTEGER NOT NULL DEFAULT 0,
+            theirs_hp INTEGER NOT NULL DEFAULT 100,
+            theirs_armor INTEGER NOT NULL DEFAULT 0,
+            theirs_special INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (match_id, round_index),
+            FOREIGN KEY (match_id) REFERENCES matches(id)
         )",
     )
     .execute(pool)
     .await?;
     sqlx::query(
-        "INSERT INTO match_inputs_v2 (match_id, round_index, tick, ours, theirs)
-         SELECT match_id, 0, tick, ours, theirs FROM match_inputs",
+        "INSERT INTO match_hunks_fk (
+            match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
+            theirs_login, theirs_name, winner,
+            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
+         )
+         SELECT match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
+            theirs_login, theirs_name, winner,
+            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
+         FROM match_hunks",
     )
     .execute(pool)
     .await?;
-    sqlx::query("DROP TABLE match_inputs").execute(pool).await?;
-    sqlx::query("ALTER TABLE match_inputs_v2 RENAME TO match_inputs")
+    sqlx::query("DROP TABLE match_hunks").execute(pool).await?;
+    sqlx::query("ALTER TABLE match_hunks_fk RENAME TO match_hunks")
         .execute(pool)
         .await?;
     Ok(())
@@ -635,12 +736,18 @@ pub fn github_identity(row: &MatchRow, hunks: &[HunkRow]) -> bool {
         || hunks.iter().any(|h| h.theirs_login.is_some())
 }
 
-pub async fn record_delivery(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+pub async fn record_delivery(
+    pool: &SqlitePool,
+    id: &str,
+    body_hash: &str,
+) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
-        "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, received_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, received_at, body_hash)
+         VALUES (?, ?, ?)",
     )
     .bind(id)
     .bind(Utc::now().to_rfc3339())
+    .bind(body_hash)
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
@@ -1146,5 +1253,49 @@ mod tests {
         let live = list_live_matches(&pool).await.unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, "nohunks");
+    }
+
+    fn is_fk(err: &sqlx::Error) -> bool {
+        err.as_database_error()
+            .map(|e| e.message().to_ascii_uppercase().contains("FOREIGN KEY"))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn hunks_and_inputs_need_a_match_row() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let err = insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "missing",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(is_fk(&err), "{err}");
+        let err = insert_input(&pool, "missing", 0, 0, 1, 2)
+            .await
+            .unwrap_err();
+        assert!(is_fk(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delivery_dedup_by_id_and_body_hash() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        assert!(record_delivery(&pool, "d1", "hash-a").await.unwrap());
+        assert!(!record_delivery(&pool, "d1", "hash-a").await.unwrap());
+        assert!(!record_delivery(&pool, "d2", "hash-a").await.unwrap());
+        assert!(record_delivery(&pool, "d2", "hash-b").await.unwrap());
+        assert!(!record_delivery(&pool, "d3", "hash-b").await.unwrap());
     }
 }

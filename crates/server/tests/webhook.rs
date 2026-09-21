@@ -878,6 +878,44 @@ async fn invalid_signature_is_401() {
 }
 
 #[tokio::test]
+async fn missing_or_junk_delivery_is_400() {
+    let addr = spawn(Config {
+        webhook_secret: Some(SECRET.to_vec()),
+        ..Config::default()
+    })
+    .await;
+    let body = b"{\"action\":\"created\"}";
+    let sig = sig::signature_header(SECRET, body);
+    let (status, _) = http(
+        addr,
+        "POST",
+        "/webhooks/github",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", &sig),
+            ("X-GitHub-Event", "issue_comment"),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = http(
+        addr,
+        "POST",
+        "/webhooks/github",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", &sig),
+            ("X-GitHub-Event", "issue_comment"),
+            ("X-GitHub-Delivery", "../main"),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
 async fn valid_fight_comments_challenge() {
     let (_keep, bare, head, base) = conflict_bare();
     let mock = github_mocks(&head, &base, cpu_opts()).await;
@@ -1461,6 +1499,34 @@ async fn duplicate_delivery_is_ignored() {
         later.len(),
         1,
         "replayed delivery started a second fight: {later:?}"
+    );
+    assert!(
+        comments.iter().any(|t| t.contains("/match/")),
+        "{comments:?}"
+    );
+}
+
+#[tokio::test]
+async fn same_body_new_delivery_is_ignored() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let addr = spawn(cfg_for(&mock, bare)).await;
+    let body = fight_body();
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-hash-a", &body).await,
+        200
+    );
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-hash-b", &body).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let later = posted_comments(&mock.received_requests().await.unwrap_or_default());
+    assert_eq!(
+        later.len(),
+        1,
+        "replayed body with a new delivery started a second fight: {later:?}"
     );
     assert!(
         comments.iter().any(|t| t.contains("/match/")),

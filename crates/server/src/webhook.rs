@@ -7,6 +7,17 @@ use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::StatusCode as HttpStatus;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+/// GitHub's `X-GitHub-Delivery` is a UUID. Reject junk so the PK cannot be a path.
+fn is_delivery_id(s: &str) -> bool {
+    let n = s.len();
+    (1..=128).contains(&n) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn payload_hash(body: &[u8]) -> String {
+    hex::encode(Sha256::digest(body))
+}
 
 pub async fn github_webhook(State(state): State<crate::app::AppState>, req: Request) -> HttpStatus {
     let Some(secret) = state.webhook_secret.as_ref() else {
@@ -35,14 +46,15 @@ pub async fn github_webhook(State(state): State<crate::app::AppState>, req: Requ
         .headers
         .get("X-GitHub-Delivery")
         .or_else(|| parts.headers.get("x-github-delivery"))
-        .and_then(|v| v.to_str().ok());
-
-    if let Some(id) = delivery {
-        match db::record_delivery(&state.pool, id).await {
-            Ok(false) => return HttpStatus::OK,
-            Ok(true) => {}
-            Err(_) => return HttpStatus::INTERNAL_SERVER_ERROR,
-        }
+        .and_then(|v| v.to_str().ok())
+        .filter(|id| is_delivery_id(id));
+    let Some(id) = delivery else {
+        return HttpStatus::BAD_REQUEST;
+    };
+    match db::record_delivery(&state.pool, id, &payload_hash(&body)).await {
+        Ok(false) => return HttpStatus::OK,
+        Ok(true) => {}
+        Err(_) => return HttpStatus::INTERNAL_SERVER_ERROR,
     }
 
     let payload: Hook = match serde_json::from_slice(&body) {

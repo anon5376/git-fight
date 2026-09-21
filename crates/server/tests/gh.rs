@@ -430,3 +430,115 @@ async fn github_http_does_not_follow_redirects() {
     let gh = client(&mock);
     assert!(gh.get_repo(1, "acme", "box").await.is_err());
 }
+
+async fn read_http1_request(sock: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let mut tmp = [0u8; 2048];
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = &buf[..pos];
+            let mut content_length = 0usize;
+            for line in headers.split(|&b| b == b'\n') {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let Ok(s) = std::str::from_utf8(line) else {
+                    continue;
+                };
+                if let Some((k, v)) = s.split_once(':') {
+                    if k.eq_ignore_ascii_case("content-length") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let need = header_end + content_length;
+            while buf.len() < need {
+                let mut tmp = [0u8; 2048];
+                let n = sock.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            return Ok(buf);
+        }
+        if buf.len() > 64 * 1024 {
+            return Ok(buf);
+        }
+    }
+}
+
+async fn write_chunked(
+    sock: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    sock.write_all(
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await?;
+    for chunk in body.chunks(512) {
+        sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await?;
+        sock.write_all(chunk).await?;
+        sock.write_all(b"\r\n").await?;
+    }
+    sock.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+async fn serve_chunked_token(body: String) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_http1_request(&mut sock).await;
+        let _ = write_chunked(&mut sock, 201, "Created", body.as_bytes()).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn installation_token_parses_chunked_json_without_content_length() {
+    let body = r#"{"token":"ghs_chunked","expires_at":"2099-01-01T00:00:00Z"}"#.to_string();
+    let base = serve_chunked_token(body).await;
+    let gh = GitHub::new(
+        base.clone(),
+        base,
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert_eq!(gh.installation_token(1).await.unwrap(), "ghs_chunked");
+}
+
+#[tokio::test]
+async fn installation_token_caps_chunked_json_without_content_length() {
+    let huge = format!(
+        r#"{{"token":"{}","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        "a".repeat(32 * 1024)
+    );
+    let base = serve_chunked_token(huge).await;
+    let gh = GitHub::new(
+        base.clone(),
+        base,
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(gh.installation_token(1).await.is_err());
+}
