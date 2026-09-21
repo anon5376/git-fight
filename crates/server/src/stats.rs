@@ -8,11 +8,7 @@ use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 
 pub fn is_github_segment(s: &str) -> bool {
-    let n = s.len();
-    (1..=64).contains(&n)
-        && !s.contains("..")
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    crate::gh::is_safe_github_name(s)
 }
 
 pub async fn record_round(
@@ -268,6 +264,11 @@ mod tests {
         assert!(!is_github_segment("../main"));
         assert!(!is_github_segment("a/b"));
         assert!(!is_github_segment("a b"));
+        assert!(
+            is_github_segment(&"r".repeat(100)),
+            "GitHub repos are up to 100"
+        );
+        assert!(!is_github_segment(&"r".repeat(101)));
     }
 
     #[test]
