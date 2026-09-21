@@ -279,6 +279,87 @@ async fn more_than_fifteen_hunks_is_too_many() {
     }
 }
 
+fn many_paths_bare(n: usize) -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    for i in 0..n {
+        std::fs::write(
+            work.join(format!("f{i}.rs")),
+            format!("fn f{i}() {{ 0 }}\n"),
+        )
+        .unwrap();
+    }
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    for i in 0..n {
+        std::fs::write(
+            work.join(format!("f{i}.rs")),
+            format!("fn f{i}() {{ 1 }}\n"),
+        )
+        .unwrap();
+    }
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    for i in 0..n {
+        std::fs::write(
+            work.join(format!("f{i}.rs")),
+            format!("fn f{i}() {{ 2 }}\n"),
+        )
+        .unwrap();
+    }
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
+#[tokio::test]
+async fn too_many_conflicted_paths_skips_cat_file() {
+    let (_keep, bare, head, base) = many_paths_bare(40);
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let (tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
+    assert_eq!(code, 1);
+    assert!(paths.len() > 32, "{}", paths.len());
+    let started = std::time::Instant::now();
+    let err = gitutil::collect_hunks(&clone, &tree, &base, &paths, None)
+        .await
+        .unwrap_err();
+    match err {
+        gitutil::GitError::TooMany(n) => assert_eq!(n, paths.len()),
+        other => panic!("expected TooMany, got {other}"),
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "must not cat-file every conflicted path"
+    );
+}
+
 fn file_directory_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");

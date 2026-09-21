@@ -1,6 +1,6 @@
 //! Git plumbing with hooks disabled. Never a shell, never user-repo code.
 
-use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_HUNKS};
+use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_CONFLICT_PATHS, MAX_HUNKS};
 use git_fight_core::{ConflictFile, FighterStats};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -471,6 +471,9 @@ pub async fn collect_hunks(
 ) -> Result<Vec<FightHunk>, GitError> {
     if !is_safe_rev(tree) || !is_safe_rev(base_sha) {
         return Err(GitError::Command("unsafe revision".into()));
+    }
+    if paths.len() > MAX_CONFLICT_PATHS {
+        return Err(GitError::TooMany(paths.len()));
     }
     let mut out = Vec::new();
     for path in paths {

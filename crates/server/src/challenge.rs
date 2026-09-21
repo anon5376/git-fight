@@ -3,11 +3,12 @@
 use crate::db::{self, NewMatch};
 use crate::gh::GitHub;
 use crate::gitutil;
-use crate::limits::{MAX_HUNKS, MAX_REPO_KB};
+use crate::limits::{GIT_JOB_TIMEOUT, MAX_HUNKS, MAX_REPO_KB};
 use crate::protocol::INPUT_DELAY;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio::time::timeout;
 
 pub struct ChallengeCtx {
     pub gh: GitHub,
@@ -166,87 +167,129 @@ pub async fn start_challenge(
             Some(token),
         )
     };
-    // Clone/merge-tree/push only. Token fetch is HTTP and must not occupy a
-    // git worker, or a second /fight waits instead of seeing this row.
-    let _permit = match crate::limits::git_slots().acquire().await {
-        Ok(p) => p,
-        Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
-    };
-    if gitutil::clone_bare(&url, &dest, bearer.as_deref())
-        .await
-        .is_err()
-    {
-        return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-    }
-    if gitutil::fetch_pr_objects(
-        &dest,
-        number,
-        &pr.head.sha,
-        &pr.base.sha,
-        Some(pr.base.r#ref.as_str()),
-        bearer.as_deref(),
-    )
-    .await
-    .is_err()
-    {
-        return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-    }
-
-    let (tree, paths, code) =
-        match gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha, bearer.as_deref()).await {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-            }
+    // Clone/merge-tree/stats only. Token fetch and blamed-author HTTP must not
+    // occupy a git worker. The whole slot hold is capped so one repo cannot
+    // sit on clone then 10k cat-files.
+    let prepared = {
+        let _permit = match crate::limits::git_slots().acquire().await {
+            Ok(p) => p,
+            Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
         };
-    if code == 0 {
-        return Ok(abort_start(
-            &ctx.pool,
-            &id,
-            "no_conflicts",
-            "no conflicts to fight".into(),
-        )
-        .await);
-    }
+        match timeout(GIT_JOB_TIMEOUT, async {
+            if gitutil::clone_bare(&url, &dest, bearer.as_deref())
+                .await
+                .is_err()
+            {
+                return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+            }
+            if gitutil::fetch_pr_objects(
+                &dest,
+                number,
+                &pr.head.sha,
+                &pr.base.sha,
+                Some(pr.base.r#ref.as_str()),
+                bearer.as_deref(),
+            )
+            .await
+            .is_err()
+            {
+                return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+            }
 
-    let hunks =
-        match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths, bearer.as_deref()).await {
-            Ok(h) => h,
-            Err(gitutil::GitError::TooMany(n)) => {
-                return Ok(abort_start(
+            let (tree, paths, code) =
+                match gitutil::merge_tree(&dest, &pr.base.sha, &pr.head.sha, bearer.as_deref())
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+                    }
+                };
+            if code == 0 {
+                return Err(abort_start(
+                    &ctx.pool,
+                    &id,
+                    "no_conflicts",
+                    "no conflicts to fight".into(),
+                )
+                .await);
+            }
+
+            let hunks =
+                match gitutil::collect_hunks(&dest, &tree, &pr.base.sha, &paths, bearer.as_deref())
+                    .await
+                {
+                    Ok(h) => h,
+                    Err(gitutil::GitError::TooMany(n)) => {
+                        return Err(abort_start(
+                            &ctx.pool,
+                            &id,
+                            "too_many",
+                            format!("too many conflicts for one fight ({n}; max {MAX_HUNKS})"),
+                        )
+                        .await);
+                    }
+                    Err(gitutil::GitError::NothingToFight) => {
+                        return Err(abort_start(
+                            &ctx.pool,
+                            &id,
+                            "nothing",
+                            "the conflicts are not the kind git fight can play".into(),
+                        )
+                        .await);
+                    }
+                    Err(_) => {
+                        return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+                    }
+                };
+            if hunks.len() > MAX_HUNKS {
+                return Err(abort_start(
                     &ctx.pool,
                     &id,
                     "too_many",
-                    format!("too many conflicts for one fight ({n}; max {MAX_HUNKS})"),
+                    format!(
+                        "too many conflicts for one fight ({}; max {MAX_HUNKS})",
+                        hunks.len()
+                    ),
                 )
                 .await);
             }
-            Err(gitutil::GitError::NothingToFight) => {
-                return Ok(abort_start(
-                    &ctx.pool,
-                    &id,
-                    "nothing",
-                    "the conflicts are not the kind git fight can play".into(),
-                )
-                .await);
-            }
-            Err(_) => {
-                return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-            }
-        };
-    if hunks.len() > MAX_HUNKS {
-        return Ok(abort_start(
-            &ctx.pool,
-            &id,
-            "too_many",
-            format!(
-                "too many conflicts for one fight ({}; max {MAX_HUNKS})",
-                hunks.len()
-            ),
-        )
-        .await);
-    }
 
+            let mut stats = Vec::with_capacity(hunks.len());
+            for h in &hunks {
+                let ours_author =
+                    gitutil::latest_author(&dest, &pr.head.sha, &h.path, bearer.as_deref())
+                        .await
+                        .unwrap_or_else(|| ours_login.clone());
+                let ours_stats = gitutil::fighter_stats(
+                    &dest,
+                    &pr.head.sha,
+                    &h.path,
+                    &ours_author,
+                    bearer.as_deref(),
+                )
+                .await;
+                let theirs_stats = gitutil::fighter_stats(
+                    &dest,
+                    &pr.base.sha,
+                    &h.path,
+                    &h.blame_name,
+                    bearer.as_deref(),
+                )
+                .await;
+                stats.push((ours_stats, theirs_stats));
+            }
+            Ok((hunks, stats))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(start)) => return Ok(start),
+            Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
+        }
+    };
+
+    let (hunks, stats) = prepared;
     let mut login_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut sides: Vec<(String, String, Option<String>)> = Vec::new();
     for h in &hunks {
@@ -285,26 +328,7 @@ pub async fn start_challenge(
         return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
     }
 
-    for (round, h) in hunks.iter().enumerate() {
-        let ours_author = gitutil::latest_author(&dest, &pr.head.sha, &h.path, bearer.as_deref())
-            .await
-            .unwrap_or_else(|| ours_login.clone());
-        let ours_stats = gitutil::fighter_stats(
-            &dest,
-            &pr.head.sha,
-            &h.path,
-            &ours_author,
-            bearer.as_deref(),
-        )
-        .await;
-        let theirs_stats = gitutil::fighter_stats(
-            &dest,
-            &pr.base.sha,
-            &h.path,
-            &h.blame_name,
-            bearer.as_deref(),
-        )
-        .await;
+    for (round, (h, (ours_stats, theirs_stats))) in hunks.iter().zip(stats).enumerate() {
         if db::insert_hunk(
             &ctx.pool,
             &db::NewHunk {
