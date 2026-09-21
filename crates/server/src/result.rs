@@ -1,6 +1,6 @@
 //! After the last round: resolve files, plumbing commit, create-only push.
 
-use crate::db::{self, clip_display_path, HunkRow, MatchRow};
+use crate::db::{self, clip_comment_text, HunkRow, MatchRow};
 use crate::gh::GitHub;
 use crate::gitutil::{self, ExistingResult};
 use crate::limits::{GIT_JOB_TIMEOUT, MAX_HUNKS};
@@ -76,6 +76,33 @@ pub fn git_pick_for_winner(winner: &str) -> Option<Pick> {
     }
 }
 
+fn comment_winner(winner: Option<&str>) -> &'static str {
+    match winner {
+        Some("ours") => "ours",
+        Some("theirs") => "theirs",
+        Some("draw") => "draw",
+        Some("forfeit_ours") => "forfeit_ours",
+        Some("forfeit_theirs") => "forfeit_theirs",
+        _ => "unresolved",
+    }
+}
+
+fn comment_round_number(round: i64) -> i64 {
+    if (0..MAX_HUNKS as i64).contains(&round) {
+        round + 1
+    } else {
+        0
+    }
+}
+
+fn comment_hunk_index(index: i64) -> i64 {
+    if (0..MAX_HUNKS as i64).contains(&index) {
+        index
+    } else {
+        0
+    }
+}
+
 fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
     hunks
         .iter()
@@ -83,9 +110,9 @@ fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
         .map(|h| {
             format!(
                 "{} hunk {} ({})",
-                clip_display_path(&h.path),
-                h.hunk_index,
-                h.winner.as_deref().unwrap_or("unresolved")
+                clip_comment_text(&h.path),
+                comment_hunk_index(h.hunk_index),
+                comment_winner(h.winner.as_deref())
             )
         })
         .collect()
@@ -108,10 +135,10 @@ fn round_lines(hunks: &[HunkRow]) -> String {
         .map(|h| {
             format!(
                 "round {}: {} hunk {} {}",
-                h.round_index + 1,
-                clip_display_path(&h.path),
-                h.hunk_index,
-                h.winner.as_deref().unwrap_or("unresolved")
+                comment_round_number(h.round_index),
+                clip_comment_text(&h.path),
+                comment_hunk_index(h.hunk_index),
+                comment_winner(h.winner.as_deref())
             )
         })
         .collect::<Vec<_>>()
@@ -593,10 +620,52 @@ mod tests {
     #[test]
     fn comment_paths_are_length_capped() {
         let long = format!("{}/lib.rs", "dir/".repeat(80));
-        let clipped = clip_display_path(&long);
+        let clipped = db::clip_display_path(&long);
         assert!(clipped.chars().count() <= 160);
         assert!(clipped.ends_with('…'), "{clipped}");
-        assert_eq!(clip_display_path("lib.rs"), "lib.rs");
+        assert_eq!(db::clip_display_path("lib.rs"), "lib.rs");
+    }
+
+    #[test]
+    fn result_comments_cannot_inject_markdown() {
+        let row = |path: &str, winner: Option<&str>, round: i64, index: i64| HunkRow {
+            round_index: round,
+            path: path.into(),
+            hunk_index: index,
+            winner: winner.map(str::to_string),
+            theirs_name: None,
+            theirs_login: None,
+            ours_hp: 100,
+            ours_armor: false,
+            ours_special: false,
+            theirs_hp: 100,
+            theirs_armor: false,
+            theirs_special: false,
+        };
+        let lines = round_lines(&[row(
+            "[click](https://evil.example/phish).rs",
+            Some("ours"),
+            0,
+            0,
+        )]);
+        assert!(lines.contains("round 1:"), "{lines}");
+        assert!(lines.ends_with(" ours"), "{lines}");
+        assert!(!lines.contains("]("), "{lines}");
+        assert!(!lines.contains("://"), "{lines}");
+        let skip = unresolved_paths(&[row(
+            "![img](https://evil.example/x.png)",
+            Some("[x](https://evil.example)"),
+            0,
+            0,
+        )]);
+        assert_eq!(skip.len(), 1);
+        assert!(!skip[0].contains("]("), "{}", skip[0]);
+        assert!(!skip[0].contains("://"), "{}", skip[0]);
+        assert!(skip[0].contains("unresolved"), "{}", skip[0]);
+        assert_eq!(
+            round_lines(&[row("lib.rs", Some("ours"), i64::MAX, i64::MAX)]),
+            "round 0: lib.rs hunk 0 ours"
+        );
     }
 
     #[test]

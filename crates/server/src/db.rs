@@ -786,8 +786,14 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     // Result rebuilds from merge-tree + picks. Do not keep 1 MiB conflict
     // blobs in SQLite (hostile repo disk, and unused at resolve time).
     let _ = (h.ours, h.theirs, h.base);
+    if !(0..crate::limits::MAX_HUNKS as i64).contains(&h.round) {
+        return Err(sqlx::Error::Protocol("round_index".into()));
+    }
     if !(0..crate::limits::MAX_HUNKS as i64).contains(&h.hunk_index) {
         return Err(sqlx::Error::Protocol("hunk_index".into()));
+    }
+    if !crate::gitutil::is_safe_path(h.path) {
+        return Err(sqlx::Error::Protocol("path".into()));
     }
     let theirs_login = crate::gh::fold_github_login_opt(h.theirs_login);
     sqlx::query(
@@ -972,12 +978,22 @@ pub async fn session_login(pool: &SqlitePool, id: &str) -> Result<Option<String>
     .map(|r| r.map(|x| x.0))
 }
 
+fn is_hunk_winner(winner: &str) -> bool {
+    matches!(
+        winner,
+        "ours" | "theirs" | "draw" | "forfeit_ours" | "forfeit_theirs"
+    )
+}
+
 pub async fn set_hunk_winner(
     pool: &SqlitePool,
     match_id: &str,
     round: i64,
     winner: &str,
 ) -> Result<bool, sqlx::Error> {
+    if !is_hunk_winner(winner) {
+        return Ok(false);
+    }
     let res = sqlx::query(
         "UPDATE match_hunks SET winner = ?
          WHERE match_id = ? AND round_index = ? AND winner IS NULL
@@ -1036,6 +1052,26 @@ pub fn clip_display_path(path: &str) -> String {
     let mut s: String = path.chars().take(MAX.saturating_sub(1)).collect();
     s.push('…');
     s
+}
+
+/// GitHub renders bot comments as markdown. Hostile paths and git author
+/// names cannot inject links, images, mentions, or HTML.
+pub fn clip_comment_text(s: &str) -> String {
+    const MAX: usize = 160;
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.chars().count() >= MAX {
+            break;
+        }
+        let keep = c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '/' | '…');
+        out.push(if keep { c } else { '_' });
+    }
+    let t = out.trim();
+    if t.is_empty() {
+        "_".into()
+    } else {
+        t.to_string()
+    }
 }
 
 pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
@@ -1694,6 +1730,22 @@ mod tests {
         assert!(clipped.ends_with('…'));
     }
 
+    #[test]
+    fn comment_text_cannot_inject_markdown() {
+        assert_eq!(clip_comment_text("lib.rs"), "lib.rs");
+        assert_eq!(clip_comment_text("Alice"), "Alice");
+        let hostile = clip_comment_text("[Play](https://evil.example) @admin");
+        assert!(!hostile.contains('['), "{hostile}");
+        assert!(!hostile.contains(']'), "{hostile}");
+        assert!(!hostile.contains('('), "{hostile}");
+        assert!(!hostile.contains(')'), "{hostile}");
+        assert!(!hostile.contains('@'), "{hostile}");
+        assert!(!hostile.contains(':'), "{hostile}");
+        assert!(!hostile.contains("://"), "{hostile}");
+        assert_eq!(clip_comment_text("   "), "_");
+        assert_eq!(clip_comment_text(&"a".repeat(200)).chars().count(), 160);
+    }
+
     #[tokio::test]
     async fn hunk_winner_is_write_once() {
         let pool = connect("sqlite::memory:").await.unwrap();
@@ -1718,6 +1770,9 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!set_hunk_winner(&pool, "m1", 0, "[x](https://evil)")
+            .await
+            .unwrap());
         assert!(set_hunk_winner(&pool, "m1", 0, "ours").await.unwrap());
         assert!(!set_hunk_winner(&pool, "m1", 0, "theirs").await.unwrap());
         let hunks = list_hunks(&pool, "m1").await.unwrap();
@@ -2109,5 +2164,43 @@ mod tests {
         .await
         .unwrap();
         insert_input(&pool, "m1", 0, 0, 1, 2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_hunk_rejects_hostile_rows() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        async fn try_hunk(
+            pool: &SqlitePool,
+            round: i64,
+            path: &str,
+            hunk_index: i64,
+        ) -> Result<(), sqlx::Error> {
+            insert_hunk(
+                pool,
+                &NewHunk {
+                    match_id: "m1",
+                    round,
+                    path,
+                    hunk_index,
+                    ours: b"a",
+                    theirs: b"b",
+                    base: b"c",
+                    theirs_login: None,
+                    theirs_name: None,
+                    ours_stats: git_fight_core::FighterStats::default(),
+                    theirs_stats: git_fight_core::FighterStats::default(),
+                },
+            )
+            .await
+        }
+        assert!(try_hunk(&pool, i64::MAX, "lib.rs", 0).await.is_err());
+        assert!(try_hunk(&pool, -1, "lib.rs", 0).await.is_err());
+        assert!(try_hunk(&pool, 0, "lib.rs", i64::MAX).await.is_err());
+        assert!(try_hunk(&pool, 0, "../x.rs", 0).await.is_err());
+        assert!(try_hunk(&pool, 0, "-opt.rs", 0).await.is_err());
+        try_hunk(&pool, 0, "lib.rs", 0).await.unwrap();
     }
 }

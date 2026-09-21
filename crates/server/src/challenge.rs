@@ -381,13 +381,7 @@ pub async fn start_challenge(
     }
 
     let rounds = hunks.len();
-    let vs = if theirs_kind == "cpu" {
-        format!("{display_login} vs {theirs_name} (CPU)")
-    } else if theirs_kind == "mirror" {
-        format!("{display_login} vs {display_login} (mirror)")
-    } else {
-        format!("{display_login} vs {theirs_name}")
-    };
+    let vs = vs_line(&display_login, &theirs_kind, &theirs_name);
     let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
     if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
         return Ok(silent());
@@ -445,6 +439,18 @@ async fn blame_login(
     login
 }
 
+fn vs_line(display_login: &str, theirs_kind: &str, theirs_name: &str) -> String {
+    let ours = db::clip_comment_text(display_login);
+    let theirs = db::clip_comment_text(theirs_name);
+    if theirs_kind == "cpu" {
+        format!("{ours} vs {theirs} (CPU)")
+    } else if theirs_kind == "mirror" {
+        format!("{ours} vs {ours} (mirror)")
+    } else {
+        format!("{ours} vs {theirs}")
+    }
+}
+
 fn side_from_blame(
     ours_login: &str,
     login: Option<String>,
@@ -482,6 +488,21 @@ mod tests {
         assert!(is_bot_user(Some("Bot"), Some("git-fight[bot]")));
         assert!(is_bot_user(Some("User"), Some("foo[bot]")));
         assert!(!is_bot_user(Some("User"), Some("alice")));
+    }
+
+    #[test]
+    fn challenge_vs_line_cannot_inject_markdown() {
+        assert_eq!(vs_line("alice", "cpu", "bob"), "alice vs bob (CPU)");
+        assert_eq!(
+            vs_line("alice", "mirror", "alice"),
+            "alice vs alice (mirror)"
+        );
+        let vs = vs_line("alice", "cpu", "[Play](https://evil.example) @admin");
+        assert!(vs.starts_with("alice vs "), "{vs}");
+        assert!(vs.ends_with(" (CPU)"), "{vs}");
+        assert!(!vs.contains("]("), "{vs}");
+        assert!(!vs.contains('@'), "{vs}");
+        assert!(!vs.contains("://"), "{vs}");
     }
 
     #[test]
