@@ -1,4 +1,5 @@
 use chrono::{Duration, Utc};
+use git_fight_core::FighterStats;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite, SqlitePool};
 use std::str::FromStr;
@@ -98,11 +99,28 @@ async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             theirs_login TEXT,
             theirs_name TEXT,
             winner TEXT,
+            ours_hp INTEGER NOT NULL DEFAULT 100,
+            ours_armor INTEGER NOT NULL DEFAULT 0,
+            ours_special INTEGER NOT NULL DEFAULT 0,
+            theirs_hp INTEGER NOT NULL DEFAULT 100,
+            theirs_armor INTEGER NOT NULL DEFAULT 0,
+            theirs_special INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (match_id, round_index)
         )",
     )
     .execute(pool)
     .await?;
+    for (col, ty) in [
+        ("ours_hp", "INTEGER NOT NULL DEFAULT 100"),
+        ("ours_armor", "INTEGER NOT NULL DEFAULT 0"),
+        ("ours_special", "INTEGER NOT NULL DEFAULT 0"),
+        ("theirs_hp", "INTEGER NOT NULL DEFAULT 100"),
+        ("theirs_armor", "INTEGER NOT NULL DEFAULT 0"),
+        ("theirs_special", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let q = format!("ALTER TABLE match_hunks ADD COLUMN {col} {ty}");
+        let _ = sqlx::query(&q).execute(pool).await;
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -333,14 +351,17 @@ pub struct NewHunk<'a> {
     pub base: &'a [u8],
     pub theirs_login: Option<&'a str>,
     pub theirs_name: Option<&'a str>,
+    pub ours_stats: FighterStats,
+    pub theirs_stats: FighterStats,
 }
 
 pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO match_hunks (
             match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
-            theirs_login, theirs_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            theirs_login, theirs_name,
+            ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(h.match_id)
     .bind(h.round)
@@ -351,6 +372,12 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     .bind(h.base)
     .bind(h.theirs_login)
     .bind(h.theirs_name)
+    .bind(i64::from(h.ours_stats.hp))
+    .bind(h.ours_stats.armor as i64)
+    .bind(h.ours_stats.special as i64)
+    .bind(i64::from(h.theirs_stats.hp))
+    .bind(h.theirs_stats.armor as i64)
+    .bind(h.theirs_stats.special as i64)
     .execute(pool)
     .await?;
     Ok(())
@@ -441,39 +468,41 @@ pub struct HunkRow {
     pub winner: Option<String>,
     pub theirs_name: Option<String>,
     pub theirs_login: Option<String>,
+    pub ours_hp: i32,
+    pub ours_armor: bool,
+    pub ours_special: bool,
+    pub theirs_hp: i32,
+    pub theirs_armor: bool,
+    pub theirs_special: bool,
+}
+
+impl HunkRow {
+    pub fn ours_stats(&self) -> FighterStats {
+        FighterStats::clamped(self.ours_hp, self.ours_armor, self.ours_special)
+    }
+
+    pub fn theirs_stats(&self) -> FighterStats {
+        FighterStats::clamped(self.theirs_hp, self.theirs_armor, self.theirs_special)
+    }
+}
+
+pub fn stats_for_round(hunks: &[HunkRow], round: u32) -> (FighterStats, FighterStats) {
+    hunks
+        .iter()
+        .find(|h| h.round_index == i64::from(round))
+        .map(|h| (h.ours_stats(), h.theirs_stats()))
+        .unwrap_or_default()
 }
 
 pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            i64,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login
+    sqlx::query_as::<_, HunkRow>(
+        "SELECT round_index, path, hunk_index, winner, theirs_name, theirs_login,
+                ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
          FROM match_hunks WHERE match_id = ? ORDER BY round_index",
     )
     .bind(match_id)
     .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(round_index, path, hunk_index, winner, theirs_name, theirs_login)| HunkRow {
-                round_index,
-                path,
-                hunk_index,
-                winner,
-                theirs_name,
-                theirs_login,
-            },
-        )
-        .collect())
+    .await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -593,6 +622,28 @@ pub async fn set_result_branch(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for HunkRow {
+    fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        let flag =
+            |name: &str| -> Result<bool, sqlx::Error> { Ok(row.try_get::<i64, _>(name)? != 0) };
+        Ok(Self {
+            round_index: row.try_get("round_index")?,
+            path: row.try_get("path")?,
+            hunk_index: row.try_get("hunk_index")?,
+            winner: row.try_get("winner")?,
+            theirs_name: row.try_get("theirs_name")?,
+            theirs_login: row.try_get("theirs_login")?,
+            ours_hp: row.try_get::<i64, _>("ours_hp")? as i32,
+            ours_armor: flag("ours_armor")?,
+            ours_special: flag("ours_special")?,
+            theirs_hp: row.try_get::<i64, _>("theirs_hp")? as i32,
+            theirs_armor: flag("theirs_armor")?,
+            theirs_special: flag("theirs_special")?,
+        })
+    }
 }
 
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {

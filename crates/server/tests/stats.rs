@@ -61,6 +61,8 @@ async fn seed(
             base: b"c",
             theirs_login: theirs,
             theirs_name: theirs,
+            ours_stats: Default::default(),
+            theirs_stats: Default::default(),
         },
     )
     .await

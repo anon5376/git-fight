@@ -75,6 +75,132 @@ async fn merge_tree_finds_fightable_hunk() {
     assert_eq!(hunks[0].blame_email, "bob@example.com");
 }
 
+#[tokio::test]
+async fn fighter_stats_match_cli_formula() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let _ = gitutil::fetch_shas(&clone, &[&head, &base], None).await;
+    let ours = gitutil::fighter_stats(&clone, &head, "lib.rs", "alice").await;
+    let theirs = gitutil::fighter_stats(&clone, &base, "lib.rs", "bob").await;
+    assert_eq!(ours.hp, 120, "{ours:?}");
+    assert!(!ours.armor, "{ours:?}");
+    assert!(!ours.special, "{ours:?}");
+    assert_eq!(theirs.hp, 120, "{theirs:?}");
+    assert!(!theirs.armor);
+    assert!(!theirs.special);
+    assert_eq!(
+        gitutil::latest_author(&clone, &head, "lib.rs")
+            .await
+            .as_deref(),
+        Some("alice")
+    );
+    assert_eq!(
+        gitutil::latest_author(&clone, &base, "lib.rs")
+            .await
+            .as_deref(),
+        Some("bob")
+    );
+}
+
+fn git_dated(cwd: &Path, date: &str, args: &[&str]) {
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .expect("git");
+    if !out.status.success() {
+        panic!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[tokio::test]
+async fn fighter_stats_armor_and_special() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 1 }\n").unwrap();
+    git_dated(&work, "2026-09-16T12:00:00 +0000", &["add", "lib.rs"]);
+    git_dated(
+        &work,
+        "2026-09-16T12:00:00 +0000",
+        &["commit", "-q", "-m", "base"],
+    );
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    std::fs::create_dir(work.join("tests")).unwrap();
+    std::fs::write(work.join("lib.rs"), "fn v() { 2 }\n").unwrap();
+    std::fs::write(work.join("tests/t.rs"), "ok\n").unwrap();
+    git_dated(
+        &work,
+        "2026-09-18T12:00:00 +0000",
+        &["add", "lib.rs", "tests/t.rs"],
+    );
+    git_dated(
+        &work,
+        "2026-09-18T12:00:00 +0000",
+        &["commit", "-q", "-m", "pr+test"],
+    );
+    std::fs::write(work.join("notes.txt"), "d1\n").unwrap();
+    git_dated(&work, "2026-09-19T12:00:00 +0000", &["add", "notes.txt"]);
+    git_dated(
+        &work,
+        "2026-09-19T12:00:00 +0000",
+        &["commit", "-q", "-m", "d2"],
+    );
+    std::fs::write(work.join("notes.txt"), "d2\n").unwrap();
+    git_dated(&work, "2026-09-20T12:00:00 +0000", &["add", "notes.txt"]);
+    git_dated(
+        &work,
+        "2026-09-20T12:00:00 +0000",
+        &["commit", "-q", "-m", "d3"],
+    );
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    std::fs::write(work.join("lib.rs"), "fn v() { 3 }\n").unwrap();
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    gitutil::clone_bare(&format!("file://{}", bare.display()), &clone, None)
+        .await
+        .unwrap();
+    let _ = gitutil::fetch_shas(&clone, &[&head, &base], None).await;
+    let ours = gitutil::fighter_stats(&clone, &head, "lib.rs", "alice").await;
+    let theirs = gitutil::fighter_stats(&clone, &base, "lib.rs", "bob").await;
+    assert_eq!(ours.hp, 120, "{ours:?}");
+    assert!(ours.armor, "{ours:?}");
+    assert!(ours.special, "{ours:?}");
+    assert_eq!(theirs.hp, 120, "{theirs:?}");
+    assert!(!theirs.armor, "{theirs:?}");
+    assert!(!theirs.special, "{theirs:?}");
+}
+
 fn many_hunks_bare(n: usize) -> (tempfile::TempDir, PathBuf, String, String) {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");

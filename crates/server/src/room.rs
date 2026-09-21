@@ -69,7 +69,6 @@ async fn run_room(
 ) {
     let seed: u64 = row.seed.parse().unwrap_or(1);
     let delay = u32::try_from(row.input_delay_ticks).unwrap_or(INPUT_DELAY);
-    let stats = FighterStats::default();
     let hunks = db::list_hunks(&pool, &row.id).await.unwrap_or_default();
     let total_rounds = u32::try_from(hunks.len()).unwrap_or(0).max(1);
     let mut round: u32 = hunks
@@ -78,7 +77,8 @@ async fn run_room(
         .map(|h| h.round_index as u32)
         .unwrap_or(0)
         .min(total_rounds.saturating_sub(1));
-    let mut sim = FightState::new(round_seed(seed, round), stats, stats);
+    let (ours_stats, theirs_stats) = db::stats_for_round(&hunks, round);
+    let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
     let mut next_tick = 0u32;
     let mut log: Vec<(u32, u8, u8)> = Vec::new();
     if round == 0 {
@@ -148,6 +148,7 @@ async fn run_room(
                             round,
                             total_rounds,
                             confirmed,
+                            db::stats_for_round(&hunks, round),
                         );
                         let _ = tx.send(encode(&hello)).await;
                         for &(n, o, t) in &log {
@@ -423,11 +424,8 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
     broadcast(a.ours, a.theirs, a.spectators, &msg).await;
     if !match_over {
         *a.round += 1;
-        *a.sim = FightState::new(
-            round_seed(a.seed, *a.round),
-            FighterStats::default(),
-            FighterStats::default(),
-        );
+        let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
+        *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
         *a.next_tick = 0;
         a.log.clear();
         a.pending_ours.clear();
@@ -451,6 +449,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
                 *a.round,
                 a.total_rounds,
                 -1,
+                db::stats_for_round(a.hunks, *a.round),
             );
             let _ = tx.send(encode(&hello)).await;
         }
@@ -465,6 +464,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
                 *a.round,
                 a.total_rounds,
                 -1,
+                db::stats_for_round(a.hunks, *a.round),
             );
             let _ = tx.send(encode(&hello)).await;
         }
@@ -479,6 +479,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
                 *a.round,
                 a.total_rounds,
                 -1,
+                db::stats_for_round(a.hunks, *a.round),
             );
             let _ = tx.send(encode(&hello)).await;
         }
@@ -542,8 +543,10 @@ fn hello_msg(
     round: u32,
     total_rounds: u32,
     confirmed_tick: i32,
+    stats: (FighterStats, FighterStats),
 ) -> ServerMsg {
     let (seed_lo, seed_hi) = split_seed(seed);
+    let (ours_stats, theirs_stats) = stats;
     ServerMsg::Hello {
         match_id: match_id.to_string(),
         seed_lo,
@@ -555,6 +558,12 @@ fn hello_msg(
         round,
         total_rounds,
         confirmed_tick,
+        ours_hp: ours_stats.hp,
+        ours_armor: ours_stats.armor,
+        ours_special: ours_stats.special,
+        theirs_hp: theirs_stats.hp,
+        theirs_armor: theirs_stats.armor,
+        theirs_special: theirs_stats.special,
     }
 }
 

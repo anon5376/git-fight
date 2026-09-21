@@ -162,6 +162,12 @@ pub async fn start_challenge(
     .map_err(|e| e.to_string())?;
 
     for (round, h) in hunks.iter().enumerate() {
+        let ours_author = gitutil::latest_author(&dest, &pr.head.sha, &h.path)
+            .await
+            .unwrap_or_else(|| ours_login.clone());
+        let ours_stats = gitutil::fighter_stats(&dest, &pr.head.sha, &h.path, &ours_author).await;
+        let theirs_stats =
+            gitutil::fighter_stats(&dest, &pr.base.sha, &h.path, &h.blame_name).await;
         db::insert_hunk(
             &ctx.pool,
             &db::NewHunk {
@@ -174,6 +180,8 @@ pub async fn start_challenge(
                 base: &h.base,
                 theirs_login: None,
                 theirs_name: Some(&h.blame_name),
+                ours_stats,
+                theirs_stats,
             },
         )
         .await

@@ -178,6 +178,8 @@ async fn seed_match(
             base: b"fn v() { 1 }\n",
             theirs_login: None,
             theirs_name: Some("bob"),
+            ours_stats: Default::default(),
+            theirs_stats: Default::default(),
         },
     )
     .await

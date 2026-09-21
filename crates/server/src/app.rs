@@ -228,6 +228,12 @@ struct ReplayOut {
     ticks: Vec<[u8; 2]>,
     final_hash: Option<String>,
     status: String,
+    ours_hp: i32,
+    ours_armor: bool,
+    ours_special: bool,
+    theirs_hp: i32,
+    theirs_armor: bool,
+    theirs_special: bool,
 }
 
 async fn get_replay(
@@ -244,12 +250,25 @@ async fn get_replay(
     let inputs = db::load_inputs(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let hunks = db::list_hunks(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (ours_stats, theirs_stats) = hunks
+        .last()
+        .map(|h| (h.ours_stats(), h.theirs_stats()))
+        .unwrap_or_default();
     Ok(Json(ReplayOut {
         id: row.id,
         seed: row.seed,
         ticks: inputs.into_iter().map(|(_, o, t)| [o, t]).collect(),
         final_hash: row.final_hash,
         status: row.status,
+        ours_hp: ours_stats.hp,
+        ours_armor: ours_stats.armor,
+        ours_special: ours_stats.special,
+        theirs_hp: theirs_stats.hp,
+        theirs_armor: theirs_stats.armor,
+        theirs_special: theirs_stats.special,
     }))
 }
 

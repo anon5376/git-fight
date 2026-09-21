@@ -29,6 +29,12 @@ type Hello = {
   round: number;
   total_rounds?: number;
   confirmed_tick: number;
+  ours_hp?: number;
+  ours_armor?: boolean;
+  ours_special?: boolean;
+  theirs_hp?: number;
+  theirs_armor?: boolean;
+  theirs_special?: boolean;
 };
 
 type TickMsg = { type: "tick"; n: number; ours: number; theirs: number };
@@ -43,6 +49,28 @@ type EndMsg = {
 };
 type ErrMsg = { type: "error"; message: string };
 type ServerMsg = Hello | TickMsg | EndMsg | ErrMsg | { type: string };
+
+function fightFromWire(
+  seedLo: number,
+  seedHi: number,
+  oursHp?: number,
+  oursArmor?: boolean,
+  oursSpecial?: boolean,
+  theirsHp?: number,
+  theirsArmor?: boolean,
+  theirsSpecial?: boolean,
+): WasmFight {
+  return WasmFight.from_seed_stats(
+    seedLo,
+    seedHi,
+    oursHp ?? 100,
+    oursArmor ?? false,
+    oursSpecial ?? false,
+    theirsHp ?? 100,
+    theirsArmor ?? false,
+    theirsSpecial ?? false,
+  );
+}
 
 export function sprite(side: number, pose: number): string[] {
   const rows = sprite_rows();
@@ -189,7 +217,16 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       nextSend = Math.max(0, confirmed + 1);
       finished = false;
       ui.ko.classList.add("hidden");
-      fight = WasmFight.from_seed(hello.seed_lo, hello.seed_hi);
+      fight = fightFromWire(
+        hello.seed_lo,
+        hello.seed_hi,
+        hello.ours_hp,
+        hello.ours_armor,
+        hello.ours_special,
+        hello.theirs_hp,
+        hello.theirs_armor,
+        hello.theirs_special,
+      );
       if (role === "spectator") {
         ui.wait.textContent = "spectating";
         void offerGithubLogin(matchId, ui);
@@ -290,11 +327,26 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
     seed: string;
     ticks: number[][];
     final_hash?: string;
+    ours_hp?: number;
+    ours_armor?: boolean;
+    ours_special?: boolean;
+    theirs_hp?: number;
+    theirs_armor?: boolean;
+    theirs_special?: boolean;
   };
   const seed = BigInt(data.seed);
   const seedLo = Number(seed & 0xffffffffn);
   const seedHi = Number(seed >> 32n);
-  const fight = WasmFight.from_seed(seedLo, seedHi);
+  const fight = fightFromWire(
+    seedLo,
+    seedHi,
+    data.ours_hp,
+    data.ours_armor,
+    data.ours_special,
+    data.theirs_hp,
+    data.theirs_armor,
+    data.theirs_special,
+  );
   const ticks = data.ticks ?? [];
   let i = 0;
   let stopped = false;

@@ -51,6 +51,12 @@ pub enum ServerMsg {
         round: u32,
         total_rounds: u32,
         confirmed_tick: i32,
+        ours_hp: i32,
+        ours_armor: bool,
+        ours_special: bool,
+        theirs_hp: i32,
+        theirs_armor: bool,
+        theirs_special: bool,
     },
     Tick {
         n: u32,

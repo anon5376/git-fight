@@ -34,6 +34,93 @@ async fn two_clients_agree_with_server_hash() {
 }
 
 #[tokio::test]
+async fn hello_includes_stored_fighter_stats() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = std::env::temp_dir().join(format!(
+        "gf-hello-stats-{}-{}",
+        std::process::id(),
+        uuid_like()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: "cafe0007cafe0007cafe0007cafe0007".into(),
+            seed: 9,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: "cafe0007cafe0007cafe0007cafe0007",
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats {
+                hp: 120,
+                armor: true,
+                special: true,
+            },
+            theirs_stats: FighterStats {
+                hp: 80,
+                armor: false,
+                special: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        git_fight_server::serve(listener, pool, Config::default())
+            .await
+            .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let url = format!("ws://{addr}/ws?match=cafe0007cafe0007cafe0007cafe0007&token=ours-token");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let hello = wait_type(&mut stream, "hello").await;
+    assert_eq!(hello["ours_hp"].as_i64(), Some(120));
+    assert_eq!(hello["ours_armor"].as_bool(), Some(true));
+    assert_eq!(hello["ours_special"].as_bool(), Some(true));
+    assert_eq!(hello["theirs_hp"].as_i64(), Some(80));
+    assert_eq!(hello["theirs_armor"].as_bool(), Some(false));
+    assert_eq!(hello["theirs_special"].as_bool(), Some(false));
+}
+
+#[tokio::test]
 async fn unfinished_match_has_no_replay() {
     let addr = spawn_server(Config::default()).await;
     let created: Value = http_post(addr, "/api/matches", r#"{"seed":2}"#).await.1;
@@ -165,7 +252,17 @@ async fn play(addr: std::net::SocketAddr, id: &str, token: &str, is_ours: bool) 
     let seed_hi = hello["seed_hi"].as_u64().unwrap() as u32;
     let delay = hello["input_delay"].as_u64().unwrap() as u32;
     let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
-    let mut sim = FightState::new(seed, FighterStats::default(), FighterStats::default());
+    let ours_stats = FighterStats::clamped(
+        hello["ours_hp"].as_i64().unwrap_or(100) as i32,
+        hello["ours_armor"].as_bool().unwrap_or(false),
+        hello["ours_special"].as_bool().unwrap_or(false),
+    );
+    let theirs_stats = FighterStats::clamped(
+        hello["theirs_hp"].as_i64().unwrap_or(100) as i32,
+        hello["theirs_armor"].as_bool().unwrap_or(false),
+        hello["theirs_special"].as_bool().unwrap_or(false),
+    );
+    let mut sim = FightState::new(seed, ours_stats, theirs_stats);
     let mut next_send = 0u32;
     let mut confirmed: i32 = hello["confirmed_tick"].as_i64().unwrap() as i32;
 

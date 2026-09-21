@@ -86,9 +86,27 @@ impl WasmFight {
 
     /// Same stats the server uses (`FighterStats::default`).
     pub fn from_seed(seed_lo: u32, seed_hi: u32) -> WasmFight {
+        WasmFight::from_seed_stats(seed_lo, seed_hi, 100, false, false, 100, false, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_seed_stats(
+        seed_lo: u32,
+        seed_hi: u32,
+        ours_hp: i32,
+        ours_armor: bool,
+        ours_special: bool,
+        theirs_hp: i32,
+        theirs_armor: bool,
+        theirs_special: bool,
+    ) -> WasmFight {
         let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
         WasmFight {
-            state: FightState::new(seed, FighterStats::default(), FighterStats::default()),
+            state: FightState::new(
+                seed,
+                FighterStats::clamped(ours_hp, ours_armor, ours_special),
+                FighterStats::clamped(theirs_hp, theirs_armor, theirs_special),
+            ),
         }
     }
 

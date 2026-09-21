@@ -1,7 +1,7 @@
 //! Git plumbing with hooks disabled. Never a shell, never user-repo code.
 
 use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_HUNKS};
-use git_fight_core::ConflictFile;
+use git_fight_core::{ConflictFile, FighterStats};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -423,6 +423,115 @@ async fn fallback_author(dir: &Path, base_sha: &str, path: &str) -> (String, Str
     ("theirs".into(), String::new(), base_sha.into())
 }
 
+fn is_safe_rev(rev: &str) -> bool {
+    let n = rev.len();
+    (8..=64).contains(&n) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn looks_like_test(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("test") || lower.contains("spec")
+}
+
+/// Latest commit author on `rev` that touched `path` (`git log -1 --format=%an`).
+pub async fn latest_author(dir: &Path, rev: &str, path: &str) -> Option<String> {
+    if !is_safe_rev(rev) || !is_safe_path(path) {
+        return None;
+    }
+    let mut cmd = git_dir(dir);
+    cmd.args(["log", "-1", "--format=%an", rev, "--", path]);
+    let (code, out, _) = run(cmd, Duration::from_secs(10)).await.ok()?;
+    if code != 0 {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// CLI-equivalent HP / armor / special from git history. Falls back to defaults.
+pub async fn fighter_stats(dir: &Path, rev: &str, path: &str, author: &str) -> FighterStats {
+    if !is_safe_rev(rev) || !is_safe_path(path) {
+        return FighterStats::default();
+    }
+    let hp = hp_from_blame(dir, rev, path, author).await;
+    let armor = armor_from_commit(dir, rev, path).await;
+    let special = special_from_log(dir, author).await;
+    FighterStats::clamped(hp, armor, special)
+}
+
+async fn hp_from_blame(dir: &Path, rev: &str, path: &str, name: &str) -> i32 {
+    let _ = cat_file(dir, &format!("{rev}:{path}")).await;
+    let mut cmd = git_dir(dir);
+    cmd.args(["blame", "--line-porcelain", rev, "--", path]);
+    let Ok((0, out, _)) = run(cmd, Duration::from_secs(20)).await else {
+        return 100;
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut mine = 0i32;
+    let mut total = 0i32;
+    for line in text.lines() {
+        if let Some(author) = line.strip_prefix("author ") {
+            total += 1;
+            if author == name {
+                mine += 1;
+            }
+        }
+    }
+    if total <= 0 {
+        return 100;
+    }
+    80 + (mine * 40) / total
+}
+
+async fn armor_from_commit(dir: &Path, rev: &str, path: &str) -> bool {
+    let mut cmd = git_dir(dir);
+    cmd.args(["log", "-1", "--format=%H", rev, "--", path]);
+    let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await else {
+        return false;
+    };
+    let commit = String::from_utf8_lossy(&out).trim().to_string();
+    if !is_safe_rev(&commit) {
+        return false;
+    }
+    let mut cmd = git_dir(dir);
+    cmd.args([
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "--root",
+        &commit,
+    ]);
+    let Ok((0, out, _)) = run(cmd, Duration::from_secs(10)).await else {
+        return false;
+    };
+    String::from_utf8_lossy(&out).lines().any(looks_like_test)
+}
+
+async fn special_from_log(dir: &Path, name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.contains('\0') || name.contains('\n') || name.starts_with('-') {
+        return false;
+    }
+    let mut cmd = git_dir(dir);
+    cmd.args(["log", "--since=7 days ago", "--format=%ad", "--date=short"]);
+    cmd.arg(format!("--author={name}"));
+    let Ok((0, out, _)) = run(cmd, Duration::from_secs(15)).await else {
+        return false;
+    };
+    let mut days = BTreeSet::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        if !line.is_empty() {
+            days.insert(line.to_string());
+        }
+    }
+    days.len() >= 3
+}
+
 /// `git-fight/pr-<number>-<match-id>` only. Never main, never an existing user branch.
 pub fn result_ref(pr_number: i64, match_id: &str) -> Result<String, GitError> {
     if pr_number <= 0 {
@@ -635,6 +744,16 @@ mod tests {
         assert!(!is_safe_path("foo/.git/bar"));
         assert!(is_safe_path("src/lib.rs"));
         assert!(is_safe_path("a/b.c"));
+    }
+
+    #[test]
+    fn test_paths_match_cli() {
+        assert!(looks_like_test("src/foo_test.rs"));
+        assert!(looks_like_test("web/spec/a.ts"));
+        assert!(!looks_like_test("src/lib.rs"));
+        assert!(is_safe_rev("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!is_safe_rev("HEAD"));
+        assert!(!is_safe_rev("../main"));
     }
 
     #[test]
