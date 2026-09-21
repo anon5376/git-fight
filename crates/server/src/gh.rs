@@ -206,16 +206,6 @@ impl GitHub {
         number: u64,
         body: &str,
     ) -> Result<u64, String> {
-        let token = self.installation_token(installation_id).await?;
-        let crab = octocrab::OctocrabBuilder::new()
-            .base_uri(self.api_base.as_str())
-            .ok()
-            .and_then(|b| b.personal_token(token.clone()).build().ok());
-        if let Some(crab) = crab {
-            if let Ok(c) = crab.issues(owner, repo).create_comment(number, body).await {
-                return Ok(c.id.into_inner());
-            }
-        }
         let res = self
             .authed(
                 installation_id,
