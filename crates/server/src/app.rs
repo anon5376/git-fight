@@ -196,9 +196,16 @@ impl AppState {
     }
 
     pub(crate) async fn close_room(&self, id: &str) {
-        let mut rooms = self.rooms.lock().await;
-        if let Some(tx) = rooms.remove(id) {
-            let _ = tx.send(RoomEvent::Shutdown).await;
+        let tx = {
+            let mut rooms = self.rooms.lock().await;
+            rooms.remove(id)
+        };
+        if let Some(tx) = tx {
+            if tx.try_send(RoomEvent::Shutdown).is_err() {
+                tokio::spawn(async move {
+                    let _ = tx.send(RoomEvent::Shutdown).await;
+                });
+            }
         }
     }
 }
@@ -673,5 +680,27 @@ mod tests {
         assert!(!is_live_public_url("ftp://fight.example"));
         assert!(!is_live_public_url("https://evil\n.example"));
         assert!(!is_live_public_url(""));
+    }
+
+    #[tokio::test]
+    async fn close_room_does_not_wait_on_a_full_event_channel() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        let (tx, _rx) = mpsc::channel::<RoomEvent>(1);
+        tx.try_send(RoomEvent::Leave { conn_id: 1 }).unwrap();
+        let mut map = HashMap::new();
+        map.insert("m1".into(), tx);
+        let state = AppState {
+            pool,
+            config: Config::default(),
+            rooms: Arc::new(Mutex::new(map)),
+            publishing: Arc::new(Mutex::new(HashSet::new())),
+            github: None,
+            auth: Auth::default(),
+            webhook_secret: None,
+            test_repos: HashMap::new(),
+        };
+        tokio::time::timeout(Duration::from_millis(200), state.close_room("m1"))
+            .await
+            .expect("close_room waited on a full room channel");
     }
 }

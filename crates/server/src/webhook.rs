@@ -190,16 +190,14 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
     {
         return;
     }
+    state.close_room(&row.id).await;
     let Some(inst) = row.installation_id.filter(|i| *i > 0).map(|i| i as u64) else {
-        state.close_room(&row.id).await;
         return;
     };
     let Some(gh) = &state.github else {
-        state.close_room(&row.id).await;
         return;
     };
     if row.pr_number <= 0 {
-        state.close_room(&row.id).await;
         return;
     }
     let public = state.auth.public_url.trim_end_matches('/');
@@ -217,7 +215,6 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
             &body,
         )
         .await;
-    state.close_room(&row.id).await;
 }
 
 async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64) -> HttpStatus {
