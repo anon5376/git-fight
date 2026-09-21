@@ -38,6 +38,7 @@ type Hello = {
 };
 
 type TickMsg = { type: "tick"; n: number; ours: number; theirs: number };
+type HashMsg = { type: "hash"; n: number; hi: number; lo: number };
 type EndMsg = {
   type: "end";
   result: number;
@@ -48,7 +49,15 @@ type EndMsg = {
   match_over?: boolean;
 };
 type ErrMsg = { type: "error"; message: string };
-type ServerMsg = Hello | TickMsg | EndMsg | ErrMsg | { type: string };
+type ServerMsg = Hello | TickMsg | HashMsg | EndMsg | ErrMsg | { type: string };
+
+function u32(n: number): number {
+  return n >>> 0;
+}
+
+function hashesMatch(fight: WasmFight, hi: number, lo: number): boolean {
+  return u32(fight.state_hash_hi()) === u32(hi) && u32(fight.state_hash_lo()) === u32(lo);
+}
 
 function fightFromWire(
   seedLo: number,
@@ -241,6 +250,16 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         confirmed = tick.n;
         ui.wait.classList.add("hidden");
       }
+    } else if (msg.type === "hash") {
+      const hash = msg as HashMsg;
+      if (!fight || finished || hash.n !== fight.tick()) {
+        return;
+      }
+      if (!hashesMatch(fight, hash.hi, hash.lo)) {
+        ui.wait.classList.remove("hidden");
+        ui.wait.textContent = "desync — reloading";
+        window.location.reload();
+      }
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
       const matchOver = end.match_over !== false;
@@ -248,6 +267,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       showKo(ui.ko, end.result);
       if (matchOver) {
         finished = true;
+      }
+      if (fight && end.tick === fight.tick() && !hashesMatch(fight, end.hash_hi, end.hash_lo)) {
+        ui.resolved.textContent = "desync — server result stands";
+      } else if (matchOver) {
         ui.resolved.textContent = `replay /replay/${matchId}`;
       } else {
         ui.resolved.textContent = `round ${(end.round ?? round) + 1}/${totalRounds}`;
