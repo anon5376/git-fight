@@ -772,6 +772,9 @@ pub struct NewHunk<'a> {
 }
 
 pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx::Error> {
+    // Result rebuilds from merge-tree + picks. Do not keep 1 MiB conflict
+    // blobs in SQLite (hostile repo disk, and unused at resolve time).
+    let _ = (h.ours, h.theirs, h.base);
     sqlx::query(
         "INSERT INTO match_hunks (
             match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
@@ -783,9 +786,9 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     .bind(h.round)
     .bind(h.path)
     .bind(h.hunk_index)
-    .bind(h.ours)
-    .bind(h.theirs)
-    .bind(h.base)
+    .bind(&[] as &[u8])
+    .bind(&[] as &[u8])
+    .bind(&[] as &[u8])
     .bind(h.theirs_login)
     .bind(h.theirs_name)
     .bind(i64::from(h.ours_stats.hp))
@@ -1598,6 +1601,12 @@ mod tests {
         assert!(!set_hunk_winner(&pool, "m1", 0, "theirs").await.unwrap());
         let hunks = list_hunks(&pool, "m1").await.unwrap();
         assert_eq!(hunks[0].winner.as_deref(), Some("ours"));
+        let blob_len: i64 =
+            sqlx::query_scalar("SELECT length(ours_bytes) FROM match_hunks WHERE match_id = 'm1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blob_len, 0, "conflict bytes must not sit in SQLite");
     }
 
     #[tokio::test]

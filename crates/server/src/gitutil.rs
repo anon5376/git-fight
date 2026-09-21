@@ -889,16 +889,15 @@ async fn armor_from_commit(dir: &Path, rev: &str, path: &str, bearer: Option<&st
 }
 
 async fn special_from_log(dir: &Path, rev: &str, name: &str, bearer: Option<&str>) -> bool {
-    let name = name.trim();
-    if name.is_empty() || name.contains('\0') || name.contains('\n') || name.starts_with('-') {
+    let Some(author) = git_log_author_literal(name) else {
         return false;
-    }
+    };
     if !is_safe_rev(rev) {
         return false;
     }
     let mut cmd = git_dir(dir, bearer);
     cmd.args(["log", "--since=7 days ago", "--format=%ad", "--date=short"]);
-    cmd.arg(format!("--author={name}"));
+    cmd.arg(format!("--author={author}"));
     cmd.arg(rev);
     cmd.arg("--");
     let Ok((0, out, _)) = run(cmd, Duration::from_secs(15)).await else {
@@ -911,6 +910,25 @@ async fn special_from_log(dir: &Path, rev: &str, name: &str, bearer: Option<&str
         }
     }
     days.len() >= 3
+}
+
+/// `git log --author` is a regex. A hostile commit name must not become `.*` or ReDoS.
+fn git_log_author_literal(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.contains('\0') || name.contains('\n') || name.starts_with('-') {
+        return None;
+    }
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(
+            c,
+            '.' | '[' | ']' | '{' | '}' | '(' | ')' | '*' | '+' | '?' | '^' | '$' | '|' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 /// `git-fight/pr-<number>-<match-id>` only. Never main, never an existing user branch.
@@ -1263,6 +1281,18 @@ mod tests {
         assert!(is_safe_path(&"d".repeat(255)));
         assert!(is_safe_path("src/lib.rs"));
         assert!(is_safe_path("a/b.c"));
+    }
+
+    #[test]
+    fn git_log_author_pattern_is_literal() {
+        assert_eq!(git_log_author_literal("alice").as_deref(), Some("alice"));
+        assert_eq!(git_log_author_literal("a.*").as_deref(), Some(r"a\.\*"));
+        assert_eq!(
+            git_log_author_literal("(a+)+$").as_deref(),
+            Some(r"\(a\+\)\+\$")
+        );
+        assert!(git_log_author_literal("-evil").is_none());
+        assert!(git_log_author_literal("").is_none());
     }
 
     #[test]

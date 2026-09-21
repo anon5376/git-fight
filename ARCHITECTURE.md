@@ -269,7 +269,7 @@ One row per round.
 | `round_index` | `INTEGER` | `0..n-1`. |
 | `path` | `TEXT` | Repo-relative, already validated. |
 | `hunk_index` | `INTEGER` | Nth fightable hunk in that file. |
-| `ours_bytes`, `theirs_bytes`, `base_bytes` | `BLOB` | Hunk sides for later resolve. |
+| `ours_bytes`, `theirs_bytes`, `base_bytes` | `BLOB` | Unused at rest. Resolve rebuilds from merge-tree + picks so a hostile 1 MiB hunk cannot sit in SQLite. |
 | `theirs_login`, `theirs_name` | `TEXT` NULL | Right-side identity for this round if it differs. |
 | `winner` | `TEXT` NULL | `ours` / `theirs` / `draw` / `forfeit_ours` / `forfeit_theirs`. |
 
@@ -360,7 +360,7 @@ A repo can be huge, contain symlink farms, `.git` path tricks, enormous blobs, o
 
 - Skip when GitHub `size` > 1 GiB; clone timeout 60 seconds; `--filter=blob:none`; bare repo; no checkout of a worktree used as a cwd for user code.
 - `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`. Git is invoked with argument lists, never a shell string built from paths. Object SHAs are passed after `--` except where git would then treat the SHA as a path (`diff-tree` tree-ish, `log` revision-range, `rev-parse --verify`). `git log --author=` takes the revision, then `--`.
-- Paths from merge-tree (`-z`) must be relative, with no `..` or `.git` component, no control characters, no option-like (`-`) names, and no component over 255 bytes or path over 4096 bytes. Only regular-file modes. Do not follow symlinks. Cap blob bytes (skip that path; other fightable files still start a match). Cap git stdout/stderr so a huge blob or merge-tree list cannot fill RAM. Blame locates a hunk with a bounded search so a 1 MiB conflict cannot be quadratic against the file. Git author names and emails are length-capped so a hostile commit cannot bloat Hello or challenge comments. Cap 15 hunks.
+- Paths from merge-tree (`-z`) must be relative, with no `..` or `.git` component, no control characters, no option-like (`-`) names, and no component over 255 bytes or path over 4096 bytes. Only regular-file modes. Do not follow symlinks. Cap blob bytes (skip that path; other fightable files still start a match). Do not store those blobs in SQLite. Cap git stdout/stderr so a huge blob or merge-tree list cannot fill RAM. Blame locates a hunk with a bounded search so a 1 MiB conflict cannot be quadratic against the file. Git author names and emails are length-capped so a hostile commit cannot bloat Hello or challenge comments. `git log --author` treats the name as a literal (regex metacharacters escaped). Cap 15 hunks.
 - Never `cargo test`, never a repo `Dockerfile`, never `git submodule update`, never a post-checkout hook.
 
 ### Comment spam
