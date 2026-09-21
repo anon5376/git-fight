@@ -1008,11 +1008,21 @@ pub fn stats_for_round(hunks: &[HunkRow], round: u32) -> (FighterStats, FighterS
         .unwrap_or_default()
 }
 
+pub fn clip_display_path(path: &str) -> String {
+    const MAX: usize = 160;
+    if path.chars().count() <= MAX {
+        return path.to_string();
+    }
+    let mut s: String = path.chars().take(MAX.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
 pub fn hunk_meta_for_round(hunks: &[HunkRow], round: u32) -> (String, u32) {
     hunks
         .iter()
         .find(|h| h.round_index == i64::from(round))
-        .map(|h| (h.path.clone(), h.hunk_index.max(0) as u32))
+        .map(|h| (clip_display_path(&h.path), h.hunk_index.max(0) as u32))
         .unwrap_or_else(|| (String::new(), 0))
 }
 
@@ -1572,6 +1582,14 @@ mod tests {
         let old = get_match(&pool, "old").await.unwrap().unwrap();
         assert_eq!(old.status, "aborted");
         assert_eq!(old.abort_reason.as_deref(), Some("outdated"));
+    }
+
+    #[test]
+    fn display_paths_are_length_capped() {
+        assert_eq!(clip_display_path("lib.rs"), "lib.rs");
+        let clipped = clip_display_path(&"a".repeat(200));
+        assert_eq!(clipped.chars().count(), 160);
+        assert!(clipped.ends_with('…'));
     }
 
     #[tokio::test]

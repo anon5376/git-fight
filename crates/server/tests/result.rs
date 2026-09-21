@@ -810,7 +810,16 @@ async fn expired_pending_match_comments_and_skips_push() {
     assert!(row.result_branch.is_none());
     assert!(row.final_hash.is_none());
     assert_eq!(heads(&bare), before);
-    let patched = patched_comments(&mock).await;
+    let mut patched = patched_comments(&mock).await;
+    for _ in 0..80 {
+        if patched.iter().any(|c| {
+            c.contains("expired") && c.contains("Nothing was pushed") && c.contains("/fight")
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        patched = patched_comments(&mock).await;
+    }
     assert!(
         patched.iter().any(|c| {
             c.contains("expired") && c.contains("Nothing was pushed") && c.contains("/fight")

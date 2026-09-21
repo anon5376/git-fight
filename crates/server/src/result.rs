@@ -1,6 +1,6 @@
 //! After the last round: resolve files, plumbing commit, create-only push.
 
-use crate::db::{self, HunkRow, MatchRow};
+use crate::db::{self, clip_display_path, HunkRow, MatchRow};
 use crate::gh::GitHub;
 use crate::gitutil::{self, ExistingResult};
 use crate::limits::GIT_JOB_TIMEOUT;
@@ -76,20 +76,6 @@ pub fn git_pick_for_winner(winner: &str) -> Option<Pick> {
     }
 }
 
-const MAX_COMMENT_PATH: usize = 160;
-
-fn clip_comment_path(path: &str) -> String {
-    if path.chars().count() <= MAX_COMMENT_PATH {
-        return path.to_string();
-    }
-    let mut s: String = path
-        .chars()
-        .take(MAX_COMMENT_PATH.saturating_sub(1))
-        .collect();
-    s.push('…');
-    s
-}
-
 fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
     hunks
         .iter()
@@ -97,7 +83,7 @@ fn unresolved_paths(hunks: &[HunkRow]) -> Vec<String> {
         .map(|h| {
             format!(
                 "{} hunk {} ({})",
-                clip_comment_path(&h.path),
+                clip_display_path(&h.path),
                 h.hunk_index,
                 h.winner.as_deref().unwrap_or("unresolved")
             )
@@ -123,7 +109,7 @@ fn round_lines(hunks: &[HunkRow]) -> String {
             format!(
                 "round {}: {} hunk {} {}",
                 h.round_index + 1,
-                clip_comment_path(&h.path),
+                clip_display_path(&h.path),
                 h.hunk_index,
                 h.winner.as_deref().unwrap_or("unresolved")
             )
@@ -598,9 +584,9 @@ mod tests {
     #[test]
     fn comment_paths_are_length_capped() {
         let long = format!("{}/lib.rs", "dir/".repeat(80));
-        let clipped = clip_comment_path(&long);
-        assert!(clipped.chars().count() <= MAX_COMMENT_PATH);
+        let clipped = clip_display_path(&long);
+        assert!(clipped.chars().count() <= 160);
         assert!(clipped.ends_with('…'), "{clipped}");
-        assert_eq!(clip_comment_path("lib.rs"), "lib.rs");
+        assert_eq!(clip_display_path("lib.rs"), "lib.rs");
     }
 }
