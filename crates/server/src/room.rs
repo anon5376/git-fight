@@ -2506,21 +2506,24 @@ mod tests {
         .await
         .unwrap();
 
-        let (out2, mut rx2) = mpsc::channel::<String>(8);
-        tx.send(RoomEvent::Join {
-            conn_id: 2,
-            login: Some("alice".into()),
-            token: None,
-            tx: out2,
-        })
-        .await
-        .unwrap();
         let hello = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut conn_id = 2;
             loop {
-                let msg = rx2.recv().await.expect("hello channel");
-                let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
-                if v["type"].as_str() == Some("hello") {
-                    return v;
+                let (out2, mut rx2) = mpsc::channel::<String>(8);
+                tx.send(RoomEvent::Join {
+                    conn_id,
+                    login: Some("alice".into()),
+                    token: None,
+                    tx: out2,
+                })
+                .await
+                .unwrap();
+                conn_id += 1;
+                while let Some(msg) = rx2.recv().await {
+                    let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                    if v["type"].as_str() == Some("hello") {
+                        return v;
+                    }
                 }
             }
         })
