@@ -124,6 +124,24 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    if !crate::gh::is_safe_github_name(&row.owner)
+        || !crate::gh::is_safe_github_name(&row.repo)
+        || !gitutil::is_github_sha(&row.pr_head_sha)
+        || !gitutil::is_github_sha(&row.pr_base_sha)
+    {
+        return skip_push(
+            ctx,
+            &row,
+            match_id,
+            "recheck",
+            format!(
+                "git fight: nothing pushed — could not re-check the pull request. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                ctx.public_url.trim_end_matches('/')
+            ),
+        )
+        .await;
+    }
+
     let mut base_ref = String::new();
     if let Some(gh) = &ctx.gh {
         if let Some(inst) = row.installation_id.map(|i| i as u64) {

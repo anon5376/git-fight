@@ -36,3 +36,23 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
           npm test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t git-fight:ci .
+      - name: Boot image and hit /health
+        run: |
+          set -euo pipefail
+          cid=$(docker run -d --name git-fight-ci -p 127.0.0.1:8080:8080 git-fight:ci)
+          trap 'docker logs "$cid" || true; docker rm -f "$cid" || true' EXIT
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container never became healthy"
+          exit 1

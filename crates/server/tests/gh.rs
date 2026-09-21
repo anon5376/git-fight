@@ -111,6 +111,22 @@ fn github_names_reject_host_tricks() {
 }
 
 #[tokio::test]
+async fn github_api_rejects_unsafe_owner_before_http() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(gh.get_repo(1, "acme/other", "box").await.is_err());
+    assert!(gh.get_pull(1, "acme", "box.git@evil", 1).await.is_err());
+    assert!(gh.comment(1, "../acme", "box", 1, "hi").await.is_err());
+    assert!(gh.edit_comment(1, "acme", "..", 99, "hi").await.is_err());
+}
+
+#[tokio::test]
 async fn login_for_commit_rejects_option_shas() {
     let gh = GitHub::new(
         "http://example.test".into(),

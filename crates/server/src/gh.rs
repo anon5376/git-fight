@@ -30,6 +30,8 @@ const MERGEABLE_POLL_TRIES: u32 = 8;
 const MAX_CONTENTS_JSON: usize = 16 * 1024;
 /// List-commits JSON (`per_page=1`, no `files` patches). Bigger is hostile.
 const MAX_COMMITS_JSON: usize = 64 * 1024;
+/// Pull/repo/comment JSON. PR bodies are capped by GitHub well under this.
+const MAX_API_JSON: usize = 1_048_576;
 
 impl std::fmt::Debug for GitHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,6 +161,7 @@ impl GitHub {
         owner: &str,
         repo: &str,
     ) -> Result<RepoInfo, String> {
+        require_names(owner, repo)?;
         let res = self
             .authed(
                 installation_id,
@@ -172,7 +175,9 @@ impl GitHub {
         if !res.status().is_success() {
             return Err(format!("repo {}", res.status()));
         }
-        res.json().await.map_err(|e| e.to_string())
+        json_capped(res, MAX_API_JSON)
+            .await
+            .ok_or_else(|| "repo json".into())
     }
 
     pub async fn get_pull(
@@ -182,6 +187,7 @@ impl GitHub {
         repo: &str,
         number: u64,
     ) -> Result<PullInfo, String> {
+        require_names(owner, repo)?;
         let res = self
             .authed(
                 installation_id,
@@ -195,7 +201,9 @@ impl GitHub {
         if !res.status().is_success() {
             return Err(format!("pull {}", res.status()));
         }
-        res.json().await.map_err(|e| e.to_string())
+        json_capped(res, MAX_API_JSON)
+            .await
+            .ok_or_else(|| "pull json".into())
     }
 
     pub async fn poll_mergeable(
@@ -230,6 +238,7 @@ impl GitHub {
         number: u64,
         body: &str,
     ) -> Result<u64, String> {
+        require_names(owner, repo)?;
         let res = self
             .authed(
                 installation_id,
@@ -248,7 +257,10 @@ impl GitHub {
         struct Id {
             id: u64,
         }
-        Ok(res.json::<Id>().await.map(|c| c.id).unwrap_or(0))
+        Ok(json_capped::<Id>(res, MAX_API_JSON)
+            .await
+            .map(|c| c.id)
+            .unwrap_or(0))
     }
 
     pub async fn edit_comment(
@@ -259,6 +271,7 @@ impl GitHub {
         comment_id: u64,
         body: &str,
     ) -> Result<u64, String> {
+        require_names(owner, repo)?;
         let res = self
             .authed(
                 installation_id,
@@ -558,6 +571,14 @@ async fn json_capped<T: DeserializeOwned>(resp: reqwest::Response, max: usize) -
         return None;
     }
     serde_json::from_slice(&bytes).ok()
+}
+
+fn require_names(owner: &str, repo: &str) -> Result<(), String> {
+    if is_safe_github_name(owner) && is_safe_github_name(repo) {
+        Ok(())
+    } else {
+        Err("unsafe name".into())
+    }
 }
 
 /// GitHub owner or repo name. Used in clone URLs and API paths — never a slash or host.
