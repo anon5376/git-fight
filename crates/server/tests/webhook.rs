@@ -322,6 +322,65 @@ fn match_id_from(comments: &[String]) -> String {
         .expect("challenge comment with /match/")
 }
 
+type WsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    Message,
+>;
+type WsStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+>;
+
+async fn connect_cookie(
+    addr: std::net::SocketAddr,
+    match_id: &str,
+    cookie: &str,
+) -> (WsSink, WsStream) {
+    let url = format!("ws://{addr}/ws?match={match_id}");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Cookie", format!("git_fight_sid={cookie}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.split()
+}
+
+async fn wait_ws_type(stream: &mut WsStream, ty: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("timeout waiting for ws")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        if v["type"].as_str() == Some(ty) {
+            return v;
+        }
+    }
+}
+
+fn spawn_hello_drain(mut stream: WsStream) -> tokio::sync::mpsc::Receiver<Value> {
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if matches!(v["type"].as_str(), Some("hello" | "end")) {
+                if tx.send(v).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
 struct MockOpts {
     commit_author: Value,
     size: u64,
@@ -640,6 +699,202 @@ async fn fight_comment_two_files_plays_two_rounds_and_pushes_both() {
         }),
         "{patched:?}"
     );
+}
+
+#[tokio::test]
+async fn fight_comment_two_authors_play_two_files_and_push() {
+    let (_keep, bare, head, base, bob_sha, carol_sha) = conflict_two_authors();
+    let mock = github_mocks(
+        &head,
+        &base,
+        MockOpts {
+            commit_author: Value::Null,
+            size: 12,
+            auto_challenge: false,
+            commit_authors: vec![
+                (bob_sha, json!({ "login": "bob" })),
+                (carol_sha, json!({ "login": "carol" })),
+            ],
+        },
+    )
+    .await;
+    let mut cfg = cfg_for(&mock, bare.clone());
+    cfg.instant = true;
+    let (addr, pool) = spawn_with_pool(cfg).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-two-authors", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("2 rounds") && t.contains("/match/")),
+        "{comments:?}"
+    );
+    let id = match_id_from(&comments);
+    let hunks = git_fight_server::db::list_hunks(&pool, &id).await.unwrap();
+    assert_eq!(
+        hunks.len(),
+        2,
+        "{:?}",
+        hunks.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+    assert_eq!(hunks[0].path, "a.rs");
+    assert_eq!(hunks[0].theirs_login.as_deref(), Some("bob"));
+    assert_eq!(hunks[1].path, "b.rs");
+    assert_eq!(hunks[1].theirs_login.as_deref(), Some("carol"));
+    git_fight_server::db::insert_session(&pool, "sid-alice", 1, "alice")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-bob", 2, "bob")
+        .await
+        .unwrap();
+    git_fight_server::db::insert_session(&pool, "sid-carol", 3, "carol")
+        .await
+        .unwrap();
+    let alice_c = git_fight_server::sign_session(SESSION_KEY, "sid-alice");
+    let bob_c = git_fight_server::sign_session(SESSION_KEY, "sid-bob");
+    let carol_c = git_fight_server::sign_session(SESSION_KEY, "sid-carol");
+
+    let (mut alice_sink, mut alice_stream) = connect_cookie(addr, &id, &alice_c).await;
+    let (mut bob_sink, mut bob_stream) = connect_cookie(addr, &id, &bob_c).await;
+    let (mut carol_sink, mut carol_stream) = connect_cookie(addr, &id, &carol_c).await;
+
+    let alice_h = wait_ws_type(&mut alice_stream, "hello").await;
+    let bob_h = wait_ws_type(&mut bob_stream, "hello").await;
+    let carol_h = wait_ws_type(&mut carol_stream, "hello").await;
+    assert_eq!(alice_h["your_role"].as_str(), Some("ours"), "{alice_h}");
+    assert_eq!(bob_h["your_role"].as_str(), Some("theirs"), "{bob_h}");
+    assert_eq!(
+        carol_h["your_role"].as_str(),
+        Some("spectator"),
+        "{carol_h}"
+    );
+    let mut bob_rx = spawn_hello_drain(bob_stream);
+    let mut carol_rx = spawn_hello_drain(carol_stream);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut next_send = 0u32;
+    while next_send < 16 {
+        let ours = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+        let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
+        alice_sink.send(Message::Text(ours.into())).await.unwrap();
+        bob_sink.send(Message::Text(idle.into())).await.unwrap();
+        next_send += 1;
+    }
+    let mut ends = 0u32;
+    let mut theirs_is_carol = false;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, alice_stream.next())
+            .await
+            .expect("timeout waiting for two-author match")
+            .expect("ws closed")
+            .unwrap();
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("hello") => {
+                next_send = 0;
+                while next_send < 16 {
+                    let ours = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                    let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
+                    alice_sink.send(Message::Text(ours.into())).await.unwrap();
+                    if theirs_is_carol {
+                        carol_sink.send(Message::Text(idle.into())).await.unwrap();
+                    } else {
+                        bob_sink.send(Message::Text(idle.into())).await.unwrap();
+                    }
+                    next_send += 1;
+                }
+            }
+            Some("tick") => {
+                let n = v["n"].as_u64().unwrap() as u32;
+                while next_send <= n + 8 {
+                    let ours = format!(r#"{{"type":"input","tick":{next_send},"buttons":2}}"#);
+                    let idle = format!(r#"{{"type":"input","tick":{next_send},"buttons":0}}"#);
+                    alice_sink.send(Message::Text(ours.into())).await.unwrap();
+                    if theirs_is_carol {
+                        carol_sink.send(Message::Text(idle.into())).await.unwrap();
+                    } else {
+                        bob_sink.send(Message::Text(idle.into())).await.unwrap();
+                    }
+                    next_send += 1;
+                }
+            }
+            Some("end") => {
+                ends += 1;
+                if v["match_over"].as_bool() == Some(true) {
+                    assert_eq!(ends, 2, "{v}");
+                    break;
+                }
+                assert_eq!(v["round"].as_u64(), Some(0), "{v}");
+                theirs_is_carol = true;
+            }
+            Some("error") => panic!("{}", v["message"]),
+            _ => {}
+        }
+    }
+    assert_eq!(ends, 2);
+    let bob_later = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let v = bob_rx.recv().await.expect("bob closed");
+            if v["type"].as_str() == Some("hello") {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("bob round-2 hello");
+    let carol_later = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let v = carol_rx.recv().await.expect("carol closed");
+            if v["type"].as_str() == Some("hello") {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("carol round-2 hello");
+    assert_eq!(
+        bob_later["your_role"].as_str(),
+        Some("spectator"),
+        "{bob_later}"
+    );
+    assert_eq!(
+        carol_later["your_role"].as_str(),
+        Some("theirs"),
+        "{carol_later}"
+    );
+
+    let mut branch = None;
+    for _ in 0..80 {
+        let row = git_fight_server::db::get_match(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.result_branch.is_some() || row.abort_reason.is_some() {
+            assert!(row.abort_reason.is_none(), "unexpected abort {row:?}");
+            branch = row.result_branch;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let branch = branch.expect("result branch after two author rounds");
+    assert_eq!(
+        git_dir(&bare, &["show", &format!("{branch}:a.rs")]),
+        "fn a() { 2 }",
+        "alice (PR) should take a.rs"
+    );
+    assert_eq!(
+        git_dir(&bare, &["show", &format!("{branch}:b.rs")]),
+        "fn b() { 2 }",
+        "alice (PR) should take b.rs"
+    );
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/pr"]), head);
+    assert_eq!(git_dir(&bare, &["rev-parse", "refs/heads/base"]), base);
 }
 
 #[tokio::test]
