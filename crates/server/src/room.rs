@@ -102,15 +102,17 @@ async fn run_room(
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
     let mut next_tick = 0u32;
     let mut log: Vec<(u32, u8, u8)> = Vec::new();
-    if let Ok(inputs) = db::load_inputs(&pool, &row.id, round).await {
-        for (tick, ours, theirs) in &inputs {
-            if *tick == next_tick && sim.result.is_none() {
-                sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
-                log.push((*tick, *ours, *theirs));
-                next_tick = next_tick.saturating_add(1);
-            }
-        }
-    }
+    let mut replay_ok = try_replay_round(
+        &pool,
+        &row.id,
+        seed,
+        &hunks,
+        round,
+        &mut sim,
+        &mut log,
+        &mut next_tick,
+    )
+    .await;
 
     let mut ours = Slot {
         kind_cpu: false,
@@ -130,18 +132,15 @@ async fn run_room(
     let id = row.id.clone();
     let mut done = matches!(row.status.as_str(), "finished" | "expired" | "aborted");
     if !done && scored_all {
-        crate::stats::record_stored_winners(&pool, &id, &hunks).await;
-        let last = total_rounds.saturating_sub(1);
-        let hash = hash_from_stored_round(&pool, &id, seed, &hunks, last).await;
-        if db::finish_open_match(&pool, &id, &hash)
-            .await
-            .unwrap_or(false)
-        {
-            if let Some(ctx) = settings.result.as_ref() {
-                ctx.spawn_publish(id.clone());
-            }
-        }
-        done = true;
+        done = try_finish_scored_all(
+            &pool,
+            &id,
+            seed,
+            &hunks,
+            total_rounds,
+            settings.result.as_ref(),
+        )
+        .await;
     }
     let mut mirror = false;
     let ours_name = row.ours_name.clone();
@@ -235,10 +234,11 @@ async fn run_room(
                                     Err(_) => {}
                                 }
                             }
-                            if !done {
-                                let hello = hello_msg(
+                            if !done && !scored_all && replay_ok {
+                                send_catch_up(
+                                    &tx,
                                     &id,
-                                    round_seed(seed, round),
+                                    seed,
                                     delay,
                                     role.as_str(),
                                     conns
@@ -252,24 +252,9 @@ async fn run_room(
                                     confirmed,
                                     db::stats_for_round(&hunks, round),
                                     &hunks,
-                                );
-                                try_send_or_spawn(&tx, encode(&hello));
-                                let snap = snapshot_msg(
-                                    round_seed(seed, round),
-                                    round,
-                                    confirmed,
-                                    db::stats_for_round(&hunks, round),
                                     &log,
-                                    &hunks,
+                                    &sim,
                                 );
-                                try_send_or_spawn(&tx, encode(&snap));
-                                if let Some(result) = sim.result {
-                                    let match_over = round + 1 >= total_rounds;
-                                    try_send_or_spawn(
-                                        &tx,
-                                        encode(&end_msg(&sim, result, round, match_over)),
-                                    );
-                                }
                             }
                         }
                     }
@@ -294,7 +279,7 @@ async fn run_room(
                         theirs_buttons,
                         round: input_round,
                     } => {
-                        if done || sim.result.is_some() {
+                        if done || !replay_ok || sim.result.is_some() {
                             continue;
                         }
                         // GitHub matches require the Hello round so a leftover
@@ -344,6 +329,59 @@ async fn run_room(
         }
 
         if done {
+            continue;
+        }
+        if scored_all {
+            done = try_finish_scored_all(
+                &pool,
+                &id,
+                seed,
+                &hunks,
+                total_rounds,
+                settings.result.as_ref(),
+            )
+            .await;
+            continue;
+        }
+        if !replay_ok {
+            replay_ok = try_replay_round(
+                &pool,
+                &id,
+                seed,
+                &hunks,
+                round,
+                &mut sim,
+                &mut log,
+                &mut next_tick,
+            )
+            .await;
+            if replay_ok {
+                let confirmed = if next_tick == 0 {
+                    -1
+                } else {
+                    next_tick as i32 - 1
+                };
+                for conn in conns.values() {
+                    let role = conn_role(conn, &row, &hunks, round, github);
+                    send_catch_up(
+                        &conn.tx,
+                        &id,
+                        seed,
+                        delay,
+                        role.as_str(),
+                        conn.login.as_deref().unwrap_or(""),
+                        &ours_name,
+                        &theirs_name,
+                        round,
+                        total_rounds,
+                        confirmed,
+                        db::stats_for_round(&hunks, round),
+                        &hunks,
+                        &log,
+                        &sim,
+                    );
+                }
+            }
             continue;
         }
 
@@ -683,7 +721,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
             return false;
         }
         let msg = encode(&end_msg(a.sim, result, *a.round, true));
-        broadcast(a.conns, &msg);
+        broadcast_or_spawn(a.conns, &msg);
         return true;
     }
     // Clients advance Input.round on End. A busy open-status read must
@@ -748,19 +786,129 @@ pub(crate) async fn hash_from_stored_round(
     seed: u64,
     hunks: &[db::HunkRow],
     round: u32,
-) -> String {
+) -> Option<String> {
+    let inputs = db::load_inputs(pool, id, round).await.ok()?;
     let (ours_stats, theirs_stats) = db::stats_for_round(hunks, round);
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
-    if let Ok(inputs) = db::load_inputs(pool, id, round).await {
-        for (_tick, ours, theirs) in inputs {
-            if sim.result.is_some() {
-                break;
-            }
-            sim.step(Input::from_u8(ours), Input::from_u8(theirs));
+    for (_tick, ours, theirs) in inputs {
+        if sim.result.is_some() {
+            break;
         }
+        sim.step(Input::from_u8(ours), Input::from_u8(theirs));
     }
     let (lo, hi) = split_hash(sim.state_hash());
-    format!("{hi:08x}{lo:08x}")
+    Some(format!("{hi:08x}{lo:08x}"))
+}
+
+async fn try_finish_scored_all(
+    pool: &SqlitePool,
+    id: &str,
+    seed: u64,
+    hunks: &[db::HunkRow],
+    total_rounds: u32,
+    result: Option<&ResultCtx>,
+) -> bool {
+    crate::stats::record_stored_winners(pool, id, hunks).await;
+    let last = total_rounds.saturating_sub(1);
+    let Some(hash) = hash_from_stored_round(pool, id, seed, hunks, last).await else {
+        return false;
+    };
+    if db::finish_open_match(pool, id, &hash)
+        .await
+        .unwrap_or(false)
+    {
+        if let Some(ctx) = result {
+            ctx.spawn_publish(id.to_string());
+        }
+    }
+    true
+}
+
+fn apply_input_log(
+    sim: &mut FightState,
+    log: &mut Vec<(u32, u8, u8)>,
+    next_tick: &mut u32,
+    inputs: &[(u32, u8, u8)],
+) {
+    *next_tick = 0;
+    log.clear();
+    for (tick, ours, theirs) in inputs {
+        if *tick == *next_tick && sim.result.is_none() {
+            sim.step(Input::from_u8(*ours), Input::from_u8(*theirs));
+            log.push((*tick, *ours, *theirs));
+            *next_tick = next_tick.saturating_add(1);
+        }
+    }
+}
+
+async fn try_replay_round(
+    pool: &SqlitePool,
+    id: &str,
+    seed: u64,
+    hunks: &[db::HunkRow],
+    round: u32,
+    sim: &mut FightState,
+    log: &mut Vec<(u32, u8, u8)>,
+    next_tick: &mut u32,
+) -> bool {
+    let Ok(inputs) = db::load_inputs(pool, id, round).await else {
+        return false;
+    };
+    let (ours_stats, theirs_stats) = db::stats_for_round(hunks, round);
+    *sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
+    apply_input_log(sim, log, next_tick, &inputs);
+    true
+}
+
+fn send_catch_up(
+    tx: &mpsc::Sender<String>,
+    match_id: &str,
+    seed: u64,
+    delay: u32,
+    role: &str,
+    you_are: &str,
+    ours_name: &str,
+    theirs_name: &str,
+    round: u32,
+    total_rounds: u32,
+    confirmed: i32,
+    stats: (FighterStats, FighterStats),
+    hunks: &[db::HunkRow],
+    log: &[(u32, u8, u8)],
+    sim: &FightState,
+) {
+    try_send_or_spawn(
+        tx,
+        encode(&hello_msg(
+            match_id,
+            round_seed(seed, round),
+            delay,
+            role,
+            you_are,
+            ours_name,
+            theirs_name,
+            round,
+            total_rounds,
+            confirmed,
+            stats,
+            hunks,
+        )),
+    );
+    try_send_or_spawn(
+        tx,
+        encode(&snapshot_msg(
+            round_seed(seed, round),
+            round,
+            confirmed,
+            stats,
+            log,
+            hunks,
+        )),
+    );
+    if let Some(result) = sim.result {
+        let match_over = round + 1 >= total_rounds;
+        try_send_or_spawn(tx, encode(&end_msg(sim, result, round, match_over)));
+    }
 }
 
 fn terminal_ws_error(row: &MatchRow) -> String {
@@ -807,7 +955,7 @@ async fn expire_now(
             let msg = encode(&ServerMsg::Error {
                 message: terminal_ws_error(row),
             });
-            broadcast(conns, &msg);
+            broadcast_or_spawn(conns, &msg);
             return;
         }
     }
@@ -817,7 +965,7 @@ async fn expire_now(
             let msg = encode(&ServerMsg::Error {
                 message: terminal_ws_error(row),
             });
-            broadcast(conns, &msg);
+            broadcast_or_spawn(conns, &msg);
         }
         return;
     }
@@ -831,7 +979,7 @@ async fn expire_now(
     let msg = encode(&ServerMsg::Error {
         message: "expired".into(),
     });
-    broadcast(conns, &msg);
+    broadcast_or_spawn(conns, &msg);
 }
 
 fn end_msg(sim: &FightState, result: RoundResult, round: u32, match_over: bool) -> ServerMsg {
@@ -925,6 +1073,13 @@ fn snapshot_msg(
 fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
     for conn in conns.values() {
         let _ = conn.tx.try_send(msg.to_string());
+    }
+}
+
+/// Terminal End / Error cannot be recovered from Snapshot. Queue if full.
+fn broadcast_or_spawn(conns: &BTreeMap<u64, Conn>, msg: &str) {
+    for conn in conns.values() {
+        try_send_or_spawn(&conn.tx, msg.to_string());
     }
 }
 
@@ -1284,5 +1439,38 @@ mod tests {
             .expect("spawned send waited")
             .expect("channel open");
         assert_eq!(next, "hello");
+    }
+
+    #[tokio::test]
+    async fn broadcast_or_spawn_delivers_when_buffer_is_full() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("held".into()).unwrap();
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            1,
+            Conn {
+                login: None,
+                token: None,
+                tx,
+            },
+        );
+        broadcast_or_spawn(&conns, r#"{"type":"end","match_over":true}"#);
+        assert_eq!(rx.recv().await.as_deref(), Some("held"));
+        let next = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("spawned End waited")
+            .expect("channel open");
+        assert!(next.contains("match_over"), "{next}");
+    }
+
+    #[test]
+    fn apply_input_log_replays_dense_ticks() {
+        let mut sim = FightState::new(1, FighterStats::default(), FighterStats::default());
+        let mut log = Vec::new();
+        let mut next = 0u32;
+        apply_input_log(&mut sim, &mut log, &mut next, &[(0, 1, 0), (1, 0, 2)]);
+        assert_eq!(next, 2);
+        assert_eq!(log, vec![(0, 1, 0), (1, 0, 2)]);
+        assert_eq!(sim.tick, 2);
     }
 }
