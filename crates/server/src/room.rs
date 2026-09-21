@@ -628,10 +628,45 @@ async fn match_is_open(pool: &SqlitePool, id: &str) -> MatchOpen {
     }
 }
 
-/// Last round is done only after `finish_open_match` or a known close.
-/// A busy mark must retry so a won fight cannot sit `in_progress` until expiry.
-fn last_round_done(marked: bool, open: MatchOpen) -> bool {
-    marked || open == MatchOpen::Closed
+/// After the last-round `finished` write: send `match_over` End only when
+/// the row is actually finished. Aborted/expired (SHA-drift, 24h) is a
+/// terminal Error, not a replay URL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LastRound {
+    MatchOver,
+    Terminal,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LastRoundStatus {
+    Open,
+    Finished,
+    Closed,
+    Unknown,
+}
+
+fn last_round_followup(marked: bool, status: LastRoundStatus) -> LastRound {
+    if marked {
+        return LastRound::MatchOver;
+    }
+    match status {
+        LastRoundStatus::Finished => LastRound::MatchOver,
+        LastRoundStatus::Closed => LastRound::Terminal,
+        LastRoundStatus::Open | LastRoundStatus::Unknown => LastRound::Retry,
+    }
+}
+
+async fn match_last_round_status(pool: &SqlitePool, id: &str) -> LastRoundStatus {
+    match db::get_match(pool, id).await {
+        Err(_) => LastRoundStatus::Unknown,
+        Ok(None) => LastRoundStatus::Closed,
+        Ok(Some(row)) => match row.status.as_str() {
+            "finished" => LastRoundStatus::Finished,
+            "pending" | "in_progress" => LastRoundStatus::Open,
+            _ => LastRoundStatus::Closed,
+        },
+    }
 }
 
 /// After a non-final winner is stored, broadcast End only when the row is
@@ -719,12 +754,19 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
             if let Some(ctx) = a.result.as_ref() {
                 ctx.spawn_publish(a.id.to_string());
             }
-        } else if !last_round_done(false, match_is_open(a.pool, a.id).await) {
-            return false;
         }
-        let msg = encode(&end_msg(a.sim, result, *a.round, true));
-        broadcast_or_spawn(a.conns, &msg);
-        return true;
+        match last_round_followup(marked, match_last_round_status(a.pool, a.id).await) {
+            LastRound::Retry => return false,
+            LastRound::Terminal => {
+                expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                return true;
+            }
+            LastRound::MatchOver => {
+                let msg = encode(&end_msg(a.sim, result, *a.round, true));
+                broadcast_or_spawn(a.conns, &msg);
+                return true;
+            }
+        }
     }
     // Clients advance Input.round on End. A busy open-status read must
     // retry without that broadcast so GitHub inputs for the next conflict
@@ -737,11 +779,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
         AfterNonFinal::Retry => return false,
         AfterNonFinal::EndAndAdvance => {}
     }
-    let msg = encode(&end_msg(a.sim, result, *a.round, false));
-    // Clients advance Input.round on End. Queue if the outbound
-    // channel is full — Snapshot ticks do not recover a missed
-    // inter-round End, and --instant will not idle-confirm.
-    broadcast_or_spawn(a.conns, &msg);
+    let end = encode(&end_msg(a.sim, result, *a.round, false));
     *a.round += 1;
     let (ours_stats, theirs_stats) = db::stats_for_round(a.hunks, *a.round);
     *a.sim = FightState::new(round_seed(a.seed, *a.round), ours_stats, theirs_stats);
@@ -780,7 +818,9 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
             db::stats_for_round(a.hunks, *a.round),
             a.hunks,
         );
-        try_send_or_spawn(&conn.tx, encode(&hello));
+        // End then Hello on the same socket. Independent spawned
+        // sends can reorder; clients advance Input.round on End.
+        try_send_pair_or_spawn(&conn.tx, end.clone(), encode(&hello));
     }
     false
 }
@@ -828,7 +868,10 @@ async fn try_finish_scored_all(
     }
     // Same retry as live last-round finish: a busy mark must not
     // stop the room while the row is still pending/in_progress.
-    last_round_done(marked, match_is_open(pool, id).await)
+    !matches!(
+        last_round_followup(marked, match_last_round_status(pool, id).await),
+        LastRound::Retry
+    )
 }
 
 fn apply_input_log(
@@ -1110,6 +1153,23 @@ fn try_send_or_spawn(tx: &mpsc::Sender<String>, msg: String) {
             }
             mpsc::error::TrySendError::Closed(_) => {}
         }
+    }
+}
+
+/// Inter-round End must land before the next-round Hello on the same
+/// socket. One spawned send pair keeps that order when the outbound
+/// channel is full.
+fn try_send_pair_or_spawn(tx: &mpsc::Sender<String>, first: String, second: String) {
+    match tx.try_send(first) {
+        Ok(()) => try_send_or_spawn(tx, second),
+        Err(mpsc::error::TrySendError::Full(first)) => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(first).await;
+                let _ = tx.send(second).await;
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
 }
 
@@ -1418,14 +1478,27 @@ mod tests {
             FinishAfterWrite::Retry,
             "cannot tell whether the hunk exists; do not ghost-advance"
         );
-        assert!(last_round_done(true, MatchOpen::Open));
-        assert!(last_round_done(false, MatchOpen::Closed));
-        assert!(
-            !last_round_done(false, MatchOpen::Open),
+        assert_eq!(
+            last_round_followup(true, LastRoundStatus::Open),
+            LastRound::MatchOver
+        );
+        assert_eq!(
+            last_round_followup(false, LastRoundStatus::Finished),
+            LastRound::MatchOver
+        );
+        assert_eq!(
+            last_round_followup(false, LastRoundStatus::Closed),
+            LastRound::Terminal,
+            "aborted/expired must not send match_over End"
+        );
+        assert_eq!(
+            last_round_followup(false, LastRoundStatus::Open),
+            LastRound::Retry,
             "still in_progress: retry finish_open_match"
         );
-        assert!(
-            !last_round_done(false, MatchOpen::Unknown),
+        assert_eq!(
+            last_round_followup(false, LastRoundStatus::Unknown),
+            LastRound::Retry,
             "busy mark must not leave a won fight without a room"
         );
         assert_eq!(
@@ -1496,6 +1569,28 @@ mod tests {
             .expect("channel open");
         assert!(next.contains("\"round\":0"), "{next}");
         assert!(next.contains("match_over"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn try_send_pair_or_spawn_preserves_end_then_hello() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("held".into()).unwrap();
+        try_send_pair_or_spawn(
+            &tx,
+            r#"{"type":"end","match_over":false}"#.into(),
+            r#"{"type":"hello","round":1}"#.into(),
+        );
+        assert_eq!(rx.recv().await.as_deref(), Some("held"));
+        let end = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("spawned End waited")
+            .expect("channel open");
+        let hello = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("Hello after End")
+            .expect("channel open");
+        assert!(end.contains("end"), "{end}");
+        assert!(hello.contains("hello"), "{hello}");
     }
 
     #[test]
