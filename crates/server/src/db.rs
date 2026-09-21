@@ -868,6 +868,7 @@ pub async fn update_match_fighters(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub struct NewHunk<'a> {
     pub match_id: &'a str,
     pub round: i64,
@@ -883,6 +884,23 @@ pub struct NewHunk<'a> {
 }
 
 pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx::Error> {
+    insert_hunks(pool, std::slice::from_ref(h)).await
+}
+
+/// All hunks or none. A mid-loop failure must not leave a partial open match.
+pub async fn insert_hunks(pool: &SqlitePool, hunks: &[NewHunk<'_>]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    for h in hunks {
+        insert_hunk_exec(&mut *tx, h).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_hunk_exec<'e, E>(executor: E, h: &NewHunk<'_>) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
     // Result rebuilds from merge-tree + picks. Do not keep 1 MiB conflict
     // blobs in SQLite (hostile repo disk, and unused at resolve time).
     let _ = (h.ours, h.theirs, h.base);
@@ -918,7 +936,7 @@ pub async fn insert_hunk(pool: &SqlitePool, h: &NewHunk<'_>) -> Result<(), sqlx:
     .bind(i64::from(h.theirs_stats.hp))
     .bind(h.theirs_stats.armor as i64)
     .bind(h.theirs_stats.special as i64)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -1392,17 +1410,24 @@ pub async fn get_player_stats(
         }))
 }
 
+/// Write-once. A later fight-link id cannot replace the first POST.
 pub async fn set_challenge_comment_id(
     pool: &SqlitePool,
     id: &str,
     comment_id: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE matches SET challenge_comment_id = ? WHERE id = ?")
-        .bind(comment_id)
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> Result<bool, sqlx::Error> {
+    if comment_id <= 0 {
+        return Ok(false);
+    }
+    let res = sqlx::query(
+        "UPDATE matches SET challenge_comment_id = ?
+         WHERE id = ? AND challenge_comment_id IS NULL",
+    )
+    .bind(comment_id)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Record the create-only branch or a skip reason. First writer wins.
@@ -1777,11 +1802,54 @@ mod tests {
         let rows = list_uncommented_open_matches(&pool).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "cmt1");
-        set_challenge_comment_id(&pool, "cmt1", 99).await.unwrap();
+        assert!(set_challenge_comment_id(&pool, "cmt1", 99).await.unwrap());
+        assert!(
+            !set_challenge_comment_id(&pool, "cmt1", 100).await.unwrap(),
+            "the first fight-link id is write-once"
+        );
+        assert_eq!(
+            get_match(&pool, "cmt1")
+                .await
+                .unwrap()
+                .unwrap()
+                .challenge_comment_id,
+            Some(99)
+        );
         assert!(list_uncommented_open_matches(&pool)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_hunks_rolls_back_a_partial_batch() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "batch1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        let ok = NewHunk {
+            match_id: "batch1",
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: None,
+            ours_stats: git_fight_core::FighterStats::default(),
+            theirs_stats: git_fight_core::FighterStats::default(),
+        };
+        let bad = NewHunk {
+            path: "../x.rs",
+            round: 1,
+            ..ok
+        };
+        assert!(insert_hunks(&pool, &[ok, bad]).await.is_err());
+        assert!(
+            list_hunks(&pool, "batch1").await.unwrap().is_empty(),
+            "a failed later hunk must not leave a partial open match"
+        );
     }
 
     #[tokio::test]

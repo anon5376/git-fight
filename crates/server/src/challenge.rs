@@ -6,10 +6,93 @@ use crate::gitutil;
 use crate::limits::{GIT_JOB_TIMEOUT, MAX_HUNKS, MAX_REPO_KB};
 use crate::protocol::INPUT_DELAY;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+
+/// In-flight fight-link posts and comment ids that posted but have not
+/// been stored. Restart loses this; the expirer posts leftover rows.
+#[derive(Clone, Default)]
+pub struct CommentTrack {
+    inflight: Arc<std::sync::Mutex<HashSet<String>>>,
+    pending_ids: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+}
+
+impl CommentTrack {
+    pub fn mark(&self, id: &str) {
+        if let Ok(mut g) = self.inflight.lock() {
+            g.insert(id.to_string());
+        }
+    }
+
+    pub fn unmark(&self, id: &str) {
+        if let Ok(mut g) = self.inflight.lock() {
+            g.remove(id);
+        }
+    }
+
+    pub fn is_inflight(&self, id: &str) -> bool {
+        self.inflight
+            .lock()
+            .map(|g| g.contains(id))
+            .unwrap_or(false)
+    }
+
+    pub fn queue_id(&self, id: String, comment_id: i64) {
+        if comment_id <= 0 {
+            return;
+        }
+        if let Ok(mut g) = self.pending_ids.lock() {
+            g.insert(id, comment_id);
+        }
+    }
+
+    pub fn pending_snapshot(&self) -> Vec<(String, i64)> {
+        self.pending_ids
+            .lock()
+            .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn dequeue_id(&self, id: &str) {
+        if let Ok(mut g) = self.pending_ids.lock() {
+            g.remove(id);
+        }
+    }
+
+    pub fn has_pending(&self, id: &str) -> bool {
+        self.pending_ids
+            .lock()
+            .map(|g| g.contains_key(id))
+            .unwrap_or(false)
+    }
+}
+
+/// Store a posted fight-link id, or queue it so the expirer SETs instead
+/// of POSTing a second comment.
+pub(crate) async fn persist_challenge_comment(
+    pool: &SqlitePool,
+    comments: &CommentTrack,
+    match_id: &str,
+    posted: u64,
+) {
+    if posted == 0 {
+        comments.unmark(match_id);
+        return;
+    }
+    match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
+        Ok(_) => comments.unmark(match_id),
+        Err(_) => match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
+            Ok(_) => comments.unmark(match_id),
+            Err(_) => {
+                comments.queue_id(match_id.to_string(), posted as i64);
+                comments.unmark(match_id);
+            }
+        },
+    }
+}
 
 #[derive(Clone)]
 pub struct ChallengeCtx {
@@ -18,6 +101,7 @@ pub struct ChallengeCtx {
     pub public_url: String,
     pub test_repos: HashMap<String, PathBuf>,
     pub expire_secs: i64,
+    pub comments: CommentTrack,
 }
 
 pub struct ChallengeStart {
@@ -376,28 +460,30 @@ pub async fn start_challenge(
         return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
     }
 
-    for (round, (h, (ours_stats, theirs_stats))) in hunks.iter().zip(stats).enumerate() {
-        if db::insert_hunk(
-            &ctx.pool,
-            &db::NewHunk {
-                match_id: &id,
-                round: round as i64,
-                path: &h.path,
-                hunk_index: h.hunk_index as i64,
-                ours: &h.ours,
-                theirs: &h.theirs,
-                base: &h.base,
-                theirs_login: sides.get(round).and_then(|s| s.2.as_deref()),
-                theirs_name: sides.get(round).map(|s| s.1.as_str()),
-                ours_stats,
-                theirs_stats,
-            },
-        )
-        .await
-        .is_err()
-        {
-            return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
-        }
+    let new_hunks: Vec<db::NewHunk<'_>> = hunks
+        .iter()
+        .zip(stats)
+        .enumerate()
+        .map(|(round, (h, (ours_stats, theirs_stats)))| db::NewHunk {
+            match_id: &id,
+            round: round as i64,
+            path: &h.path,
+            hunk_index: h.hunk_index as i64,
+            ours: &h.ours,
+            theirs: &h.theirs,
+            base: &h.base,
+            theirs_login: sides.get(round).and_then(|s| s.2.as_deref()),
+            theirs_name: sides.get(round).map(|s| s.1.as_str()),
+            ours_stats,
+            theirs_stats,
+        })
+        .collect();
+    // Hold the fight-link slot before hunks become visible so the 5s
+    // expirer cannot POST while clone finish is still posting.
+    ctx.comments.mark(&id);
+    if db::insert_hunks(&ctx.pool, &new_hunks).await.is_err() {
+        ctx.comments.unmark(&id);
+        return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
     }
 
     let rounds = hunks.len();
@@ -406,7 +492,10 @@ pub async fn start_challenge(
     // The 5s expirer posts uncommented open rows that still have hunks.
     match db::is_open_match(&ctx.pool, &id).await {
         Ok(true) => {}
-        Ok(false) | Err(_) => return Ok(silent()),
+        Ok(false) | Err(_) => {
+            ctx.comments.unmark(&id);
+            return Ok(silent());
+        }
     }
     Ok(ChallengeStart {
         body: fight_link_body(
@@ -649,5 +738,20 @@ mod tests {
 
     fn first_or_retry(first: Result<bool, ()>, retry: Result<bool, ()>) -> Result<bool, ()> {
         first.or(retry)
+    }
+
+    #[test]
+    fn comment_track_skips_inflight_and_pending() {
+        let track = CommentTrack::default();
+        track.mark("m1");
+        assert!(track.is_inflight("m1"));
+        assert!(!track.has_pending("m1"));
+        track.queue_id("m1".into(), 42);
+        track.unmark("m1");
+        assert!(!track.is_inflight("m1"));
+        assert!(track.has_pending("m1"));
+        assert_eq!(track.pending_snapshot(), vec![("m1".into(), 42)]);
+        track.dequeue_id("m1");
+        assert!(!track.has_pending("m1"));
     }
 }

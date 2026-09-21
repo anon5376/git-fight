@@ -250,6 +250,7 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         public_url: state.auth.public_url.clone(),
         test_repos: state.test_repos.clone(),
         expire_secs: state.config.expire_secs,
+        comments: state.comments.clone(),
     };
     let owner = crate::gh::fold_github_name(&repo.owner.login);
     let name = crate::gh::fold_github_name(&repo.name);
@@ -270,7 +271,10 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         if let Some(ref match_id) = start.match_id {
             match open_for_comment_retry(&ctx.pool, match_id).await {
                 Ok(true) => {}
-                Ok(false) => return,
+                Ok(false) => {
+                    ctx.comments.unmark(match_id);
+                    return;
+                }
                 Err(_) => {
                     schedule_challenge_comment(ctx, inst, owner, name, number, start);
                     return;
@@ -339,9 +343,15 @@ fn schedule_challenge_comment(
                     post_challenge_comment(&ctx, inst, &owner, &name, number, &start).await;
                     return;
                 }
-                Ok(false) => return,
+                Ok(false) => {
+                    ctx.comments.unmark(match_id);
+                    return;
+                }
                 Err(_) => {}
             }
+        }
+        if let Some(ref match_id) = start.match_id {
+            ctx.comments.unmark(match_id);
         }
     });
 }
@@ -360,9 +370,8 @@ async fn post_challenge_comment(
         .await
         .unwrap_or(0);
     if let Some(match_id) = start.match_id.as_deref() {
-        if posted > 0 {
-            let _ = db::set_challenge_comment_id(&ctx.pool, match_id, posted as i64).await;
-        }
+        crate::challenge::persist_challenge_comment(&ctx.pool, &ctx.comments, match_id, posted)
+            .await;
     }
 }
 

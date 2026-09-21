@@ -117,6 +117,7 @@ pub struct AppState {
     /// SHA-drift aborts that exhausted the short retry loop. Restart loses
     /// this map; the next `synchronize` or 24h expiry covers leftover rows.
     pending_aborts: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pub(crate) comments: crate::challenge::CommentTrack,
     pub github: Option<GitHub>,
     pub auth: Auth,
     pub webhook_secret: Option<Vec<u8>>,
@@ -259,7 +260,17 @@ impl AppState {
         }
     }
 
+    async fn retry_pending_comment_ids(&self) {
+        for (id, comment_id) in self.comments.pending_snapshot() {
+            match db::set_challenge_comment_id(&self.pool, &id, comment_id).await {
+                Ok(_) => self.comments.dequeue_id(&id),
+                Err(_) => {}
+            }
+        }
+    }
+
     async fn post_uncommented_challenges(&self) {
+        self.retry_pending_comment_ids().await;
         let Some(gh) = &self.github else {
             return;
         };
@@ -267,6 +278,9 @@ impl AppState {
             return;
         };
         for row in rows {
+            if self.comments.is_inflight(&row.id) || self.comments.has_pending(&row.id) {
+                continue;
+            }
             if row.pr_number <= 0 || row.owner.is_empty() {
                 continue;
             }
@@ -297,13 +311,18 @@ impl AppState {
                 &row.theirs_name,
                 hunks.len(),
             );
+            self.comments.mark(&row.id);
             let posted = gh
                 .comment(inst, &row.owner, &row.repo, row.pr_number as u64, &body)
                 .await
                 .unwrap_or(0);
-            if posted > 0 {
-                let _ = db::set_challenge_comment_id(&self.pool, &row.id, posted as i64).await;
-            }
+            crate::challenge::persist_challenge_comment(
+                &self.pool,
+                &self.comments,
+                &row.id,
+                posted,
+            )
+            .await;
         }
     }
 
@@ -374,6 +393,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         rooms: Arc::new(Mutex::new(HashMap::new())),
         publishing: Arc::new(Mutex::new(HashSet::new())),
         pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        comments: crate::challenge::CommentTrack::default(),
     };
     if let Ok(rows) = db::list_live_matches(&state.pool).await {
         for row in rows {
@@ -392,6 +412,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
             allow_unhashed = true;
             expirer.retry_pending_aborts().await;
             expirer.abort_stale_preparing().await;
+            expirer.retry_pending_comment_ids().await;
             expirer.post_uncommented_challenges().await;
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
                 for id in ids {
@@ -983,6 +1004,7 @@ mod tests {
             rooms: Arc::new(Mutex::new(map)),
             publishing: Arc::new(Mutex::new(HashSet::new())),
             pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            comments: crate::challenge::CommentTrack::default(),
             github: None,
             auth: Auth::default(),
             webhook_secret: None,
@@ -1000,6 +1022,7 @@ mod tests {
             rooms: Arc::new(Mutex::new(HashMap::new())),
             publishing: Arc::new(Mutex::new(HashSet::new())),
             pending_aborts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            comments: crate::challenge::CommentTrack::default(),
             github: None,
             auth: Auth::default(),
             webhook_secret: None,
