@@ -218,12 +218,20 @@ async fn run_room(
                                 &mut theirs,
                             );
                             if ours.seen && theirs.seen && started_at.is_none() {
-                                if db::start_open_match(&pool, &id).await.unwrap_or(false) {
-                                    started_at = Some(Instant::now());
-                                } else {
-                                    send_closed(&tx, &pool, &id).await;
-                                    expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
-                                    done = true;
+                                match db::start_open_match(&pool, &id).await {
+                                    Ok(true) => started_at = Some(Instant::now()),
+                                    Ok(false) => {
+                                        send_closed(&tx, &pool, &id).await;
+                                        expire_now(
+                                            &pool,
+                                            &id,
+                                            &conns,
+                                            settings.result.as_ref(),
+                                        )
+                                        .await;
+                                        done = true;
+                                    }
+                                    Err(_) => {}
                                 }
                             }
                             if !done {
@@ -403,6 +411,16 @@ async fn advance(a: Advance<'_>) -> bool {
     }
     if let Some(result) = a.sim.result {
         return finish(a, result).await;
+    }
+    if a.started_at.is_none() && a.ours.seen && a.theirs.seen {
+        match db::start_open_match(a.pool, a.id).await {
+            Ok(true) => *a.started_at = Some(Instant::now()),
+            Ok(false) => {
+                expire_now(a.pool, a.id, a.conns, a.result.as_ref()).await;
+                return true;
+            }
+            Err(_) => return false,
+        }
     }
 
     // Disconnect forfeit is only for someone who already occupied a slot

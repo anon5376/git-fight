@@ -315,7 +315,7 @@ pub async fn start_challenge(
     for h in &mut hunks {
         h.drop_payload();
     }
-    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
+    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(true) {
         return Ok(silent());
     }
     let mut login_cache: HashMap<String, Option<String>> = HashMap::new();
@@ -383,7 +383,7 @@ pub async fn start_challenge(
     let rounds = hunks.len();
     let vs = vs_line(&display_login, &theirs_kind, &theirs_name);
     let link = format!("{}/match/{id}", ctx.public_url.trim_end_matches('/'));
-    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(false) {
+    if !db::is_open_match(&ctx.pool, &id).await.unwrap_or(true) {
         return Ok(silent());
     }
     Ok(ChallengeStart {
