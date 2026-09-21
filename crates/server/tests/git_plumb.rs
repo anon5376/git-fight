@@ -476,6 +476,17 @@ async fn git_rejects_option_injection_in_revs() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("unsafe revision"), "{err}");
+    let err = gitutil::fetch_pr_objects(
+        dir.path(),
+        1,
+        "--upload-pack=true",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        Some("main"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("unsafe revision"), "{err}");
     let err = gitutil::cat_blob(
         dir.path(),
         "--upload-pack=true",
@@ -485,4 +496,30 @@ async fn git_rejects_option_injection_in_revs() {
     .unwrap_err();
     assert!(err.to_string().contains("unsafe revision"), "{err}");
     assert!(!err.to_string().contains("ghs_live_token_secret"), "{err}");
+}
+
+#[tokio::test]
+async fn fetch_pr_objects_reads_github_pull_ref() {
+    let (_keep, bare, head, base) = conflict_bare();
+    git(&bare, &["update-ref", "refs/pull/1/head", &head]);
+    git(&bare, &["update-ref", "-d", "refs/heads/pr"]);
+    let dest = tempfile::tempdir().unwrap();
+    let clone = dest.path().join("c.git");
+    let url = format!("file://{}", bare.display());
+    gitutil::clone_bare(&url, &clone, None).await.unwrap();
+    let refs = git(&clone, &["show-ref"]);
+    assert!(
+        !refs.contains("refs/pull/"),
+        "clone must not copy pull refs: {refs}"
+    );
+    gitutil::fetch_pr_objects(&clone, 1, &head, &base, Some("base"), None)
+        .await
+        .expect("pull/1/head fetch");
+    let fetched = git(&clone, &["rev-parse", "refs/git-fight-fetch/head"]);
+    assert_eq!(fetched, head);
+    let (_tree, paths, code) = gitutil::merge_tree(&clone, &base, &head, None)
+        .await
+        .unwrap();
+    assert_eq!(code, 1);
+    assert!(paths.contains("lib.rs"));
 }

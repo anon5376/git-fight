@@ -164,6 +164,8 @@ pub async fn clone_bare(url: &str, dest: &Path, bearer: Option<&str>) -> Result<
         "clone",
         "--bare",
         "--filter=blob:none",
+        "--no-tags",
+        "--no-local",
         url,
         dest.to_str()
             .ok_or_else(|| GitError::Command("dest".into()))?,
@@ -189,7 +191,8 @@ pub async fn fetch_shas(dir: &Path, shas: &[&str], bearer: Option<&str>) -> Resu
         return Err(GitError::Command("unsafe revision".into()));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.arg("fetch").arg("origin").args(shas.iter().copied());
+    cmd.args(["fetch", "--no-tags", "origin"]);
+    cmd.args(shas.iter().copied());
     let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 {
         let msg = redact_git_text(&String::from_utf8_lossy(&err));
@@ -198,6 +201,75 @@ pub async fn fetch_shas(dir: &Path, shas: &[&str], bearer: Option<&str>) -> Resu
         }
         return Err(GitError::Command(msg));
     }
+    Ok(())
+}
+
+fn is_safe_refname(s: &str) -> bool {
+    let n = s.len();
+    (1..=255).contains(&n)
+        && !s.starts_with('-')
+        && !s.starts_with('/')
+        && !s.ends_with('/')
+        && !s.ends_with('.')
+        && !s.contains("..")
+        && !s.contains("//")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+}
+
+async fn fetch_refspec(dir: &Path, refspec: &str, bearer: Option<&str>) -> Result<(), GitError> {
+    let mut cmd = git_dir(dir, bearer);
+    cmd.args(["fetch", "--no-tags", "origin", refspec]);
+    let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
+    if code != 0 {
+        return Err(git_err(&err));
+    }
+    Ok(())
+}
+
+async fn ensure_commit(dir: &Path, sha: &str, bearer: Option<&str>) -> Result<(), GitError> {
+    if !is_safe_rev(sha) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    let mut cmd = git_dir(dir, bearer);
+    cmd.args(["cat-file", "-t", sha]);
+    let (code, out, err) = run(cmd, Duration::from_secs(20)).await?;
+    if code != 0 {
+        return Err(git_err(&err));
+    }
+    if String::from_utf8_lossy(&out).trim() != "commit" {
+        return Err(GitError::Command("not a commit".into()));
+    }
+    Ok(())
+}
+
+/// GitHub clone copies `refs/heads/*` and tags, not `refs/pull/<n>/head`.
+/// Fork PR heads (and same-repo heads that are not a branch name we cloned)
+/// only exist on that pull ref. Fetch it, then require both SHAs to exist.
+pub async fn fetch_pr_objects(
+    dir: &Path,
+    pr_number: u64,
+    head_sha: &str,
+    base_sha: &str,
+    base_ref: Option<&str>,
+    bearer: Option<&str>,
+) -> Result<(), GitError> {
+    if !is_safe_rev(head_sha) || !is_safe_rev(base_sha) {
+        return Err(GitError::Command("unsafe revision".into()));
+    }
+    if (1..=99_999_999).contains(&pr_number) {
+        let spec = format!("+refs/pull/{pr_number}/head:refs/git-fight-fetch/head");
+        let _ = fetch_refspec(dir, &spec, bearer).await;
+    }
+    if let Some(r) = base_ref {
+        if is_safe_refname(r) {
+            let spec = format!("+refs/heads/{r}:refs/git-fight-fetch/base");
+            let _ = fetch_refspec(dir, &spec, bearer).await;
+        }
+    }
+    let _ = fetch_shas(dir, &[head_sha, base_sha], bearer).await;
+    ensure_commit(dir, head_sha, bearer).await?;
+    ensure_commit(dir, base_sha, bearer).await?;
     Ok(())
 }
 
@@ -839,6 +911,11 @@ mod tests {
         assert!(!is_safe_rev("../main"));
         assert!(!is_safe_rev("--upload-pack=true"));
         assert!(!is_safe_rev("-C"));
+        assert!(is_safe_refname("main"));
+        assert!(is_safe_refname("feat/foo-bar"));
+        assert!(!is_safe_refname("--upload-pack=true"));
+        assert!(!is_safe_refname("../main"));
+        assert!(!is_safe_refname("heads//x"));
         assert!(is_safe_blob_spec(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:lib.rs"
         ));

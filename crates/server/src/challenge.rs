@@ -168,9 +168,16 @@ pub async fn start_challenge(
     {
         return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
     }
-    if gitutil::fetch_shas(&dest, &[&pr.head.sha, &pr.base.sha], bearer.as_deref())
-        .await
-        .is_err()
+    if gitutil::fetch_pr_objects(
+        &dest,
+        number,
+        &pr.head.sha,
+        &pr.base.sha,
+        Some(pr.base.r#ref.as_str()),
+        bearer.as_deref(),
+    )
+    .await
+    .is_err()
     {
         return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
     }

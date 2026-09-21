@@ -126,6 +126,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    let mut base_ref = String::new();
     if let Some(gh) = &ctx.gh {
         if let Some(inst) = row.installation_id.map(|i| i as u64) {
             let pr = match gh
@@ -158,6 +159,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
                 let _ = db::set_result_branch(&ctx.pool, match_id, None, Some("outdated")).await;
                 return Ok(());
             }
+            base_ref = pr.base.r#ref;
         }
     }
 
@@ -214,9 +216,16 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
         )
         .await;
     }
-    if gitutil::fetch_shas(
+    if gitutil::fetch_pr_objects(
         &dest,
-        &[&row.pr_head_sha, &row.pr_base_sha],
+        row.pr_number as u64,
+        &row.pr_head_sha,
+        &row.pr_base_sha,
+        if base_ref.is_empty() {
+            None
+        } else {
+            Some(base_ref.as_str())
+        },
         bearer.as_deref(),
     )
     .await
