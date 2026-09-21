@@ -197,14 +197,15 @@ Hello { match_id, seed, input_delay, your_role, ours, theirs, round, confirmed_t
 Fighters send only:
 
 ```text
-Input { tick, buttons }
+Input { tick, buttons, round }
 ```
 
-`tick` is the simulation tick the input is meant for. The client queues a local press for `local_display_tick + INPUT_DELAY` and also sends it. `buttons` is a small integer (idle / punch / kick / block / special), the same taps as the terminal: no key-release channel.
+`tick` is the simulation tick the input is meant for. The client queues a local press for `local_display_tick + INPUT_DELAY` and also sends it. `buttons` is a small integer (idle / punch / kick / block / special), the same taps as the terminal: no key-release channel. `round` is the Hello round; an in-flight Input from a finished round (early KO, then the next conflict) is dropped so those buttons cannot steer the next sim.
 
 The server accepts an input only if:
 
 - the session owns that slot,
+- `round` is omitted or matches the current round,
 - `tick` is in `(confirmed_tick, confirmed_tick + window]`,
 - that tick has not already been confirmed.
 

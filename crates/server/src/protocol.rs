@@ -206,6 +206,30 @@ mod tests {
     }
 
     #[test]
+    fn input_round_is_optional_on_the_wire() {
+        let v: ClientMsg =
+            serde_json::from_str(r#"{"type":"input","tick":3,"buttons":1}"#).unwrap();
+        match v {
+            ClientMsg::Input {
+                tick,
+                buttons,
+                round,
+                theirs,
+            } => {
+                assert_eq!(tick, 3);
+                assert_eq!(buttons, 1);
+                assert_eq!(round, None);
+                assert_eq!(theirs, None);
+            }
+        }
+        let v: ClientMsg =
+            serde_json::from_str(r#"{"type":"input","tick":3,"buttons":1,"round":1}"#).unwrap();
+        match v {
+            ClientMsg::Input { round, .. } => assert_eq!(round, Some(1)),
+        }
+    }
+
+    #[test]
     fn closed_ws_messages() {
         assert_eq!(closed_ws_message("finished", None), Some("finished"));
         assert_eq!(
@@ -233,6 +257,9 @@ pub enum ClientMsg {
         buttons: u8,
         #[serde(default)]
         theirs: Option<u8>,
+        /// Hello round. A leftover Input from a finished round is dropped.
+        #[serde(default)]
+        round: Option<u32>,
     },
 }
 

@@ -28,6 +28,7 @@ pub enum RoomEvent {
         tick: u32,
         buttons: u8,
         theirs_buttons: Option<u8>,
+        round: Option<u32>,
     },
     Shutdown,
 }
@@ -286,8 +287,12 @@ async fn run_room(
                         tick,
                         buttons,
                         theirs_buttons,
+                        round: input_round,
                     } => {
                         if done || sim.result.is_some() {
+                            continue;
+                        }
+                        if input_round.is_some_and(|r| r != round) {
                             continue;
                         }
                         if tick < next_tick || tick > next_tick.saturating_add(INPUT_WINDOW) {

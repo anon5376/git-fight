@@ -276,10 +276,17 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     while (nextSend <= horizon) {
       const buttons = nextSend === horizon ? oursBtn : 0;
       const theirs = nextSend === horizon ? theirsBtn : 0;
-      const payload: { type: string; tick: number; buttons: number; theirs?: number } = {
+      const payload: {
+        type: string;
+        tick: number;
+        buttons: number;
+        round: number;
+        theirs?: number;
+      } = {
         type: "input",
         tick: nextSend,
         buttons,
+        round,
       };
       if (role === "both") {
         payload.theirs = theirs;

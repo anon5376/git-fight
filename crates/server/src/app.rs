@@ -566,6 +566,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                 tick,
                 buttons,
                 theirs,
+                round,
             }) = serde_json::from_str::<ClientMsg>(&text)
             else {
                 continue;
@@ -576,6 +577,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                     tick,
                     buttons,
                     theirs_buttons: theirs,
+                    round,
                 })
                 .await;
         }
