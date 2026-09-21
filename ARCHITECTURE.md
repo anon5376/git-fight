@@ -166,7 +166,7 @@ After the last round (Milestone 5):
 - Otherwise build each resolved file in core from the winning side. `git hash-object -w` the blobs, a temporary index, `write-tree`, `commit-tree` with parents `(pr_head_sha, pr_base_sha)`. Commit message lists each round and who won it. Push **only** `refs/heads/git-fight/pr-<number>-<match-id>` (create, never `--force`). If that ref already points at this match's commit (author `git-fight`, those parents, message `git fight match <id>`), that is success — crash recovery, not overwrite.
 - `result_branch` and skip `abort_reason` are write-once and mutually exclusive. A later skip cannot clobber a stored branch.
 - Comment: winner of each round, compare URL for the new branch, replay URL `/replay/<id>`.
-- Server restart retries finished GitHub matches that still have no `result_branch` and no skip reason. Round winners are write-once on an open match; a resume does not record the same leaderboard round twice or start another round after SHA-drift/expiry.
+- Server restart retries finished GitHub matches that still have no `result_branch` and no skip reason. Transient clone, token, pull, or push failures do not write a skip reason, so boot and the expirer can try the create-only push again. Decision skips (draw, forfeit, outdated, exists, no conflicts, gone PR) still write once and comment. Round winners are write-once on an open match; a resume does not record the same leaderboard round twice or start another round after SHA-drift/expiry.
 
 Humans review and merge. The bot never opens or merges the PR.
 

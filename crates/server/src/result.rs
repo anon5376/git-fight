@@ -176,18 +176,23 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
                 .await
             {
                 Ok(pr) => pr,
-                Err(_) => {
-                    return skip_push(
-                        ctx,
-                        &row,
-                        match_id,
-                        "recheck",
-                        format!(
-                            "git fight: nothing pushed — could not re-check the pull request. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
-                            ctx.public_url.trim_end_matches('/')
-                        ),
-                    )
-                    .await;
+                Err(e) => {
+                    // Gone PR cannot grow a result. A 5xx/timeout must stay
+                    // unpublished so boot and the expirer retry the push.
+                    if e.contains("pull 404") || e.contains("pull 410") {
+                        return skip_push(
+                            ctx,
+                            &row,
+                            match_id,
+                            "recheck",
+                            format!(
+                                "git fight: nothing pushed — could not re-check the pull request. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
+                                ctx.public_url.trim_end_matches('/')
+                            ),
+                        )
+                        .await;
+                    }
+                    return retry_later("pull");
                 }
             };
             if !pr.head.sha.eq_ignore_ascii_case(&row.pr_head_sha)
@@ -205,28 +210,14 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
 
     let branch = match gitutil::result_ref(row.pr_number, &row.id) {
         Ok(b) => b,
-        Err(_) => {
-            return skip_push(
-                ctx,
-                &row,
-                match_id,
-                "push",
-                format!(
-                    "git fight: nothing pushed — could not name the result branch. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
-                    ctx.public_url.trim_end_matches('/')
-                ),
-            )
-            .await;
-        }
+        Err(_) => return retry_later("push"),
     };
     let work = match tempfile::Builder::new()
         .prefix("git-fight-result-")
         .tempdir()
     {
         Ok(w) => w,
-        Err(_) => {
-            return skip_clone(ctx, &row, match_id).await;
-        }
+        Err(_) => return retry_later("clone"),
     };
     let dest = work.path().join("repo.git");
     let key = format!("{}/{}", row.owner, row.repo);
@@ -239,7 +230,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
                 ctx,
                 &row,
                 match_id,
-                "clone",
+                "recheck",
                 format!(
                     "git fight: nothing pushed — invalid repository name. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
                     ctx.public_url.trim_end_matches('/')
@@ -248,14 +239,14 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             .await;
         }
         let Some(inst) = row.installation_id.map(|i| i as u64) else {
-            return skip_clone(ctx, &row, match_id).await;
+            return retry_later("clone");
         };
         let Some(gh) = ctx.gh.as_ref() else {
-            return skip_clone(ctx, &row, match_id).await;
+            return retry_later("clone");
         };
         let token = match gh.installation_token(inst).await {
             Ok(t) => t,
-            Err(_) => return skip_clone(ctx, &row, match_id).await,
+            Err(_) => return retry_later("clone"),
         };
         (
             format!("https://github.com/{}/{}.git", row.owner, row.repo),
@@ -266,7 +257,7 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
     let git = {
         let _permit = match crate::limits::git_slots().acquire().await {
             Ok(p) => p,
-            Err(_) => return skip_clone(ctx, &row, match_id).await,
+            Err(_) => return retry_later("clone"),
         };
         match timeout(
             GIT_JOB_TIMEOUT,
@@ -313,7 +304,13 @@ pub async fn publish(ctx: &ResultCtx, match_id: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        Err((reason, body)) => skip_push(ctx, &row, match_id, reason, body).await,
+        Err((reason, body)) => {
+            if is_decision_skip(reason) {
+                skip_push(ctx, &row, match_id, reason, body).await
+            } else {
+                retry_later(reason)
+            }
+        }
     }
 }
 
@@ -493,18 +490,23 @@ async fn push_result_git(
     Ok(())
 }
 
-async fn skip_clone(ctx: &ResultCtx, row: &MatchRow, match_id: &str) -> Result<(), String> {
-    skip_push(
-        ctx,
-        row,
-        match_id,
-        "clone",
-        format!(
-            "git fight: nothing pushed — could not clone to write the result branch. Comment `/fight` for a rematch.\nreplay: {}/replay/{match_id}",
-            ctx.public_url.trim_end_matches('/')
-        ),
+/// Draw / forfeit / outdated / exists / gone PR. Not clone, token, or push I/O.
+fn is_decision_skip(reason: &str) -> bool {
+    matches!(
+        reason,
+        "draw"
+            | "forfeit"
+            | "outdated"
+            | "exists"
+            | "no_conflicts"
+            | "expired"
+            | "too_many"
+            | "recheck"
     )
-    .await
+}
+
+fn retry_later(why: &str) -> Result<(), String> {
+    Err(why.to_string())
 }
 
 async fn skip_push(
@@ -588,5 +590,24 @@ mod tests {
         assert!(clipped.chars().count() <= 160);
         assert!(clipped.ends_with('…'), "{clipped}");
         assert_eq!(clip_display_path("lib.rs"), "lib.rs");
+    }
+
+    #[test]
+    fn only_decision_skips_are_permanent() {
+        for reason in [
+            "draw",
+            "forfeit",
+            "outdated",
+            "exists",
+            "no_conflicts",
+            "expired",
+            "too_many",
+            "recheck",
+        ] {
+            assert!(is_decision_skip(reason), "{reason}");
+        }
+        for reason in ["clone", "push", "pull", "token"] {
+            assert!(!is_decision_skip(reason), "{reason}");
+        }
     }
 }

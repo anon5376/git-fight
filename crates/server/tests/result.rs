@@ -1158,6 +1158,150 @@ async fn live_match_vs_cpu_pushes_after_last_round() {
 }
 
 #[tokio::test]
+async fn transient_clone_failure_stays_unpublished() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = github_mocks(&head, &base).await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    assert!(
+        git_fight_server::db::finish_open_match(&pool, MATCH_ID, "deadbeef")
+            .await
+            .unwrap()
+    );
+    let missing = bare.parent().unwrap().join("missing.git");
+    let ctx_fail = ctx(pool.clone(), &mock, missing);
+    let err = git_fight_server::publish_result(&ctx_fail, MATCH_ID).await;
+    assert!(err.is_err(), "{err:?}");
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none(), "{row:?}");
+    assert!(row.abort_reason.is_none(), "{row:?}");
+    assert_eq!(
+        git_fight_server::db::list_unpublished_results(&pool)
+            .await
+            .unwrap(),
+        vec![MATCH_ID.to_string()]
+    );
+    assert!(
+        posted_comments(&mock).await.is_empty() && patched_comments(&mock).await.is_empty(),
+        "transient clone must not comment a skip"
+    );
+
+    let ctx_ok = ctx(pool.clone(), &mock, bare.clone());
+    git_fight_server::publish_result(&ctx_ok, MATCH_ID)
+        .await
+        .unwrap();
+    let branch = format!("git-fight/pr-1-{MATCH_ID}");
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.result_branch.as_deref(), Some(branch.as_str()));
+    assert!(row.abort_reason.is_none(), "{row:?}");
+    assert!(heads(&bare).iter().any(|r| r.ends_with(&branch)));
+    assert!(git_fight_server::db::list_unpublished_results(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn transient_pull_failure_stays_unpublished() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_test_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/pulls/1"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&mock)
+        .await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    assert!(
+        git_fight_server::db::finish_open_match(&pool, MATCH_ID, "deadbeef")
+            .await
+            .unwrap()
+    );
+    let ctx_fail = ctx(pool.clone(), &mock, bare.clone());
+    let err = git_fight_server::publish_result(&ctx_fail, MATCH_ID).await;
+    assert_eq!(err, Err("pull".into()));
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none(), "{row:?}");
+    assert!(row.abort_reason.is_none(), "{row:?}");
+    assert_eq!(
+        git_fight_server::db::list_unpublished_results(&pool)
+            .await
+            .unwrap(),
+        vec![MATCH_ID.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn gone_pr_is_a_decision_skip() {
+    let (_keep, bare, head, base) = conflict_bare();
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_test_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/pulls/1"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/box/issues/1/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 42 })))
+        .mount(&mock)
+        .await;
+    let pool = pool().await;
+    seed_match(&pool, &head, &base, Some("ours")).await;
+    assert!(
+        git_fight_server::db::finish_open_match(&pool, MATCH_ID, "deadbeef")
+            .await
+            .unwrap()
+    );
+    let ctx = ctx(pool.clone(), &mock, bare);
+    git_fight_server::publish_result(&ctx, MATCH_ID)
+        .await
+        .unwrap();
+    let row = git_fight_server::db::get_match(&pool, MATCH_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.result_branch.is_none(), "{row:?}");
+    assert_eq!(row.abort_reason.as_deref(), Some("recheck"));
+    assert!(git_fight_server::db::list_unpublished_results(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        posted_comments(&mock)
+            .await
+            .iter()
+            .any(|c| c.contains("could not re-check") && c.contains("nothing pushed")),
+        "{:?}",
+        posted_comments(&mock).await
+    );
+}
+
+#[tokio::test]
 async fn local_match_does_not_push() {
     let (_keep, bare, _head, _base) = conflict_bare();
     let before = heads(&bare);
