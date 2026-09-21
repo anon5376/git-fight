@@ -262,10 +262,18 @@ pub async fn start_challenge(
         ));
     }
 
-    let pr = ctx
+    let pr = match ctx
         .gh
         .poll_mergeable(installation_id, &owner, &repo, number)
-        .await?;
+        .await
+    {
+        Ok(pr) => pr,
+        // get_pull rejects option-like SHAs at the API boundary so
+        // synchronize cannot abort a live fight. /fight still owes
+        // the user-visible "could not start" note.
+        Err(e) if e == "pull sha" => return Ok(note("git fight could not start")),
+        Err(e) => return Err(e),
+    };
     match pr.mergeable {
         Some(true) => return Ok(note("no conflicts to fight")),
         None => return Ok(note("could not determine mergeability")),
@@ -820,6 +828,21 @@ mod tests {
             "note",
             "unique collision already proved another row; busy lookup must not become could-not-start"
         );
+    }
+
+    #[test]
+    fn pull_sha_reject_is_a_start_note() {
+        assert_eq!(poll_err_followup("pull sha"), "note");
+        assert_eq!(poll_err_followup("pull 503"), "silent");
+        assert_eq!(poll_err_followup("repo 503"), "silent");
+    }
+
+    fn poll_err_followup(err: &str) -> &'static str {
+        if err == "pull sha" {
+            "note"
+        } else {
+            "silent"
+        }
     }
 
     fn already_open_followup(lookup: Result<Option<&'static str>, ()>) -> &'static str {
