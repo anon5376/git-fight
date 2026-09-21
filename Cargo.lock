@@ -724,6 +724,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "octocrab",
  "reqwest",
  "serde",

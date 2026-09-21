@@ -88,6 +88,8 @@ fn git_base() -> Command {
     c.env_remove("GIT_PROXY_COMMAND");
     c.env_remove("GIT_SSH_COMMAND");
     c.env_remove("GIT_ASKPASS");
+    // Clone URLs are https://github.com/… or file:// tests. No ssh/ext/git.
+    c.env("GIT_ALLOW_PROTOCOL", "https:file");
     if let Some(ca) = ssl_ca_bundle() {
         c.env("GIT_SSL_CAINFO", ca);
         c.arg("-c").arg(format!("http.sslCAInfo={ca}"));
@@ -101,12 +103,49 @@ fn git_base() -> Command {
     c
 }
 
+/// git clone/fetch spawn index-pack. Put the child in its own group so a
+/// 60s timeout can SIGKILL helpers, not only the git parent.
+fn prepare_child(cmd: &mut Command) {
+    #[cfg(unix)]
+    cmd.process_group(0);
+}
+
+fn kill_process_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 1 {
+                // SAFETY: process_group(0) made this pid the group leader.
+                // Negative pgid signals that group (git + index-pack), never -1.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+async fn wait_child(
+    child: tokio::process::Child,
+    limit: Duration,
+) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
+    let pid = child.id();
+    match timeout(limit, child.wait_with_output()).await {
+        Ok(out) => {
+            let out = out.map_err(GitError::Io)?;
+            Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
+        }
+        Err(_) => {
+            kill_process_group(pid);
+            Err(GitError::Timeout)
+        }
+    }
+}
+
 async fn run(mut cmd: Command, limit: Duration) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
-    let out = timeout(limit, cmd.output())
-        .await
-        .map_err(|_| GitError::Timeout)?
-        .map_err(GitError::Io)?;
-    Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
+    prepare_child(&mut cmd);
+    let child = cmd.spawn().map_err(GitError::Io)?;
+    wait_child(child, limit).await
 }
 
 async fn run_stdin(
@@ -117,18 +156,21 @@ async fn run_stdin(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    prepare_child(&mut cmd);
     let mut child = cmd.spawn().map_err(GitError::Io)?;
+    let pid = child.id();
     if let Some(mut stdin) = child.stdin.take() {
-        timeout(limit, stdin.write_all(input))
-            .await
-            .map_err(|_| GitError::Timeout)?
-            .map_err(GitError::Io)?;
+        match timeout(limit, stdin.write_all(input)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(GitError::Io(e)),
+            Err(_) => {
+                kill_process_group(pid);
+                let _ = child.start_kill();
+                return Err(GitError::Timeout);
+            }
+        }
     }
-    let out = timeout(limit, child.wait_with_output())
-        .await
-        .map_err(|_| GitError::Timeout)?
-        .map_err(GitError::Io)?;
-    Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
+    wait_child(child, limit).await
 }
 
 fn apply_auth(cmd: &mut Command, url: &str, bearer: Option<&str>) {
@@ -1045,6 +1087,21 @@ Auto-merging lib.rs\n";
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "timeout must not wait out the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_process_group() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 | sleep 30"]);
+        cmd.kill_on_drop(true);
+        cmd.stdin(Stdio::null());
+        let started = std::time::Instant::now();
+        let err = run(cmd, Duration::from_millis(200)).await.unwrap_err();
+        assert!(matches!(err, GitError::Timeout), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "helpers must not outlive the 60s clone cap"
         );
     }
 
