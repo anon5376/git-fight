@@ -39,6 +39,20 @@ type Hello = {
 
 type TickMsg = { type: "tick"; n: number; ours: number; theirs: number };
 type HashMsg = { type: "hash"; n: number; hi: number; lo: number };
+type SnapshotMsg = {
+  type: "snapshot";
+  seed_lo: number;
+  seed_hi: number;
+  round: number;
+  confirmed_tick: number;
+  ours_hp?: number;
+  ours_armor?: boolean;
+  ours_special?: boolean;
+  theirs_hp?: number;
+  theirs_armor?: boolean;
+  theirs_special?: boolean;
+  ticks: number[][];
+};
 type EndMsg = {
   type: "end";
   result: number;
@@ -49,7 +63,7 @@ type EndMsg = {
   match_over?: boolean;
 };
 type ErrMsg = { type: "error"; message: string };
-type ServerMsg = Hello | TickMsg | HashMsg | EndMsg | ErrMsg | { type: string };
+type ServerMsg = Hello | TickMsg | HashMsg | SnapshotMsg | EndMsg | ErrMsg | { type: string };
 
 function u32(n: number): number {
   return n >>> 0;
@@ -158,6 +172,46 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   const tickMs = 1000 / tps;
   let last = performance.now();
   let leftover = 0;
+  let pendingDesync = false;
+  let desyncApplies = 0;
+  let desyncTimer: number | null = null;
+
+  const clearDesyncTimer = () => {
+    if (desyncTimer !== null) {
+      window.clearTimeout(desyncTimer);
+      desyncTimer = null;
+    }
+  };
+
+  const applySnapshot = (snap: SnapshotMsg): void => {
+    const rebuilt = fightFromWire(
+      snap.seed_lo,
+      snap.seed_hi,
+      snap.ours_hp,
+      snap.ours_armor,
+      snap.ours_special,
+      snap.theirs_hp,
+      snap.theirs_armor,
+      snap.theirs_special,
+    );
+    for (const pair of snap.ticks ?? []) {
+      const n = pair[0] ?? 0;
+      const oursBtn = pair[1] ?? 0;
+      const theirsBtn = pair[2] ?? 0;
+      if (n === rebuilt.tick()) {
+        rebuilt.step(oursBtn, theirsBtn);
+      }
+    }
+    fight = rebuilt;
+    confirmed = snap.confirmed_tick;
+    round = snap.round ?? round;
+    nextSend = Math.max(0, confirmed + 1);
+    pendingDesync = false;
+    clearDesyncTimer();
+    if (rebuilt.tick() > 0 && role !== "spectator") {
+      ui.wait.classList.add("hidden");
+    }
+  };
 
   ui.wait.classList.remove("hidden");
   ui.wait.textContent = "connecting…";
@@ -255,13 +309,39 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       }
     } else if (msg.type === "hash") {
       const hash = msg as HashMsg;
-      if (!fight || finished || hash.n !== fight.tick()) {
+      if (!fight || finished) {
         return;
       }
-      if (!hashesMatch(fight, hash.hi, hash.lo)) {
+      if (hash.n !== fight.tick() || !hashesMatch(fight, hash.hi, hash.lo)) {
+        pendingDesync = true;
         ui.wait.classList.remove("hidden");
-        ui.wait.textContent = "desync — reloading";
-        window.location.reload();
+        ui.wait.textContent = "desync — waiting for snapshot";
+        clearDesyncTimer();
+        desyncTimer = window.setTimeout(() => {
+          if (!stopped && !finished && pendingDesync) {
+            ui.wait.textContent = "desync — reloading";
+            window.location.reload();
+          }
+        }, 1500);
+      } else {
+        pendingDesync = false;
+        desyncApplies = 0;
+        clearDesyncTimer();
+      }
+    } else if (msg.type === "snapshot") {
+      const snap = msg as SnapshotMsg;
+      const expect = snap.confirmed_tick < 0 ? 0 : snap.confirmed_tick + 1;
+      if (pendingDesync || !fight || fight.tick() !== expect) {
+        if (pendingDesync) {
+          desyncApplies += 1;
+          if (desyncApplies >= 2) {
+            ui.wait.classList.remove("hidden");
+            ui.wait.textContent = "desync — reloading";
+            window.location.reload();
+            return;
+          }
+        }
+        applySnapshot(snap);
       }
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
@@ -334,6 +414,9 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       keys.unbind();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
+      }
+      if (desyncTimer !== null) {
+        window.clearTimeout(desyncTimer);
       }
     },
   };

@@ -212,6 +212,24 @@ async fn reconnect_resumes_later_round_from_stored_inputs() {
     assert_eq!(hello["round"].as_u64(), Some(1));
     assert_eq!(hello["total_rounds"].as_u64(), Some(2));
     assert_eq!(hello["confirmed_tick"].as_i64(), Some(2));
+    let snap = wait_type(&mut stream, "snapshot").await;
+    assert_eq!(snap["round"].as_u64(), Some(1));
+    assert_eq!(snap["confirmed_tick"].as_i64(), Some(2));
+    assert_eq!(
+        snap["ticks"],
+        serde_json::json!([[0, 1, 0], [1, 0, 1], [2, 0, 0]])
+    );
+    let seed_lo = snap["seed_lo"].as_u64().unwrap() as u32;
+    let seed_hi = snap["seed_hi"].as_u64().unwrap() as u32;
+    let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
+    let mut sim = FightState::new(seed, FighterStats::default(), FighterStats::default());
+    for pair in snap["ticks"].as_array().unwrap() {
+        sim.step(
+            Input::from_u8(pair[1].as_u64().unwrap() as u8),
+            Input::from_u8(pair[2].as_u64().unwrap() as u8),
+        );
+    }
+    assert_eq!(sim.tick, 3);
     let mut ticks = Vec::new();
     for _ in 0..3 {
         let tick = wait_type(&mut stream, "tick").await;

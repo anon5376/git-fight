@@ -116,6 +116,27 @@ mod tests {
         assert_eq!(round_seed(7, 0), 7);
         assert_eq!(round_seed(7, 1), 14);
     }
+
+    #[test]
+    fn snapshot_wire_includes_tick_log() {
+        let msg = ServerMsg::Snapshot {
+            seed_lo: 1,
+            seed_hi: 0,
+            round: 2,
+            confirmed_tick: 1,
+            ours_hp: 100,
+            ours_armor: false,
+            ours_special: false,
+            theirs_hp: 100,
+            theirs_armor: false,
+            theirs_special: false,
+            ticks: vec![(0, 1, 0), (1, 0, 2)],
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "snapshot");
+        assert_eq!(v["round"], 2);
+        assert_eq!(v["ticks"], serde_json::json!([[0, 1, 0], [1, 0, 2]]));
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -159,6 +180,19 @@ pub enum ServerMsg {
         n: u32,
         hi: u32,
         lo: u32,
+    },
+    Snapshot {
+        seed_lo: u32,
+        seed_hi: u32,
+        round: u32,
+        confirmed_tick: i32,
+        ours_hp: i32,
+        ours_armor: bool,
+        ours_special: bool,
+        theirs_hp: i32,
+        theirs_armor: bool,
+        theirs_special: bool,
+        ticks: Vec<(u32, u8, u8)>,
     },
     End {
         result: i32,

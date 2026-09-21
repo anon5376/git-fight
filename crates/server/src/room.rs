@@ -163,6 +163,14 @@ async fn run_room(
                             db::stats_for_round(&hunks, round),
                         );
                         let _ = tx.send(encode(&hello)).await;
+                        let snap = snapshot_msg(
+                            round_seed(seed, round),
+                            round,
+                            confirmed,
+                            db::stats_for_round(&hunks, round),
+                            &log,
+                        );
+                        let _ = tx.send(encode(&snap)).await;
                         for &(n, o, t) in &log {
                             let _ = tx
                                 .send(encode(&ServerMsg::Tick {
@@ -402,6 +410,19 @@ async fn advance(a: Advance<'_>) -> bool {
                 lo,
             });
             broadcast(a.conns, &hash).await;
+            let confirmed = if *a.next_tick == 0 {
+                -1
+            } else {
+                *a.next_tick as i32 - 1
+            };
+            let snap = snapshot_msg(
+                round_seed(a.seed, *a.round),
+                *a.round,
+                confirmed,
+                db::stats_for_round(a.hunks, *a.round),
+                a.log,
+            );
+            broadcast(a.conns, &encode(&snap)).await;
         }
     }
     if let Some(result) = a.sim.result {
@@ -549,6 +570,30 @@ fn hello_msg(
         theirs_hp: theirs_stats.hp,
         theirs_armor: theirs_stats.armor,
         theirs_special: theirs_stats.special,
+    }
+}
+
+fn snapshot_msg(
+    seed: u64,
+    round: u32,
+    confirmed_tick: i32,
+    stats: (FighterStats, FighterStats),
+    log: &[(u32, u8, u8)],
+) -> ServerMsg {
+    let (seed_lo, seed_hi) = split_seed(seed);
+    let (ours_stats, theirs_stats) = stats;
+    ServerMsg::Snapshot {
+        seed_lo,
+        seed_hi,
+        round,
+        confirmed_tick,
+        ours_hp: ours_stats.hp,
+        ours_armor: ours_stats.armor,
+        ours_special: ours_stats.special,
+        theirs_hp: theirs_stats.hp,
+        theirs_armor: theirs_stats.armor,
+        theirs_special: theirs_stats.special,
+        ticks: log.to_vec(),
     }
 }
 
