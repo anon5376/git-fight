@@ -470,7 +470,7 @@ async fn advance(a: Advance<'_>) -> bool {
             ours: ours_btn,
             theirs: theirs_btn,
         });
-        broadcast(a.conns, &msg).await;
+        broadcast(a.conns, &msg);
         if n % 10 == 9 || a.sim.result.is_some() {
             let (lo, hi) = split_hash(a.sim.state_hash());
             let hash = encode(&ServerMsg::Hash {
@@ -478,7 +478,7 @@ async fn advance(a: Advance<'_>) -> bool {
                 hi,
                 lo,
             });
-            broadcast(a.conns, &hash).await;
+            broadcast(a.conns, &hash);
         }
     }
     if let Some(result) = a.sim.result {
@@ -514,7 +514,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
         }
     }
     let msg = encode(&end_msg(a.sim, result, *a.round, match_over));
-    broadcast(a.conns, &msg).await;
+    broadcast(a.conns, &msg);
     if match_over {
         return true;
     }
@@ -560,7 +560,7 @@ async fn finish(a: Advance<'_>, result: RoundResult, forfeit: bool) -> bool {
             db::stats_for_round(a.hunks, *a.round),
             a.hunks,
         );
-        let _ = conn.tx.send(encode(&hello)).await;
+        let _ = conn.tx.try_send(encode(&hello));
     }
     false
 }
@@ -629,7 +629,7 @@ async fn expire_now(
             let msg = encode(&ServerMsg::Error {
                 message: terminal_ws_error(row),
             });
-            broadcast(conns, &msg).await;
+            broadcast(conns, &msg);
             return;
         }
     }
@@ -639,7 +639,7 @@ async fn expire_now(
             let msg = encode(&ServerMsg::Error {
                 message: terminal_ws_error(row),
             });
-            broadcast(conns, &msg).await;
+            broadcast(conns, &msg);
         }
         return;
     }
@@ -649,7 +649,7 @@ async fn expire_now(
     let msg = encode(&ServerMsg::Error {
         message: "expired".into(),
     });
-    broadcast(conns, &msg).await;
+    broadcast(conns, &msg);
 }
 
 fn end_msg(sim: &FightState, result: RoundResult, round: u32, match_over: bool) -> ServerMsg {
@@ -738,9 +738,11 @@ fn snapshot_msg(
     }
 }
 
-async fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
+/// Non-blocking: a spectator (or fighter) who stops reading must not stall
+/// the 30 Hz confirm loop. Missed ticks are recovered via Snapshot on reconnect.
+fn broadcast(conns: &BTreeMap<u64, Conn>, msg: &str) {
     for conn in conns.values() {
-        let _ = conn.tx.send(msg.to_string()).await;
+        let _ = conn.tx.try_send(msg.to_string());
     }
 }
 
@@ -847,5 +849,30 @@ fn apply_presence(slot: &mut Slot, here: bool, match_started: bool) {
     }
     if (slot.seen || match_started) && slot.disconnected_at.is_none() {
         slot.disconnected_at = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_client_buffer_does_not_block_broadcast() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        tx.try_send("held".into()).unwrap();
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            1,
+            Conn {
+                login: None,
+                token: None,
+                tx,
+            },
+        );
+        let hung = tokio::time::timeout(Duration::from_millis(200), async {
+            broadcast(&conns, r#"{"type":"tick","n":0,"ours":0,"theirs":0}"#);
+        })
+        .await;
+        assert!(hung.is_ok(), "broadcast waited on a full spectator buffer");
     }
 }

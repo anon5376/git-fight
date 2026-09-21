@@ -162,11 +162,11 @@ Players log in with GitHub. Only the two fighter logins can take a slot; everyon
 After the last round (Milestone 5):
 
 - Any draw, skip, or forfeit that left a hunk unresolved: push nothing; comment the unresolved paths.
-- Re-fetch the PR. If `head` or `base` SHA changed: push nothing; say the fight was over outdated code and offer a rematch (`/fight` again). An aborted or expired match does not record leaderboard rounds or start another round.
+- Re-fetch the PR. If `head` or `base` SHA changed: push nothing; say the fight was over outdated code and offer a rematch (`/fight` again). An aborted or expired match does not record leaderboard rounds or start another round. Hunk winners are write-once and only while the row is still `pending` or `in_progress`.
 - Otherwise build each resolved file in core from the winning side. `git hash-object -w` the blobs, a temporary index, `write-tree`, `commit-tree` with parents `(pr_head_sha, pr_base_sha)`. Commit message lists each round and who won it. Push **only** `refs/heads/git-fight/pr-<number>-<match-id>` (create, never `--force`). If that ref already points at this match's commit (author `git-fight`, those parents, message `git fight match <id>`), that is success — crash recovery, not overwrite.
 - `result_branch` and skip `abort_reason` are write-once and mutually exclusive. A later skip cannot clobber a stored branch.
 - Comment: winner of each round, compare URL for the new branch, replay URL `/replay/<id>`.
-- Server restart retries finished GitHub matches that still have no `result_branch` and no skip reason. Round winners are write-once; a resume does not record the same leaderboard round twice or start another round after SHA-drift/expiry.
+- Server restart retries finished GitHub matches that still have no `result_branch` and no skip reason. Round winners are write-once on an open match; a resume does not record the same leaderboard round twice or start another round after SHA-drift/expiry.
 
 Humans review and merge. The bot never opens or merges the PR.
 
@@ -190,7 +190,7 @@ On WebSocket connect the server reads the session, then sends:
 Hello { match_id, seed, input_delay, your_role, ours, theirs, round, confirmed_tick, you_are, path, hunk_index }
 ```
 
-`your_role` is `ours`, `theirs`, `both` (mirror), or `spectator`. Spectators never have a fighter slot.
+`your_role` is `ours`, `theirs`, `both` (mirror), or `spectator`. Spectators never have a fighter slot. Outbound Tick/Hash/End/Hello are non-blocking so a client who stops reading cannot stall confirm; they resync from Snapshot on reconnect.
 
 ### Inputs
 
@@ -350,7 +350,7 @@ Anyone who can hit `POST /webhooks/github` can send a JSON body that looks like 
 
 A spectator (or a stranger who found the match URL) sends `Input` for a fighter slot, or spoofs a query param `role=ours`.
 
-**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped. CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned.
+**Mitigation:** Role is assigned on the server from the session cookie + `matches.ours_login` / `theirs_login`. The cookie is random, HttpOnly, `SameSite=Lax`, integrity-protected with `SESSION_KEY`. Clients cannot pick a slot. Inputs from the wrong login or from spectators are dropped. CPU slots cannot be claimed. Mirror matches allow only that one login to send both sides. Share tokens (`?token=`) exist only for local anonymous matches; a GitHub fight stores none, and an empty token cannot claim a slot. Expired session rows are pruned. Room broadcasts do not wait on a full client buffer, so a silent spectator cannot freeze lockstep.
 
 ### Hostile repos
 
@@ -359,7 +359,7 @@ A repo can be huge, contain symlink farms, `.git` path tricks, enormous blobs, o
 **Mitigation:**
 
 - Skip when GitHub `size` > 1 GiB; clone timeout 60 seconds; `--filter=blob:none`; bare repo; no checkout of a worktree used as a cwd for user code.
-- `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`. Git is invoked with argument lists, never a shell string built from paths.
+- `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `core.hooksPath=/dev/null`. Git is invoked with argument lists, never a shell string built from paths. Object SHAs are passed after `--`.
 - Paths from merge-tree (`-z`) must be relative, with no `..` or `.git` component, no control characters, and no option-like (`-`) names. Only regular-file modes. Do not follow symlinks. Cap blob bytes (skip that path; other fightable files still start a match). Cap git stdout/stderr so a huge blob or merge-tree list cannot fill RAM. Blame locates a hunk with a bounded search so a 1 MiB conflict cannot be quadratic against the file. Cap 15 hunks.
 - Never `cargo test`, never a repo `Dockerfile`, never `git submodule update`, never a post-checkout hook.
 

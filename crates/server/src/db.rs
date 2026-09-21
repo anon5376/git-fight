@@ -953,7 +953,12 @@ pub async fn set_hunk_winner(
 ) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "UPDATE match_hunks SET winner = ?
-         WHERE match_id = ? AND round_index = ? AND winner IS NULL",
+         WHERE match_id = ? AND round_index = ? AND winner IS NULL
+           AND EXISTS (
+             SELECT 1 FROM matches
+             WHERE id = match_hunks.match_id
+               AND status IN ('pending', 'in_progress')
+           )",
     )
     .bind(winner)
     .bind(match_id)
@@ -1590,6 +1595,36 @@ mod tests {
         assert!(!set_hunk_winner(&pool, "m1", 0, "theirs").await.unwrap());
         let hunks = list_hunks(&pool, "m1").await.unwrap();
         assert_eq!(hunks[0].winner.as_deref(), Some("ours"));
+    }
+
+    #[tokio::test]
+    async fn hunk_winner_is_not_written_after_abort() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "m-ab", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "m-ab",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(abort_open_match(&pool, "m-ab", "outdated").await.unwrap());
+        assert!(!set_hunk_winner(&pool, "m-ab", 0, "ours").await.unwrap());
+        let hunks = list_hunks(&pool, "m-ab").await.unwrap();
+        assert!(hunks[0].winner.is_none());
     }
 
     #[tokio::test]

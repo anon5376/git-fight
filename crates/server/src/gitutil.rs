@@ -361,7 +361,7 @@ pub async fn fetch_shas(dir: &Path, shas: &[&str], bearer: Option<&str>) -> Resu
         return Err(GitError::Command("unsafe revision".into()));
     }
     let mut cmd = git_dir(dir, bearer);
-    cmd.args(["fetch", "--no-tags", "origin"]);
+    cmd.args(["fetch", "--no-tags", "origin", "--"]);
     cmd.args(shas.iter().copied());
     let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
     if code != 0 {
