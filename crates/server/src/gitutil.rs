@@ -143,6 +143,8 @@ async fn wait_child(
 }
 
 async fn run(mut cmd: Command, limit: Duration) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     prepare_child(&mut cmd);
     let child = cmd.spawn().map_err(GitError::Io)?;
     wait_child(child, limit).await
