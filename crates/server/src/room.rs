@@ -696,7 +696,7 @@ async fn finish(a: Advance<'_>, result: RoundResult) -> bool {
     false
 }
 
-async fn hash_from_stored_round(
+pub(crate) async fn hash_from_stored_round(
     pool: &SqlitePool,
     id: &str,
     seed: u64,

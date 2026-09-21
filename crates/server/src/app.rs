@@ -155,6 +155,31 @@ impl AppState {
         }
     }
 
+    async fn finish_scored_open(&self) {
+        let Ok(ids) = db::list_scored_open_matches(&self.pool).await else {
+            return;
+        };
+        for id in ids {
+            let Some(row) = db::get_match(&self.pool, &id).await.ok().flatten() else {
+                continue;
+            };
+            let hunks = db::list_hunks(&self.pool, &id).await.unwrap_or_default();
+            if hunks.is_empty() || hunks.iter().any(|h| h.winner.is_none()) {
+                continue;
+            }
+            let seed: u64 = row.seed.parse().unwrap_or(1);
+            let last = u32::try_from(hunks.len().saturating_sub(1)).unwrap_or(0);
+            let hash = room::hash_from_stored_round(&self.pool, &id, seed, &hunks, last).await;
+            if db::finish_open_match(&self.pool, &id, &hash)
+                .await
+                .unwrap_or(false)
+            {
+                self.result_ctx().spawn_publish(id.clone());
+                self.close_room(&id).await;
+            }
+        }
+    }
+
     fn retry_unpublished(&self) {
         let ctx = self.result_ctx();
         let pool = self.pool.clone();
@@ -227,12 +252,14 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
             let _ = state.room_tx(&row).await;
         }
     }
+    state.finish_scored_open().await;
     state.retry_unpublished();
     let expirer = state.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_secs(5));
         loop {
             iv.tick().await;
+            expirer.finish_scored_open().await;
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
                 for id in ids {
                     expirer.close_room(&id).await;

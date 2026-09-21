@@ -654,9 +654,17 @@ pub async fn expire_pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Erro
     let now = Utc::now().to_rfc3339();
     // One statement: a match that `finish_open_match` wins on the 24h line
     // is not returned, so the expirer cannot comment "nothing was pushed".
+    // A fully scored open match is finished+published, not expired.
     let rows = sqlx::query_as::<_, (String,)>(
         "UPDATE matches SET status = 'expired', abort_reason = 'expired', finished_at = ?
          WHERE status IN ('pending', 'in_progress') AND expires_at <= ?
+           AND NOT (
+             EXISTS (SELECT 1 FROM match_hunks h WHERE h.match_id = matches.id)
+             AND NOT EXISTS (
+               SELECT 1 FROM match_hunks h
+               WHERE h.match_id = matches.id AND h.winner IS NULL
+             )
+           )
          RETURNING id",
     )
     .bind(&now)
@@ -1280,6 +1288,23 @@ pub async fn set_result_branch(
     Ok(res.rows_affected() > 0)
 }
 
+/// Open fights whose every hunk already has a winner. The expirer marks
+/// these finished and publishes; `expire_pending` must not bury them.
+pub async fn list_scored_open_matches(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM matches
+         WHERE status IN ('pending', 'in_progress')
+           AND EXISTS (SELECT 1 FROM match_hunks h WHERE h.match_id = matches.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM match_hunks h
+             WHERE h.match_id = matches.id AND h.winner IS NULL
+           )",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Finished GitHub fights that never stored a branch or skip reason (crash
 /// after `finish_open_match`, before publish completed).
 pub async fn list_unpublished_results(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
@@ -1365,6 +1390,73 @@ mod tests {
         assert_eq!(row.status, "expired");
         assert!(row.final_hash.is_none());
         assert_eq!(row.abort_reason.as_deref(), Some("expired"));
+    }
+
+    #[tokio::test]
+    async fn expire_pending_does_not_bury_a_scored_open_match() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "won1".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 0,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        set_status(&pool, "won1", "in_progress", true, false, None, None)
+            .await
+            .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "won1",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(set_hunk_winner(&pool, "won1", 0, "ours").await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert_eq!(
+            list_scored_open_matches(&pool).await.unwrap(),
+            vec!["won1".to_string()]
+        );
+        assert!(expire_pending(&pool).await.unwrap().is_empty());
+        let row = get_match(&pool, "won1").await.unwrap().unwrap();
+        assert_eq!(row.status, "in_progress");
+        assert!(row.abort_reason.is_none());
+        assert!(finish_open_match(&pool, "won1", "deadbeef").await.unwrap());
+        assert!(list_scored_open_matches(&pool).await.unwrap().is_empty());
+        assert_eq!(
+            list_unpublished_results(&pool).await.unwrap(),
+            vec!["won1".to_string()]
+        );
     }
 
     #[tokio::test]
