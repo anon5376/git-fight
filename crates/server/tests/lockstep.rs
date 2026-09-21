@@ -831,6 +831,119 @@ async fn scored_all_past_deadline_finishes_not_expires() {
 }
 
 #[tokio::test]
+async fn later_scored_room_finishes_after_expire_noop() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = git_fight_server::test_tmp_dir("gf-later-scored");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "laterscored00000000000000000000";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 2,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the expirer’s first immediate tick run with no winner.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        git_fight_server::db::get_match(&pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "in_progress"
+    );
+    assert!(
+        git_fight_server::db::set_hunk_winner(&pool, id, 0, "forfeit_ours", false)
+            .await
+            .unwrap()
+    );
+    // expires_at is ~2s from insert. Next expirer tick is 5s after boot.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let mut status = String::new();
+    for _ in 0..20 {
+        let row = git_fight_server::db::get_match(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        status = row.status;
+        if status == "finished" {
+            break;
+        }
+        assert_ne!(
+            status, "expired",
+            "a later-scored fight must not be buried at expires_at"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        status, "finished",
+        "the live room must finish after an expire no-op, not wait for the 5s expirer"
+    );
+}
+
+#[tokio::test]
 async fn scored_all_without_terminal_sim_does_not_fake_hash() {
     use git_fight_server::db::{NewHunk, NewMatch};
     let dir = git_fight_server::test_tmp_dir("gf-scored-nohash");

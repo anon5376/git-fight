@@ -128,10 +128,10 @@ async fn run_room(
 ) {
     let seed: u64 = row.seed.parse().unwrap_or(1);
     let delay = u32::try_from(row.input_delay_ticks).unwrap_or(INPUT_DELAY);
-    let hunks = db::list_hunks(&pool, &row.id).await.unwrap_or_default();
+    let mut hunks = db::list_hunks(&pool, &row.id).await.unwrap_or_default();
     let github = db::github_identity(&row, &hunks);
     let total_rounds = u32::try_from(hunks.len()).unwrap_or(0).max(1);
-    let scored_all = !hunks.is_empty() && hunks.iter().all(|h| h.winner.is_some());
+    let mut scored_all = !hunks.is_empty() && hunks.iter().all(|h| h.winner.is_some());
     let mut round: u32 = hunks
         .iter()
         .find(|h| h.winner.is_none())
@@ -501,8 +501,21 @@ async fn run_room(
         }
         if expiry_due && !scored_all {
             expire_now(&pool, &id, &conns, settings.result.as_ref(), &rooms).await;
+            // expire_open_match no-ops a fully scored row.
+            // RAM `scored_all` is boot-time; a winner written after
+            // start must be re-read so last-round finish can retry.
             done = match_is_open(&pool, &id).await == MatchOpen::Closed;
-            continue;
+            if !done {
+                if let Ok(fresh) = db::list_hunks(&pool, &id).await {
+                    if !fresh.is_empty() && fresh.iter().all(|h| h.winner.is_some()) {
+                        hunks = fresh;
+                        scored_all = true;
+                    }
+                }
+            }
+            if done || !scored_all {
+                continue;
+            }
         }
         if scored_all {
             done = try_finish_scored_all(
@@ -1731,17 +1744,22 @@ mod tests {
 
     #[test]
     fn expiry_due_does_not_confirm_ticks() {
-        assert_eq!(expiry_due_followup(false, false), "advance");
-        assert_eq!(expiry_due_followup(true, true), "finish");
+        assert_eq!(expiry_due_followup(false, false, false), "advance");
+        assert_eq!(expiry_due_followup(true, true, false), "finish");
         assert_eq!(
-            expiry_due_followup(true, false),
+            expiry_due_followup(true, false, false),
             "retry_expire",
             "a busy expire write must not keep confirming past expires_at"
         );
+        assert_eq!(
+            expiry_due_followup(true, false, true),
+            "finish",
+            "an expire no-op on a later-scored row must mark finished"
+        );
     }
 
-    fn expiry_due_followup(due: bool, scored_all: bool) -> &'static str {
-        if scored_all {
+    fn expiry_due_followup(due: bool, ram_scored_all: bool, db_scored_all: bool) -> &'static str {
+        if ram_scored_all || (due && db_scored_all) {
             "finish"
         } else if due {
             "retry_expire"
