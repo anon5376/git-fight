@@ -1,0 +1,21 @@
+[package]
+name = "git-fight"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resolve merge conflicts by beating up the other branch."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "git-fight"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+git-fight-core = { path = "../core" }
+
+[dev-dependencies]
+git-fight-core = { path = "../core" }

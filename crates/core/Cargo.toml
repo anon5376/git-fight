@@ -1,0 +1,12 @@
+[package]
+name = "git-fight-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Conflict parser and deterministic fight simulation for git fight."
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
