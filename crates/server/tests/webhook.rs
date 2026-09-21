@@ -1572,8 +1572,8 @@ async fn same_body_new_delivery_is_ignored() {
 #[tokio::test]
 async fn mergeable_pr_comments_nothing_to_fight() {
     let mock = github_mocks(
-        "dead",
-        "beef",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         MockOpts {
             commit_author: Value::Null,
             size: 12,
