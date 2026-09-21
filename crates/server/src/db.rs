@@ -19,11 +19,15 @@ pub struct MatchRow {
     pub owner: String,
     pub repo: String,
     pub pr_number: i64,
+    pub pr_head_sha: String,
+    pub pr_base_sha: String,
+    pub installation_id: Option<i64>,
     pub input_delay_ticks: i64,
     pub created_at: String,
     pub expires_at: String,
     pub final_hash: Option<String>,
     pub abort_reason: Option<String>,
+    pub result_branch: Option<String>,
 }
 
 pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -154,8 +158,9 @@ pub async fn get_match(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, 
     sqlx::query_as::<_, MatchRow>(
         "SELECT id, seed, status, ours_name, theirs_name, ours_kind, theirs_kind,
                 ours_token, theirs_token, ours_login, theirs_login, owner, repo, pr_number,
+                pr_head_sha, pr_base_sha, installation_id,
                 input_delay_ticks, created_at, expires_at,
-                final_hash, abort_reason
+                final_hash, abort_reason, result_branch
          FROM matches WHERE id = ?",
     )
     .bind(id)
@@ -400,6 +405,70 @@ pub async fn session_login(pool: &SqlitePool, id: &str) -> Result<Option<String>
     .map(|r| r.map(|x| x.0))
 }
 
+pub async fn set_hunk_winner(
+    pool: &SqlitePool,
+    match_id: &str,
+    round: i64,
+    winner: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE match_hunks SET winner = ? WHERE match_id = ? AND round_index = ?")
+        .bind(winner)
+        .bind(match_id)
+        .bind(round)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub struct HunkRow {
+    pub round_index: i64,
+    pub path: String,
+    pub hunk_index: i64,
+    pub winner: Option<String>,
+    pub theirs_name: Option<String>,
+}
+
+pub async fn list_hunks(pool: &SqlitePool, match_id: &str) -> Result<Vec<HunkRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i64, String, i64, Option<String>, Option<String>)>(
+        "SELECT round_index, path, hunk_index, winner, theirs_name
+         FROM match_hunks WHERE match_id = ? ORDER BY round_index",
+    )
+    .bind(match_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(round_index, path, hunk_index, winner, theirs_name)| HunkRow {
+                round_index,
+                path,
+                hunk_index,
+                winner,
+                theirs_name,
+            },
+        )
+        .collect())
+}
+
+pub async fn set_result_branch(
+    pool: &SqlitePool,
+    id: &str,
+    branch: Option<&str>,
+    abort: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE matches SET result_branch = COALESCE(?, result_branch),
+            abort_reason = COALESCE(?, abort_reason)
+         WHERE id = ?",
+    )
+    .bind(branch)
+    .bind(abort)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -418,11 +487,15 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for MatchRow {
             owner: row.try_get("owner")?,
             repo: row.try_get("repo")?,
             pr_number: row.try_get("pr_number")?,
+            pr_head_sha: row.try_get("pr_head_sha")?,
+            pr_base_sha: row.try_get("pr_base_sha")?,
+            installation_id: row.try_get("installation_id")?,
             input_delay_ticks: row.try_get("input_delay_ticks")?,
             created_at: row.try_get("created_at")?,
             expires_at: row.try_get("expires_at")?,
             final_hash: row.try_get("final_hash")?,
             abort_reason: row.try_get("abort_reason")?,
+            result_branch: row.try_get("result_branch")?,
         })
     }
 }

@@ -2,6 +2,7 @@ use crate::auth::{self, Auth};
 use crate::db::{self, MatchRow};
 use crate::gh::GitHub;
 use crate::protocol::{ClientMsg, Role, DISCONNECT_SECS, EXPIRE_SECS, INPUT_DELAY};
+use crate::result::ResultCtx;
 use crate::room::{self, RoomEvent, RoomSettings};
 use crate::webhook;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -271,6 +272,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Op
                     RoomSettings {
                         instant: state.config.instant,
                         disconnect: state.config.disconnect,
+                        result: Some(ResultCtx {
+                            gh: state.github.clone(),
+                            pool: state.pool.clone(),
+                            public_url: state.auth.public_url.clone(),
+                            test_repos: state.test_repos.clone(),
+                        }),
                     },
                 )
             })

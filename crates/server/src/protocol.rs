@@ -49,6 +49,7 @@ pub enum ServerMsg {
         ours: String,
         theirs: String,
         round: u32,
+        total_rounds: u32,
         confirmed_tick: i32,
     },
     Tick {
@@ -66,6 +67,8 @@ pub enum ServerMsg {
         hash_hi: u32,
         hash_lo: u32,
         tick: u32,
+        round: u32,
+        match_over: bool,
     },
     Error {
         message: String,

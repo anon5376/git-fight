@@ -4,9 +4,10 @@ use crate::limits::{CLONE_TIMEOUT, MAX_BLOB_BYTES, MAX_HUNKS};
 use git_fight_core::ConflictFile;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -79,6 +80,28 @@ fn git_base() -> Command {
 
 async fn run(mut cmd: Command, limit: Duration) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
     let out = timeout(limit, cmd.output())
+        .await
+        .map_err(|_| GitError::Timeout)?
+        .map_err(GitError::Io)?;
+    Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
+}
+
+async fn run_stdin(
+    mut cmd: Command,
+    input: &[u8],
+    limit: Duration,
+) -> Result<(i32, Vec<u8>, Vec<u8>), GitError> {
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(GitError::Io)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        timeout(limit, stdin.write_all(input))
+            .await
+            .map_err(|_| GitError::Timeout)?
+            .map_err(GitError::Io)?;
+    }
+    let out = timeout(limit, child.wait_with_output())
         .await
         .map_err(|_| GitError::Timeout)?
         .map_err(GitError::Io)?;
@@ -400,6 +423,206 @@ async fn fallback_author(dir: &Path, base_sha: &str, path: &str) -> (String, Str
     ("theirs".into(), String::new(), base_sha.into())
 }
 
+/// `git-fight/pr-<number>-<match-id>` only. Never main, never an existing user branch.
+pub fn result_ref(pr_number: i64, match_id: &str) -> Result<String, GitError> {
+    if pr_number <= 0 {
+        return Err(GitError::Command("missing pull request".into()));
+    }
+    if match_id.is_empty()
+        || match_id.len() > 64
+        || !match_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(GitError::Command("unsafe match id".into()));
+    }
+    Ok(format!("git-fight/pr-{pr_number}-{match_id}"))
+}
+
+pub async fn hash_object_w(dir: &Path, bytes: &[u8]) -> Result<String, GitError> {
+    let mut cmd = git_dir(dir);
+    cmd.args(["hash-object", "-w", "--stdin"]);
+    let (code, out, err) = run_stdin(cmd, bytes, Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(GitError::Command(
+            String::from_utf8_lossy(&err).into_owned(),
+        ));
+    }
+    let oid = String::from_utf8_lossy(&out).trim().to_string();
+    if oid.len() != 40 && oid.len() != 64 {
+        return Err(GitError::Command("hash-object: bad oid".into()));
+    }
+    Ok(oid)
+}
+
+fn with_index(cmd: &mut Command, index: &Path) {
+    cmd.env("GIT_INDEX_FILE", index);
+}
+
+pub async fn read_tree_index(dir: &Path, index: &Path, tree: &str) -> Result<(), GitError> {
+    let mut cmd = git_dir(dir);
+    with_index(&mut cmd, index);
+    cmd.args(["read-tree", tree]);
+    let (code, _, err) = run(cmd, Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(GitError::Command(redact_git_text(
+            &String::from_utf8_lossy(&err),
+        )));
+    }
+    Ok(())
+}
+
+pub async fn update_index_cacheinfo(
+    dir: &Path,
+    index: &Path,
+    mode: &str,
+    blob: &str,
+    path: &str,
+) -> Result<(), GitError> {
+    if !is_safe_path(path) {
+        return Err(GitError::Command("unsafe path".into()));
+    }
+    if mode != "100644" && mode != "100755" {
+        return Err(GitError::Command("refusing non-regular mode".into()));
+    }
+    let mut cmd = git_dir(dir);
+    with_index(&mut cmd, index);
+    cmd.args(["update-index", "--add", "--cacheinfo", mode, blob, path]);
+    let (code, _, err) = run(cmd, Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(GitError::Command(redact_git_text(
+            &String::from_utf8_lossy(&err),
+        )));
+    }
+    Ok(())
+}
+
+pub async fn write_tree_index(dir: &Path, index: &Path) -> Result<String, GitError> {
+    let mut cmd = git_dir(dir);
+    with_index(&mut cmd, index);
+    cmd.arg("write-tree");
+    let (code, out, err) = run(cmd, Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(GitError::Command(redact_git_text(
+            &String::from_utf8_lossy(&err),
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+pub async fn commit_tree(
+    dir: &Path,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+) -> Result<String, GitError> {
+    let mut cmd = git_dir(dir);
+    cmd.env("GIT_AUTHOR_NAME", "git-fight");
+    cmd.env("GIT_AUTHOR_EMAIL", "git-fight@users.noreply.github.com");
+    cmd.env("GIT_COMMITTER_NAME", "git-fight");
+    cmd.env("GIT_COMMITTER_EMAIL", "git-fight@users.noreply.github.com");
+    cmd.args(["commit-tree", tree]);
+    for p in parents {
+        cmd.arg("-p").arg(p);
+    }
+    let (code, out, err) = run_stdin(cmd, message.as_bytes(), Duration::from_secs(15)).await?;
+    if code != 0 {
+        return Err(GitError::Command(redact_git_text(
+            &String::from_utf8_lossy(&err),
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+pub async fn ref_exists(url: &str, refname: &str, bearer: Option<&str>) -> Result<bool, GitError> {
+    if !refname.starts_with("git-fight/") {
+        return Err(GitError::Command(
+            "refusing to inspect non git-fight ref".into(),
+        ));
+    }
+    let mut cmd = git_base();
+    apply_auth(&mut cmd, url, bearer);
+    cmd.args([
+        "ls-remote",
+        "--heads",
+        url,
+        &format!("refs/heads/{refname}"),
+    ]);
+    let (code, out, err) = run(cmd, Duration::from_secs(20)).await?;
+    if code != 0 {
+        return Err(GitError::Command(redact_git_text(
+            &String::from_utf8_lossy(&err),
+        )));
+    }
+    Ok(!String::from_utf8_lossy(&out).trim().is_empty())
+}
+
+/// Create-only push of `commit` to `refs/heads/<refname>`. Never force-pushes.
+pub async fn push_create_only(
+    dir: &Path,
+    url: &str,
+    commit: &str,
+    refname: &str,
+    bearer: Option<&str>,
+) -> Result<(), GitError> {
+    if !refname.starts_with("git-fight/") || refname.contains("..") || refname.contains('\\') {
+        return Err(GitError::Command(
+            "refusing to push outside git-fight/*".into(),
+        ));
+    }
+    if ref_exists(url, refname, bearer).await? {
+        return Err(GitError::Command(format!(
+            "ref refs/heads/{refname} already exists"
+        )));
+    }
+    let dest = format!("{commit}:refs/heads/{refname}");
+    let mut cmd = git_dir(dir);
+    apply_auth(&mut cmd, url, bearer);
+    cmd.args(["push", "--", url, &dest]);
+    let (code, _, err) = run(cmd, CLONE_TIMEOUT).await?;
+    if code != 0 {
+        return Err(GitError::Command(redact_git_text(
+            &String::from_utf8_lossy(&err),
+        )));
+    }
+    Ok(())
+}
+
+pub fn temp_index_path(dir: &Path) -> PathBuf {
+    dir.join(".git-fight-index")
+}
+
+/// Replace resolved regular files in `merge_tree` and write a new tree. Plumbing only.
+pub async fn build_resolved_tree(
+    dir: &Path,
+    merge_tree: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<String, GitError> {
+    let index = temp_index_path(dir);
+    let _ = tokio::fs::remove_file(&index).await;
+    read_tree_index(dir, &index, merge_tree).await?;
+    for (path, bytes) in files {
+        if !is_safe_path(path) {
+            continue;
+        }
+        let mode = ls_tree_mode(dir, merge_tree, path)
+            .await?
+            .unwrap_or_else(|| "100644".into());
+        if mode != "100644" && mode != "100755" {
+            continue;
+        }
+        let blob = hash_object_w(dir, bytes).await?;
+        update_index_cacheinfo(dir, &index, &mode, &blob, path).await?;
+    }
+    let tree = write_tree_index(dir, &index).await?;
+    let _ = tokio::fs::remove_file(&index).await;
+    Ok(tree)
+}
+
+pub async fn cat_blob(dir: &Path, spec: &str) -> Result<Vec<u8>, GitError> {
+    cat_file(dir, spec).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +635,18 @@ mod tests {
         assert!(!is_safe_path("foo/.git/bar"));
         assert!(is_safe_path("src/lib.rs"));
         assert!(is_safe_path("a/b.c"));
+    }
+
+    #[test]
+    fn result_ref_only_git_fight() {
+        assert_eq!(
+            result_ref(7, "deadbeef").unwrap(),
+            "git-fight/pr-7-deadbeef"
+        );
+        assert!(result_ref(0, "deadbeef").is_err());
+        assert!(result_ref(1, "../main").is_err());
+        assert!(result_ref(1, "MAIN").is_err());
+        assert!(result_ref(1, "dead/beef").is_err());
     }
 
     #[test]

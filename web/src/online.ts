@@ -27,6 +27,7 @@ type Hello = {
   ours: string;
   theirs: string;
   round: number;
+  total_rounds?: number;
   confirmed_tick: number;
 };
 
@@ -37,6 +38,8 @@ type EndMsg = {
   hash_hi: number;
   hash_lo: number;
   tick: number;
+  round?: number;
+  match_over?: boolean;
 };
 type ErrMsg = { type: "error"; message: string };
 type ServerMsg = Hello | TickMsg | EndMsg | ErrMsg | { type: string };
@@ -112,6 +115,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let oursName = "ours";
   let theirsName = "theirs";
   let finished = false;
+  let round = 0;
+  let totalRounds = 1;
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
@@ -179,6 +184,11 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       confirmed = hello.confirmed_tick;
       oursName = hello.ours;
       theirsName = hello.theirs;
+      round = hello.round ?? 0;
+      totalRounds = hello.total_rounds ?? 1;
+      nextSend = Math.max(0, confirmed + 1);
+      finished = false;
+      ui.ko.classList.add("hidden");
       fight = WasmFight.from_seed(hello.seed_lo, hello.seed_hi);
       if (role === "spectator") {
         ui.wait.textContent = "spectating";
@@ -196,10 +206,15 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       }
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
-      finished = true;
+      const matchOver = end.match_over !== false;
       ui.wait.classList.add("hidden");
       showKo(ui.ko, end.result);
-      ui.resolved.textContent = `replay /replay/${matchId}`;
+      if (matchOver) {
+        finished = true;
+        ui.resolved.textContent = `replay /replay/${matchId}`;
+      } else {
+        ui.resolved.textContent = `round ${(end.round ?? round) + 1}/${totalRounds}`;
+      }
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
       ui.wait.classList.remove("hidden");
@@ -238,7 +253,13 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       }
     }
     if (fight) {
-      paintFight(ui.stage, fight, oursName, theirsName, "online 1/1");
+      paintFight(
+        ui.stage,
+        fight,
+        oursName,
+        theirsName,
+        `online ${round + 1}/${totalRounds}`,
+      );
     }
     requestAnimationFrame(loop);
   };
