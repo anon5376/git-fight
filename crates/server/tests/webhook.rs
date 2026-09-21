@@ -172,6 +172,54 @@ fn binary_conflict_bare() -> (tempfile::TempDir, PathBuf, String, String) {
     (tmp, bare, head, base)
 }
 
+fn write_hunk_fns(work: &Path, n: usize, body: i32) {
+    let mut src = String::new();
+    for i in 0..n {
+        src.push_str(&format!("fn f{i}() {{ {body} }}\n"));
+        for p in 0..8 {
+            src.push_str(&format!("// pad {i} {p}\n"));
+        }
+    }
+    std::fs::write(work.join("lib.rs"), src).unwrap();
+}
+
+fn many_hunks_bare(n: usize) -> (tempfile::TempDir, PathBuf, String, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q"]);
+    git(&work, &["config", "user.email", "alice@example.com"]);
+    git(&work, &["config", "user.name", "alice"]);
+    write_hunk_fns(&work, n, 0);
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base"]);
+    git(&work, &["branch", "base"]);
+    git(&work, &["checkout", "-q", "-b", "pr"]);
+    write_hunk_fns(&work, n, 1);
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "pr"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["checkout", "-q", "base"]);
+    git(&work, &["config", "user.email", "bob@example.com"]);
+    git(&work, &["config", "user.name", "bob"]);
+    write_hunk_fns(&work, n, 2);
+    git(&work, &["add", "lib.rs"]);
+    git(&work, &["commit", "-q", "-m", "base2"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let bare = tmp.path().join("repo.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    (tmp, bare, head, base)
+}
+
 async fn spawn(cfg: Config) -> std::net::SocketAddr {
     spawn_with_pool(cfg).await.0
 }
@@ -1239,6 +1287,35 @@ async fn binary_conflict_is_not_fightable() {
             .unwrap()
             .is_none(),
         "unfightable conflicts must not leave a pending match"
+    );
+}
+
+#[tokio::test]
+async fn too_many_conflicts_comment_and_abort() {
+    let (_keep, bare, head, base) = many_hunks_bare(16);
+    let mock = github_mocks(&head, &base, cpu_opts()).await;
+    let (addr, pool) = spawn_with_pool(cfg_for(&mock, bare)).await;
+    assert_eq!(
+        post_signed(addr, "issue_comment", "deliv-too-many", &fight_body()).await,
+        200
+    );
+    let comments = wait_posted(&mock, 1).await;
+    assert!(
+        comments
+            .iter()
+            .any(|t| t.contains("too many conflicts for one fight") && t.contains("max 15")),
+        "{comments:?}"
+    );
+    assert!(
+        comments.iter().all(|t| !t.contains("/match/")),
+        "{comments:?}"
+    );
+    assert!(
+        git_fight_server::db::open_match_for_pr(&pool, "acme", "box", 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "too many conflicts must not leave a pending match"
     );
 }
 

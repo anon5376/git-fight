@@ -372,3 +372,36 @@ test("expired match shows expiry and does not reconnect", async ({ page, request
   await expect(page.getByTestId("wait")).not.toContainText(/reconnecting/i);
   await expect(page.getByTestId("wait")).not.toContainText(/reloading/i);
 });
+
+test("repo leaderboard and badge render in the browser", async ({ page }) => {
+  execFileSync(
+    "sqlite3",
+    [
+      DB,
+      `DELETE FROM player_stats WHERE owner = 'acme' AND repo = 'box-lb';
+INSERT INTO player_stats (owner, repo, github_login, wins, losses, kos, conflicts_caused)
+VALUES
+  ('acme', 'box-lb', 'alice', 3, 1, 2, 0),
+  ('acme', 'box-lb', 'bob', 1, 3, 0, 4);`,
+    ],
+    { stdio: "pipe" },
+  );
+
+  await page.goto("/acme/box-lb/leaderboard");
+  await expect(page.locator(".tag")).toHaveText("acme/box-lb leaderboard");
+  await expect(page.locator("table")).toContainText("alice");
+  await expect(page.locator("table")).toContainText("bob");
+  const aliceRow = page.locator("tbody tr").filter({ hasText: "alice" });
+  await expect(aliceRow).toContainText("3");
+  await expect(aliceRow).toContainText("2");
+  await expect(page.getByTestId("stage")).toHaveCount(0);
+  await expect(page.getByTestId("wait")).toHaveCount(0);
+
+  const badge = await page.goto("/badge/acme/box-lb/alice");
+  expect(badge?.ok()).toBeTruthy();
+  expect(badge?.headers()["content-type"] ?? "").toMatch(/image\/svg\+xml/);
+  const svg = (await badge?.text()) ?? "";
+  expect(svg).toContain("3 wins");
+  expect(svg).toContain("#FF4A1C");
+  expect(svg).toContain("#0A0A0B");
+});
