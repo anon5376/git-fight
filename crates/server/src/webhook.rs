@@ -197,7 +197,7 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
     if head.eq_ignore_ascii_case(&row.pr_head_sha) && base.eq_ignore_ascii_case(&row.pr_base_sha) {
         return;
     }
-    match abort_open_retry(&state.pool, &row.id, "outdated").await {
+    match db::abort_open_retry(&state.pool, &row.id, "outdated").await {
         Ok(true) => {}
         Ok(false) => return,
         Err(_) => {
@@ -209,19 +209,6 @@ async fn notice_if_outdated(state: &crate::app::AppState, row: &db::MatchRow, pr
         }
     }
     close_and_comment_outdated(state, row).await;
-}
-
-/// Retry once. `Ok(false)` means the row is already closed. `Err` is
-/// still unknown — do not treat that as a no-op.
-async fn abort_open_retry(
-    pool: &sqlx::SqlitePool,
-    id: &str,
-    reason: &str,
-) -> Result<bool, sqlx::Error> {
-    match db::abort_open_match(pool, id, reason).await {
-        Ok(v) => Ok(v),
-        Err(_) => db::abort_open_match(pool, id, reason).await,
-    }
 }
 
 fn schedule_outdated_abort(state: crate::app::AppState, row: db::MatchRow) {
@@ -330,7 +317,7 @@ async fn open_match_lookup_retry(
 
 fn schedule_open_lookup(state: crate::app::AppState, owner: String, repo: String, pr: Pr) {
     tokio::spawn(async move {
-        for delay_ms in [25_u64, 50, 100, 200] {
+        for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             match db::open_match_for_pr(&state.pool, &owner, &repo, pr.number).await {
                 Ok(Some(row)) => {

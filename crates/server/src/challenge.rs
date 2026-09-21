@@ -8,6 +8,7 @@ use crate::protocol::INPUT_DELAY;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::time::timeout;
 
 #[derive(Clone)]
@@ -61,13 +62,28 @@ async fn already_open_now(
 }
 
 async fn abort_start(pool: &SqlitePool, id: &str, reason: &str, body: String) -> ChallengeStart {
-    if db::abort_open_match(pool, id, reason)
-        .await
-        .unwrap_or(false)
-    {
-        return note(body);
+    match db::abort_open_retry(pool, id, reason).await {
+        Ok(true) => note(body),
+        Ok(false) => silent(),
+        Err(_) => {
+            // Busy write is not already-closed. Keep retrying abort so
+            // rematch `/fight` is not stuck on a leftover pending row.
+            schedule_abort_start(pool.clone(), id.to_string(), reason.to_string());
+            silent()
+        }
     }
-    silent()
+}
+
+fn schedule_abort_start(pool: SqlitePool, id: String, reason: String) {
+    tokio::spawn(async move {
+        for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            match db::abort_open_match(&pool, &id, &reason).await {
+                Ok(_) => return,
+                Err(_) => {}
+            }
+        }
+    });
 }
 
 async fn abort_start_quiet(pool: &SqlitePool, id: &str, reason: &str) -> ChallengeStart {
@@ -566,5 +582,19 @@ mod tests {
         let row = crate::db::get_match(&pool, "m1").await.unwrap().unwrap();
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
+    }
+
+    #[test]
+    fn abort_start_busy_write_is_not_already_closed() {
+        assert!(matches!(first_or_retry(Err(()), Ok(true)), Ok(true)));
+        assert!(matches!(first_or_retry(Err(()), Ok(false)), Ok(false)));
+        assert!(
+            first_or_retry(Err(()), Err(())).is_err(),
+            "two busy aborts must retry later, not leave a pending row"
+        );
+    }
+
+    fn first_or_retry(first: Result<bool, ()>, retry: Result<bool, ()>) -> Result<bool, ()> {
+        first.or(retry)
     }
 }

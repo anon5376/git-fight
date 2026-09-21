@@ -648,6 +648,19 @@ pub async fn abort_open_match(
     Ok(res.rows_affected() > 0)
 }
 
+/// Retry once. `Ok(false)` means the row is already closed. `Err` is
+/// still unknown — do not treat that as a no-op.
+pub async fn abort_open_retry(
+    pool: &SqlitePool,
+    id: &str,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    match abort_open_match(pool, id, reason).await {
+        Ok(v) => Ok(v),
+        Err(_) => abort_open_match(pool, id, reason).await,
+    }
+}
+
 /// Mark a match finished only if it is still open (not aborted/expired).
 pub async fn finish_open_match(
     pool: &SqlitePool,
