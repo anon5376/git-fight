@@ -326,6 +326,11 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
 
   const onMessage = (ev: MessageEvent) => {
     const msg = JSON.parse(String(ev.data)) as ServerMsg;
+    // Terminal Error (outdated / finished / …) wins over a queued Hello
+    // still sitting on the same socket.
+    if (finished && msg.type !== "error") {
+      return;
+    }
     if (msg.type === "hello") {
       const hello = msg as Hello;
       role = hello.your_role;
@@ -474,6 +479,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       if (terminal) {
         finished = true;
         clearReconnect();
+        ws?.close();
       }
     }
   };

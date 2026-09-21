@@ -1309,10 +1309,11 @@ async fn forfeit_round_then_return_plays_later_round() {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
     tokio::spawn(async move {
         git_fight_server::serve(
             listener,
-            pool,
+            serve_pool,
             Config {
                 instant: true,
                 disconnect: Duration::from_millis(80),
@@ -1378,6 +1379,12 @@ async fn forfeit_round_then_return_plays_later_round() {
         "ours disconnect => theirs"
     );
     assert_eq!(end0["match_over"].as_bool(), Some(false));
+    let hunks = git_fight_server::db::list_hunks(&pool, id).await.unwrap();
+    assert_eq!(
+        hunks[0].winner.as_deref(),
+        Some("forfeit_ours"),
+        "disconnect forfeit must be stored before End so resume cannot replay a KO pick"
+    );
 
     let (ours_ws, _) = tokio_tungstenite::connect_async(&ours_url).await.unwrap();
     let (mut ours_sink, mut ours_stream) = ours_ws.split();

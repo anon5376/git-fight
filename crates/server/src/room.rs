@@ -253,7 +253,6 @@ async fn run_room(
                                     db::stats_for_round(&hunks, round),
                                     &hunks,
                                     &log,
-                                    &sim,
                                 );
                             }
                         }
@@ -380,7 +379,6 @@ async fn run_room(
                         db::stats_for_round(&hunks, round),
                         &hunks,
                         &log,
-                        &sim,
                     );
                 }
             }
@@ -478,15 +476,37 @@ async fn advance(a: Advance<'_>) -> bool {
     if a.started_at.is_some() {
         if let Some(at) = a.ours.disconnected_at {
             if at.elapsed() >= a.disconnect {
-                a.sim.forfeit(Side::Ours);
                 *a.forfeit_pending = true;
+                // Write the forfeit tag before End so a restart cannot
+                // replay this round as a KO pick.
+                if !persist_disconnect_forfeit(
+                    a.pool,
+                    a.id,
+                    *a.round,
+                    result::winner_tag(RoundResult::Theirs, true),
+                )
+                .await
+                {
+                    return false;
+                }
+                a.sim.forfeit(Side::Ours);
                 return finish(a, RoundResult::Theirs).await;
             }
         }
         if let Some(at) = a.theirs.disconnected_at {
             if at.elapsed() >= a.disconnect {
-                a.sim.forfeit(Side::Theirs);
                 *a.forfeit_pending = true;
+                if !persist_disconnect_forfeit(
+                    a.pool,
+                    a.id,
+                    *a.round,
+                    result::winner_tag(RoundResult::Ours, true),
+                )
+                .await
+                {
+                    return false;
+                }
+                a.sim.forfeit(Side::Theirs);
                 return finish(a, RoundResult::Ours).await;
             }
         }
@@ -692,6 +712,19 @@ enum StoredRound {
     Empty,
     Missing,
     Unknown,
+}
+
+async fn persist_disconnect_forfeit(pool: &SqlitePool, id: &str, round: u32, tag: &str) -> bool {
+    let tagged = db::set_hunk_winner(pool, id, i64::from(round), tag, false)
+        .await
+        .unwrap_or(false);
+    if tagged {
+        return true;
+    }
+    match stored_round(pool, id, round).await {
+        StoredRound::Winner | StoredRound::Missing => true,
+        StoredRound::Empty | StoredRound::Unknown => false,
+    }
 }
 
 async fn stored_round(pool: &SqlitePool, id: &str, round: u32) -> StoredRound {
@@ -927,7 +960,6 @@ fn send_catch_up(
     stats: (FighterStats, FighterStats),
     hunks: &[db::HunkRow],
     log: &[(u32, u8, u8)],
-    sim: &FightState,
 ) {
     try_send_or_spawn(
         tx,
@@ -957,10 +989,10 @@ fn send_catch_up(
             hunks,
         )),
     );
-    if let Some(result) = sim.result {
-        let match_over = round + 1 >= total_rounds;
-        try_send_or_spawn(tx, encode(&end_msg(sim, result, round, match_over)));
-    }
+    // End is finish()'s job (last_round_followup + End-then-Hello).
+    // Catch-up End would send match_over while still in_progress, or
+    // advance the canvas Input.round while the room is still on this
+    // conflict.
 }
 
 fn terminal_ws_error(row: &MatchRow) -> String {
@@ -1591,6 +1623,49 @@ mod tests {
             .expect("channel open");
         assert!(end.contains("end"), "{end}");
         assert!(hello.contains("hello"), "{hello}");
+    }
+
+    #[tokio::test]
+    async fn send_catch_up_does_not_emit_end() {
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        send_catch_up(
+            &tx,
+            "m",
+            1,
+            3,
+            "ours",
+            "alice",
+            "alice",
+            "bob",
+            0,
+            1,
+            2,
+            (FighterStats::default(), FighterStats::default()),
+            &[],
+            &[(0, 1, 0)],
+        );
+        let hello = rx.recv().await.expect("Hello");
+        let snap = rx.recv().await.expect("Snapshot");
+        assert!(hello.contains("hello"), "{hello}");
+        assert!(snap.contains("snapshot"), "{snap}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "catch-up must not send End"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_disconnect_forfeit_is_ok_without_a_hunk() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "abc", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        assert!(
+            persist_disconnect_forfeit(&pool, "abc", 0, "forfeit_ours").await,
+            "local demo has no hunk row"
+        );
     }
 
     #[test]
