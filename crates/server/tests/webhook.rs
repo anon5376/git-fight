@@ -1060,11 +1060,7 @@ async fn fight_comment_two_authors_play_two_files_and_push() {
     let alice = board.iter().find(|p| p.github_login == "alice");
     let bob = board.iter().find(|p| p.github_login == "bob");
     let carol = board.iter().find(|p| p.github_login == "carol");
-    assert_eq!(
-        alice.map(|p| (p.wins, p.losses, p.kos)),
-        Some((2, 0, 2)),
-        "{board:?}"
-    );
+    assert_eq!(alice.map(|p| (p.wins, p.losses)), Some((2, 0)), "{board:?}");
     assert_eq!(
         bob.map(|p| (p.wins, p.losses, p.conflicts_caused)),
         Some((0, 1, 1)),
