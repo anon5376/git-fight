@@ -153,6 +153,11 @@ impl ConflictFile {
         &self.original[r.start..r.end]
     }
 
+    pub fn base(&self, hunk: usize) -> Option<&[u8]> {
+        let r = self.hunks.get(hunk)?.base.as_ref()?;
+        Some(&self.original[r.start..r.end])
+    }
+
     /// Reconstruct the file. `None` leaves that hunk's markers in place.
     /// When every pick is `None`, the original bytes are returned unchanged.
     pub fn resolve(&self, picks: &[Option<Pick>]) -> Vec<u8> {
