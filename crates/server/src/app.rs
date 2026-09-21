@@ -388,8 +388,7 @@ impl AppState {
             }
             let posted = gh
                 .comment(inst, &row.owner, &row.repo, row.pr_number as u64, &body)
-                .await
-                .unwrap_or(0);
+                .await;
             crate::challenge::persist_challenge_comment(
                 &self.pool,
                 &self.comments,

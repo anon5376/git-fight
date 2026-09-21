@@ -475,11 +475,7 @@ async fn post_challenge_comment(
     number: u64,
     start: &challenge::ChallengeStart,
 ) {
-    let posted = ctx
-        .gh
-        .comment(inst, owner, name, number, &start.body)
-        .await
-        .unwrap_or(0);
+    let posted = ctx.gh.comment(inst, owner, name, number, &start.body).await;
     if let Some(match_id) = start.match_id.as_deref() {
         crate::challenge::persist_challenge_comment(&ctx.pool, &ctx.comments, match_id, posted)
             .await;

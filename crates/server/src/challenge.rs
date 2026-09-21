@@ -102,19 +102,50 @@ impl StartNoteTrack {
     }
 }
 
+/// After `GitHub::comment`: set the id, hold inflight (2xx with no id),
+/// or unmark so a failed POST can retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersistPosted {
+    Set(u64),
+    Hold,
+    Retry,
+}
+
+pub(crate) fn persist_posted_followup(posted: Result<u64, &str>) -> PersistPosted {
+    match posted {
+        Ok(id) if id > 0 => PersistPosted::Set(id),
+        Ok(_) => PersistPosted::Hold,
+        Err("comment id") => PersistPosted::Hold,
+        Err(_) => PersistPosted::Retry,
+    }
+}
+
 /// Store a posted fight-link id, or queue it so the expirer SETs instead
 /// of POSTing a second comment.
 pub(crate) async fn persist_challenge_comment(
     pool: &SqlitePool,
     comments: &CommentTrack,
     match_id: &str,
+    posted: Result<u64, String>,
+) {
+    match persist_posted_followup(posted.as_ref().map(|id| *id).map_err(|e| e.as_str())) {
+        PersistPosted::Hold => return,
+        PersistPosted::Retry => {
+            comments.unmark(match_id);
+            return;
+        }
+        PersistPosted::Set(posted) => {
+            persist_challenge_comment_id(pool, comments, match_id, posted).await;
+        }
+    }
+}
+
+async fn persist_challenge_comment_id(
+    pool: &SqlitePool,
+    comments: &CommentTrack,
+    match_id: &str,
     posted: u64,
 ) {
-    if posted == 0 {
-        // POST may already have created a thread whose id we could not
-        // parse. Hold inflight so the expirer does not POST a second link.
-        return;
-    }
     match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
         Ok(_) => comments.unmark(match_id),
         Err(_) => match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
@@ -927,16 +958,18 @@ mod tests {
 
     #[test]
     fn missing_posted_id_holds_inflight() {
-        assert_eq!(posted_id_followup(0), "hold");
-        assert_eq!(posted_id_followup(7), "set");
-    }
-
-    fn posted_id_followup(posted: u64) -> &'static str {
-        if posted == 0 {
-            "hold"
-        } else {
-            "set"
-        }
+        assert_eq!(persist_posted_followup(Ok(7)), PersistPosted::Set(7));
+        assert_eq!(persist_posted_followup(Ok(0)), PersistPosted::Hold);
+        assert_eq!(
+            persist_posted_followup(Err("comment id")),
+            PersistPosted::Hold,
+            "a 2xx body without an id must not POST a second fight link"
+        );
+        assert_eq!(
+            persist_posted_followup(Err("comment 502")),
+            PersistPosted::Retry,
+            "a failed POST must unmark so the expirer can try again"
+        );
     }
 
     #[test]
