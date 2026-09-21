@@ -22,4 +22,5 @@ ENV GIT_CONFIG_GLOBAL=/dev/null
 ENV GIT_CONFIG_NOSYSTEM=1
 EXPOSE 8080
 VOLUME ["/data"]
+# Bind is 0.0.0.0; GitHub App mode requires GIT_FIGHT_PUBLIC_URL (a real host, not 0.0.0.0).
 CMD ["git-fight-server", "--bind", "0.0.0.0:8080", "--static", "/app/web", "--db", "sqlite:///data/git-fight.db"]

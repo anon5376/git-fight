@@ -55,8 +55,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// A GitHub-backed process must have a webhook HMAC secret and a
-    /// non-default session key. Local demo (no App) may keep compiled defaults.
+    /// A GitHub-backed process must have a webhook HMAC secret, a
+    /// non-default session key, and a public URL that is not a wildcard bind.
     pub fn require_live_github_secrets(&self) -> Result<(), &'static str> {
         if self.github.is_none() {
             return Ok(());
@@ -67,8 +67,38 @@ impl Config {
         if self.auth.session_key.len() < 16 || self.auth.session_key.iter().all(|&b| b == 0x11) {
             return Err("SESSION_KEY");
         }
+        if !is_live_public_url(&self.auth.public_url) {
+            return Err("GIT_FIGHT_PUBLIC_URL");
+        }
         Ok(())
     }
+}
+
+/// Match links and OAuth redirect_uri. Reject wildcard binds (`0.0.0.0`).
+fn is_live_public_url(s: &str) -> bool {
+    let s = s.trim();
+    if !(12..=200).contains(&s.len()) {
+        return false;
+    }
+    let rest = if let Some(r) = s.strip_prefix("https://") {
+        r
+    } else if let Some(r) = s.strip_prefix("http://") {
+        r
+    } else {
+        return false;
+    };
+    if rest.is_empty()
+        || rest.contains(|c: char| c.is_ascii_whitespace() || matches!(c, '\\' | '?' | '#' | '@'))
+    {
+        return false;
+    }
+    let hostport = rest.split('/').next().unwrap_or("");
+    let host = if let Some(inner) = hostport.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    !host.is_empty() && host != "0.0.0.0" && host != "*" && host != "::" && !host.starts_with('-')
 }
 
 #[derive(Clone)]
@@ -524,5 +554,24 @@ mod tests {
         assert_eq!(cfg.require_live_github_secrets(), Err("SESSION_KEY"));
         cfg.auth.session_key = b"session-key-session-key-session!".to_vec();
         assert!(cfg.require_live_github_secrets().is_ok());
+        cfg.auth.public_url = "http://0.0.0.0:8080".into();
+        assert_eq!(
+            cfg.require_live_github_secrets(),
+            Err("GIT_FIGHT_PUBLIC_URL")
+        );
+        cfg.auth.public_url = "https://fight.example".into();
+        assert!(cfg.require_live_github_secrets().is_ok());
+    }
+
+    #[test]
+    fn public_url_rejects_wildcard_and_junk() {
+        assert!(is_live_public_url("http://127.0.0.1:8080"));
+        assert!(is_live_public_url("https://git-fight.example/"));
+        assert!(!is_live_public_url("http://0.0.0.0:8080"));
+        assert!(!is_live_public_url("http://[::]:8080"));
+        assert!(!is_live_public_url("http://evil@fight.example"));
+        assert!(!is_live_public_url("ftp://fight.example"));
+        assert!(!is_live_public_url("https://evil\n.example"));
+        assert!(!is_live_public_url(""));
     }
 }
