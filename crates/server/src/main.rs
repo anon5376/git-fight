@@ -32,6 +32,9 @@ struct Args {
     /// Directory of the Vite build (index.html + assets).
     #[arg(long)]
     r#static: Option<PathBuf>,
+    /// Confirm ticks as fast as inputs arrive (lockstep tests, not production).
+    #[arg(long, default_value_t = false)]
+    instant: bool,
 }
 
 #[tokio::main]
@@ -55,7 +58,7 @@ async fn main() {
         });
     let mut config = Config {
         lag: Duration::from_millis(args.lag_ms),
-        instant: false,
+        instant: args.instant,
         static_dir: args.r#static.or_else(|| {
             let p = PathBuf::from("web/dist");
             p.exists().then_some(p)

@@ -5,12 +5,13 @@ export default defineConfig({
   fullyParallel: false,
   retries: 0,
   use: {
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: "http://127.0.0.1:18080",
     trace: "on-first-retry",
   },
   webServer: {
-    command: "npm run build && npm run preview",
-    url: "http://127.0.0.1:4173",
+    command:
+      "npm run build && cargo run -q --manifest-path ../Cargo.toml -p git-fight-server -- --bind 127.0.0.1:18080 --static dist --db sqlite://../target/playwright.db --instant",
+    url: "http://127.0.0.1:18080/health",
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,
   },
