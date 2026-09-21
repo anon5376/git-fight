@@ -1,0 +1,17 @@
+{
+  "name": "git-fight-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wasm": "wasm-pack build ../crates/wasm --target web --out-dir ../../web/pkg --release",
+    "dev": "npm run wasm && vite",
+    "build": "npm run wasm && tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3"
+  }
+}
