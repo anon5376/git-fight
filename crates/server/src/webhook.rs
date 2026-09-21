@@ -335,6 +335,7 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         test_repos: state.test_repos.clone(),
         expire_secs: state.config.expire_secs,
         comments: state.comments.clone(),
+        start_notes: state.start_notes.clone(),
     };
     let owner = crate::gh::fold_github_name(&repo.owner.login);
     let name = crate::gh::fold_github_name(&repo.name);

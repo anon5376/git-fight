@@ -295,6 +295,7 @@ fn ctx(pool: sqlx::SqlitePool, mock: &MockServer, bare: PathBuf) -> ResultCtx {
         public_url: "http://fight.test".into(),
         test_repos,
         publishing: Default::default(),
+        pending_expired: Default::default(),
     }
 }
 
@@ -1321,6 +1322,7 @@ async fn local_match_does_not_push() {
         public_url: "http://fight.test".into(),
         test_repos: HashMap::new(),
         publishing: Default::default(),
+        pending_expired: Default::default(),
     };
     git_fight_server::publish_result(&ctx, "aabbccdd")
         .await

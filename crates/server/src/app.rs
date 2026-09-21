@@ -122,6 +122,8 @@ pub struct AppState {
     /// Busy `synchronize` lookups that exhausted the short retry loop.
     pub(crate) lookups: crate::webhook::LookupTrack,
     pub(crate) comments: crate::challenge::CommentTrack,
+    pub(crate) start_notes: crate::challenge::StartNoteTrack,
+    pending_expired: Arc<std::sync::Mutex<HashSet<String>>>,
     pub github: Option<GitHub>,
     pub auth: Auth,
     pub webhook_secret: Option<Vec<u8>>,
@@ -160,6 +162,7 @@ impl AppState {
             public_url: self.auth.public_url.clone(),
             test_repos: self.test_repos.clone(),
             publishing: self.publishing.clone(),
+            pending_expired: self.pending_expired.clone(),
         }
     }
 
@@ -284,6 +287,30 @@ impl AppState {
         crate::result::comment_outdated(&self.result_ctx(), &row)
             .await
             .is_ok()
+    }
+
+    async fn retry_start_notes(&self) {
+        let ctx = self.result_ctx();
+        for (id, reason, body) in self.start_notes.snapshot() {
+            match db::abort_open_match(&self.pool, &id, &reason).await {
+                Ok(true) | Ok(false) => {}
+                Err(_) => continue,
+            }
+            let Ok(Some(row)) = db::get_match(&self.pool, &id).await else {
+                self.start_notes.dequeue(&id);
+                continue;
+            };
+            if row.abort_reason.as_deref() != Some(reason.as_str()) {
+                self.start_notes.dequeue(&id);
+                continue;
+            }
+            if crate::result::comment_decision(&ctx, &row, &body)
+                .await
+                .is_ok()
+            {
+                self.start_notes.dequeue(&id);
+            }
+        }
     }
 
     async fn abort_stale_preparing(&self) {
@@ -447,6 +474,8 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
         closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         lookups: crate::webhook::LookupTrack::default(),
         comments: crate::challenge::CommentTrack::default(),
+        start_notes: crate::challenge::StartNoteTrack::default(),
+        pending_expired: Arc::new(std::sync::Mutex::new(HashSet::new())),
     };
     if let Ok(rows) = db::list_live_matches(&state.pool).await {
         for row in rows {
@@ -468,6 +497,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
             expirer.abort_stale_preparing().await;
             expirer.retry_pending_comment_ids().await;
             expirer.post_uncommented_challenges().await;
+            expirer.retry_start_notes().await;
             if let Ok(ids) = db::expire_pending(&expirer.pool).await {
                 for id in ids {
                     expirer.close_room(&id).await;
@@ -475,12 +505,16 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
                     tokio::spawn(async move {
                         if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
                             if row.status == "expired" {
-                                crate::result::comment_expired(&expirer.result_ctx(), &row).await;
+                                let ctx = expirer.result_ctx();
+                                if crate::result::comment_expired(&ctx, &row).await.is_err() {
+                                    ctx.queue_expired(&row.id);
+                                }
                             }
                         }
                     });
                 }
             }
+            expirer.result_ctx().retry_pending_expired().await;
             expirer.retry_unpublished();
             let _ = db::prune_deliveries(&expirer.pool, crate::limits::WEBHOOK_MAX_AGE_SECS).await;
             let _ = db::prune_sessions(&expirer.pool).await;
@@ -1065,6 +1099,8 @@ mod tests {
             closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             lookups: crate::webhook::LookupTrack::default(),
             comments: crate::challenge::CommentTrack::default(),
+            start_notes: crate::challenge::StartNoteTrack::default(),
+            pending_expired: Arc::new(std::sync::Mutex::new(HashSet::new())),
             github: None,
             auth: Auth::default(),
             webhook_secret: None,
@@ -1085,6 +1121,8 @@ mod tests {
             closing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             lookups: crate::webhook::LookupTrack::default(),
             comments: crate::challenge::CommentTrack::default(),
+            start_notes: crate::challenge::StartNoteTrack::default(),
+            pending_expired: Arc::new(std::sync::Mutex::new(HashSet::new())),
             github: None,
             auth: Auth::default(),
             webhook_secret: None,
@@ -1276,6 +1314,41 @@ mod tests {
         assert!(
             state.lookups.is_empty(),
             "a resolved lookup must leave the expirer queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_start_notes_aborts_and_drops_the_queue() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "note1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        let state = test_state(pool.clone());
+        state.start_notes.queue(
+            "note1".into(),
+            "no_conflicts".into(),
+            "no conflicts to fight".into(),
+        );
+        state.retry_start_notes().await;
+        let row = crate::db::get_match(&pool, "note1").await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        assert_eq!(row.abort_reason.as_deref(), Some("no_conflicts"));
+        assert!(state.start_notes.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_pending_expired_drops_a_closed_row() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "exp1", 1, 3, "o", "t", 1)
+            .await
+            .unwrap();
+        assert!(crate::db::expire_open_match(&pool, "exp1").await.unwrap());
+        let state = test_state(pool.clone());
+        state.result_ctx().queue_expired("exp1");
+        state.result_ctx().retry_pending_expired().await;
+        assert!(
+            state.result_ctx().expired_snapshot().is_empty(),
+            "no-github expiry comment is success and must dequeue"
         );
     }
 }

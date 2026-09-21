@@ -21,6 +21,30 @@ pub struct ResultCtx {
     /// One in-flight publish per match so boot retry and the room task cannot
     /// both comment a skip after a successful create-only push.
     pub publishing: Arc<Mutex<HashSet<String>>>,
+    /// 24h expiry comments that failed HTTP. Restart loses this; a later
+    /// `/fight` still works because the row is already expired.
+    pub pending_expired: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl ResultCtx {
+    pub(crate) fn queue_expired(&self, id: &str) {
+        if let Ok(mut g) = self.pending_expired.lock() {
+            g.insert(id.to_string());
+        }
+    }
+
+    fn dequeue_expired(&self, id: &str) {
+        if let Ok(mut g) = self.pending_expired.lock() {
+            g.remove(id);
+        }
+    }
+
+    pub(crate) fn expired_snapshot(&self) -> Vec<String> {
+        self.pending_expired
+            .lock()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 impl ResultCtx {
@@ -43,6 +67,22 @@ impl ResultCtx {
             eprintln!("git fight result failed");
         }
         self.publishing.lock().await.remove(id);
+    }
+
+    pub(crate) async fn retry_pending_expired(&self) {
+        for id in self.expired_snapshot() {
+            let Ok(Some(row)) = db::get_match(&self.pool, &id).await else {
+                self.dequeue_expired(&id);
+                continue;
+            };
+            if row.status != "expired" {
+                self.dequeue_expired(&id);
+                continue;
+            }
+            if comment_expired(self, &row).await.is_ok() {
+                self.dequeue_expired(&id);
+            }
+        }
     }
 }
 
@@ -607,9 +647,17 @@ async fn comment(ctx: &ResultCtx, row: &MatchRow, body: &str) -> Result<(), Stri
     .map(|_| ())
 }
 
-pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) {
+pub(crate) async fn comment_expired(ctx: &ResultCtx, row: &MatchRow) -> Result<(), String> {
     let body = "git fight: this match expired before anyone finished. Nothing was pushed. Comment `/fight` for a rematch.".to_string();
-    let _ = comment(ctx, row, &body).await;
+    comment(ctx, row, &body).await
+}
+
+pub(crate) async fn comment_decision(
+    ctx: &ResultCtx,
+    row: &MatchRow,
+    body: &str,
+) -> Result<(), String> {
+    comment(ctx, row, body).await
 }
 
 pub(crate) async fn comment_outdated(ctx: &ResultCtx, row: &MatchRow) -> Result<(), String> {
@@ -633,6 +681,23 @@ mod tests {
             "retry",
             "a failed outcome comment must stay unpublished"
         );
+    }
+
+    #[test]
+    fn expired_comment_failure_is_retried() {
+        assert_eq!(expired_comment_followup(Ok(())), "done");
+        assert_eq!(
+            expired_comment_followup(Err(())),
+            "queue",
+            "a failed expiry PATCH must not go silent"
+        );
+    }
+
+    fn expired_comment_followup(comment: Result<(), ()>) -> &'static str {
+        match comment {
+            Ok(()) => "done",
+            Err(()) => "queue",
+        }
     }
 
     fn outcome_record_followup(comment: Result<(), ()>) -> &'static str {

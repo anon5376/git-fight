@@ -70,6 +70,38 @@ impl CommentTrack {
     }
 }
 
+/// Decision abort comments that could not be posted after a busy SQLite
+/// write. Restart loses this; the 120s hunk-less backstop still frees `/fight`.
+#[derive(Clone, Default)]
+pub struct StartNoteTrack {
+    pending: Arc<std::sync::Mutex<HashMap<String, (String, String)>>>,
+}
+
+impl StartNoteTrack {
+    pub(crate) fn queue(&self, id: String, reason: String, body: String) {
+        if let Ok(mut g) = self.pending.lock() {
+            g.insert(id, (reason, body));
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(String, String, String)> {
+        self.pending
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|(k, (r, b))| (k.clone(), r.clone(), b.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn dequeue(&self, id: &str) {
+        if let Ok(mut g) = self.pending.lock() {
+            g.remove(id);
+        }
+    }
+}
+
 /// Store a posted fight-link id, or queue it so the expirer SETs instead
 /// of POSTing a second comment.
 pub(crate) async fn persist_challenge_comment(
@@ -102,6 +134,7 @@ pub struct ChallengeCtx {
     pub test_repos: HashMap<String, PathBuf>,
     pub expire_secs: i64,
     pub comments: CommentTrack,
+    pub start_notes: StartNoteTrack,
 }
 
 pub struct ChallengeStart {
@@ -145,32 +178,38 @@ async fn already_open_now(
     Ok(note("a fight is already open"))
 }
 
-async fn abort_start(pool: &SqlitePool, id: &str, reason: &str, body: String) -> ChallengeStart {
-    match db::abort_open_retry(pool, id, reason).await {
+async fn abort_start(ctx: &ChallengeCtx, id: &str, reason: &str, body: String) -> ChallengeStart {
+    match db::abort_open_retry(&ctx.pool, id, reason).await {
         Ok(true) => note(body),
         Ok(false) => silent(),
         Err(_) => {
             // Busy write is not already-closed. Keep retrying abort so
             // rematch `/fight` is not stuck on a leftover pending row.
-            schedule_abort_start(pool.clone(), id.to_string(), reason.to_string());
+            schedule_abort_start(ctx.clone(), id.to_string(), reason.to_string(), body);
             silent()
         }
     }
 }
 
-fn schedule_abort_start(pool: SqlitePool, id: String, reason: String) {
+fn schedule_abort_start(ctx: ChallengeCtx, id: String, reason: String, body: String) {
     tokio::spawn(async move {
         for delay_ms in [25_u64, 50, 100, 200, 400, 800, 1600] {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            if db::abort_open_match(&pool, &id, &reason).await.is_ok() {
-                return;
+            match db::abort_open_match(&ctx.pool, &id, &reason).await {
+                Ok(true) => {
+                    ctx.start_notes.queue(id, reason, body);
+                    return;
+                }
+                Ok(false) => return,
+                Err(_) => {}
             }
         }
+        ctx.start_notes.queue(id, reason, body);
     });
 }
 
-async fn abort_start_quiet(pool: &SqlitePool, id: &str, reason: &str) -> ChallengeStart {
-    abort_start(pool, id, reason, "git fight could not start".into()).await
+async fn abort_start_quiet(ctx: &ChallengeCtx, id: &str, reason: &str) -> ChallengeStart {
+    abort_start(ctx, id, reason, "git fight could not start".into()).await
 }
 
 pub async fn start_challenge(
@@ -271,7 +310,7 @@ pub async fn start_challenge(
     let work = match tempfile::Builder::new().prefix("git-fight-").tempdir() {
         Ok(w) => w,
         Err(_) => {
-            return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
+            return Ok(abort_start_quiet(ctx, &id, "clone").await);
         }
     };
     let dest = work.path().join("repo.git");
@@ -282,7 +321,7 @@ pub async fn start_challenge(
         // HTTP. Must not `?` after insert: that would leave a pending row.
         let token = match ctx.gh.installation_token(installation_id).await {
             Ok(t) => t,
-            Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
+            Err(_) => return Ok(abort_start_quiet(ctx, &id, "clone").await),
         };
         (
             format!("https://github.com/{owner}/{repo}.git"),
@@ -295,14 +334,14 @@ pub async fn start_challenge(
     let prepared = {
         let _permit = match crate::limits::git_slots().acquire().await {
             Ok(p) => p,
-            Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
+            Err(_) => return Ok(abort_start_quiet(ctx, &id, "clone").await),
         };
         match timeout(GIT_JOB_TIMEOUT, async {
             if gitutil::clone_bare(&url, &dest, bearer.as_deref())
                 .await
                 .is_err()
             {
-                return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+                return Err(abort_start_quiet(ctx, &id, "clone").await);
             }
             if gitutil::fetch_pr_objects(
                 &dest,
@@ -315,7 +354,7 @@ pub async fn start_challenge(
             .await
             .is_err()
             {
-                return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+                return Err(abort_start_quiet(ctx, &id, "clone").await);
             }
 
             let (tree, paths, code) =
@@ -324,17 +363,13 @@ pub async fn start_challenge(
                 {
                     Ok(v) => v,
                     Err(_) => {
-                        return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+                        return Err(abort_start_quiet(ctx, &id, "clone").await);
                     }
                 };
             if code == 0 {
-                return Err(abort_start(
-                    &ctx.pool,
-                    &id,
-                    "no_conflicts",
-                    "no conflicts to fight".into(),
-                )
-                .await);
+                return Err(
+                    abort_start(ctx, &id, "no_conflicts", "no conflicts to fight".into()).await,
+                );
             }
 
             let hunks =
@@ -344,7 +379,7 @@ pub async fn start_challenge(
                     Ok(h) => h,
                     Err(gitutil::GitError::TooMany(n)) => {
                         return Err(abort_start(
-                            &ctx.pool,
+                            ctx,
                             &id,
                             "too_many",
                             format!("too many conflicts for one fight ({n}; max {MAX_HUNKS})"),
@@ -353,7 +388,7 @@ pub async fn start_challenge(
                     }
                     Err(gitutil::GitError::NothingToFight) => {
                         return Err(abort_start(
-                            &ctx.pool,
+                            ctx,
                             &id,
                             "nothing",
                             "the conflicts are not the kind git fight can play".into(),
@@ -361,12 +396,12 @@ pub async fn start_challenge(
                         .await);
                     }
                     Err(_) => {
-                        return Err(abort_start_quiet(&ctx.pool, &id, "clone").await);
+                        return Err(abort_start_quiet(ctx, &id, "clone").await);
                     }
                 };
             if hunks.len() > MAX_HUNKS {
                 return Err(abort_start(
-                    &ctx.pool,
+                    ctx,
                     &id,
                     "too_many",
                     format!(
@@ -407,7 +442,7 @@ pub async fn start_challenge(
         {
             Ok(Ok(v)) => v,
             Ok(Err(start)) => return Ok(start),
-            Err(_) => return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await),
+            Err(_) => return Ok(abort_start_quiet(ctx, &id, "clone").await),
         }
     };
 
@@ -433,7 +468,7 @@ pub async fn start_challenge(
         .await
         {
             Ok(login) => login,
-            Err(()) => return Ok(abort_start_quiet(&ctx.pool, &id, "blame").await),
+            Err(()) => return Ok(abort_start_quiet(ctx, &id, "blame").await),
         };
         sides.push(side_from_blame(&ours_login, login, &h.blame_name));
     }
@@ -457,7 +492,7 @@ pub async fn start_challenge(
     .await
     .is_err()
     {
-        return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
+        return Ok(abort_start_quiet(ctx, &id, "clone").await);
     }
 
     let new_hunks: Vec<db::NewHunk<'_>> = hunks
@@ -483,7 +518,7 @@ pub async fn start_challenge(
     ctx.comments.mark(&id);
     if db::insert_hunks(&ctx.pool, &new_hunks).await.is_err() {
         ctx.comments.unmark(&id);
-        return Ok(abort_start_quiet(&ctx.pool, &id, "clone").await);
+        return Ok(abort_start_quiet(ctx, &id, "clone").await);
     }
 
     let rounds = hunks.len();
@@ -696,13 +731,33 @@ mod tests {
         assert!(login.is_none());
     }
 
+    fn test_ctx(pool: SqlitePool) -> ChallengeCtx {
+        ChallengeCtx {
+            gh: crate::gh::GitHub::new(
+                "http://127.0.0.1:9".into(),
+                "http://127.0.0.1:9".into(),
+                1,
+                String::new(),
+                "id".into(),
+                "sec".into(),
+            ),
+            pool,
+            public_url: "http://fight.test".into(),
+            test_repos: HashMap::new(),
+            expire_secs: 3600,
+            comments: CommentTrack::default(),
+            start_notes: StartNoteTrack::default(),
+        }
+    }
+
     #[tokio::test]
     async fn abort_start_comments_when_it_owns_the_row() {
         let pool = crate::db::connect("sqlite::memory:").await.unwrap();
         crate::db::insert_match(&pool, "m1", 1, 3, "o", "t", 3600)
             .await
             .unwrap();
-        let start = abort_start(&pool, "m1", "clone", "git fight could not start".into()).await;
+        let ctx = test_ctx(pool.clone());
+        let start = abort_start(&ctx, "m1", "clone", "git fight could not start".into()).await;
         assert_eq!(start.body, "git fight could not start");
         let row = crate::db::get_match(&pool, "m1").await.unwrap().unwrap();
         assert_eq!(row.status, "aborted");
@@ -718,12 +773,32 @@ mod tests {
         assert!(crate::db::abort_open_match(&pool, "m1", "outdated")
             .await
             .unwrap());
-        let start = abort_start(&pool, "m1", "clone", "git fight could not start".into()).await;
+        let ctx = test_ctx(pool.clone());
+        let start = abort_start(&ctx, "m1", "clone", "git fight could not start".into()).await;
         assert!(start.body.is_empty());
         assert!(start.match_id.is_none());
         let row = crate::db::get_match(&pool, "m1").await.unwrap().unwrap();
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
+    }
+
+    #[test]
+    fn busy_decision_abort_queues_the_comment() {
+        assert_eq!(start_note_followup(Ok(true)), "comment");
+        assert_eq!(start_note_followup(Ok(false)), "silent");
+        assert_eq!(
+            start_note_followup(Err(())),
+            "queue",
+            "busy abort must not drop the decision comment"
+        );
+    }
+
+    fn start_note_followup(abort: Result<bool, ()>) -> &'static str {
+        match abort {
+            Ok(true) => "comment",
+            Ok(false) => "silent",
+            Err(()) => "queue",
+        }
     }
 
     #[test]

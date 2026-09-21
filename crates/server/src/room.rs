@@ -1124,7 +1124,7 @@ fn send_catch_up(
     hunks: &[db::HunkRow],
     log: &[(u32, u8, u8)],
 ) {
-    try_send_or_spawn(
+    try_send_pair_or_spawn(
         tx,
         encode(&hello_msg(
             match_id,
@@ -1140,9 +1140,6 @@ fn send_catch_up(
             stats,
             hunks,
         )),
-    );
-    try_send_or_spawn(
-        tx,
         encode(&snapshot_msg(
             round_seed(seed, round),
             round,
@@ -1236,7 +1233,9 @@ async fn expire_now(
         let ctx = ctx.clone();
         let row = row.clone();
         tokio::spawn(async move {
-            result::comment_expired(&ctx, &row).await;
+            if result::comment_expired(&ctx, &row).await.is_err() {
+                ctx.queue_expired(&row.id);
+            }
         });
     }
     let msg = encode(&ServerMsg::Error {
@@ -1911,6 +1910,39 @@ mod tests {
             .expect("channel open");
         assert!(end.contains("end"), "{end}");
         assert!(hello.contains("hello"), "{hello}");
+    }
+
+    #[tokio::test]
+    async fn send_catch_up_preserves_hello_then_snapshot() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        tx.try_send("held".into()).unwrap();
+        send_catch_up(
+            &tx,
+            "m",
+            1,
+            3,
+            "ours",
+            "alice",
+            "alice",
+            "bob",
+            0,
+            1,
+            2,
+            (FighterStats::default(), FighterStats::default()),
+            &[],
+            &[(0, 1, 0)],
+        );
+        assert_eq!(rx.recv().await.as_deref(), Some("held"));
+        let hello = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("spawned Hello waited")
+            .expect("channel open");
+        let snap = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("Snapshot after Hello")
+            .expect("channel open");
+        assert!(hello.contains("hello"), "{hello}");
+        assert!(snap.contains("snapshot"), "{snap}");
     }
 
     #[tokio::test]
