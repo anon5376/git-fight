@@ -203,6 +203,28 @@ async fn run_room(
                             send_closed(&tx, &pool, &id).await;
                             expire_now(&pool, &id, &conns, settings.result.as_ref()).await;
                             done = true;
+                        } else if scored_all {
+                            // Do not insert: a fighter Join must not start
+                            // the disconnect clock while finish is retrying.
+                            done = try_finish_scored_all(
+                                &pool,
+                                &id,
+                                seed,
+                                &hunks,
+                                total_rounds,
+                                settings.result.as_ref(),
+                            )
+                            .await;
+                            if done {
+                                send_closed(&tx, &pool, &id).await;
+                            } else {
+                                try_send_or_spawn(
+                                    &tx,
+                                    encode(&ServerMsg::Error {
+                                        message: "preparing".into(),
+                                    }),
+                                );
+                            }
                         } else {
                             let conn = Conn { login, token, tx: tx.clone() };
                             let role = conn_role(&conn, &row, &hunks, round, github);
@@ -234,7 +256,7 @@ async fn run_room(
                                     Err(_) => {}
                                 }
                             }
-                            if !done && !scored_all && replay_ok {
+                            if !done && replay_ok {
                                 send_catch_up(
                                     &tx,
                                     &id,
@@ -476,9 +498,9 @@ async fn advance(a: Advance<'_>) -> bool {
     if a.started_at.is_some() {
         if let Some(at) = a.ours.disconnected_at {
             if at.elapsed() >= a.disconnect {
-                *a.forfeit_pending = true;
-                // Write the forfeit tag before End so a restart cannot
-                // replay this round as a KO pick.
+                // Persist first. Do not set forfeit_pending until the
+                // hunk is durable — a reconnect clears disconnected_at
+                // and a stale flag would tag a later KO as forfeit_*.
                 if !persist_disconnect_forfeit(
                     a.pool,
                     a.id,
@@ -489,13 +511,13 @@ async fn advance(a: Advance<'_>) -> bool {
                 {
                     return false;
                 }
+                *a.forfeit_pending = true;
                 a.sim.forfeit(Side::Ours);
                 return finish(a, RoundResult::Theirs).await;
             }
         }
         if let Some(at) = a.theirs.disconnected_at {
             if at.elapsed() >= a.disconnect {
-                *a.forfeit_pending = true;
                 if !persist_disconnect_forfeit(
                     a.pool,
                     a.id,
@@ -506,6 +528,7 @@ async fn advance(a: Advance<'_>) -> bool {
                 {
                     return false;
                 }
+                *a.forfeit_pending = true;
                 a.sim.forfeit(Side::Theirs);
                 return finish(a, RoundResult::Ours).await;
             }
@@ -868,11 +891,18 @@ pub(crate) async fn hash_from_stored_round(
     let inputs = db::load_inputs(pool, id, round).await.ok()?;
     let (ours_stats, theirs_stats) = db::stats_for_round(hunks, round);
     let mut sim = FightState::new(round_seed(seed, round), ours_stats, theirs_stats);
-    for (_tick, ours, theirs) in inputs {
-        if sim.result.is_some() {
-            break;
-        }
-        sim.step(Input::from_u8(ours), Input::from_u8(theirs));
+    let mut log = Vec::new();
+    let mut next = 0u32;
+    apply_input_log(&mut sim, &mut log, &mut next, &inputs);
+    match hunks
+        .iter()
+        .find(|h| h.round_index == i64::from(round))
+        .and_then(|h| h.winner.as_deref())
+    {
+        Some("forfeit_ours") => sim.forfeit(Side::Ours),
+        Some("forfeit_theirs") => sim.forfeit(Side::Theirs),
+        Some(_) if sim.result.is_none() => return None,
+        _ => {}
     }
     let (lo, hi) = split_hash(sim.state_hash());
     Some(format!("{hi:08x}{lo:08x}"))
@@ -1665,6 +1695,129 @@ mod tests {
         assert!(
             persist_disconnect_forfeit(&pool, "abc", 0, "forfeit_ours").await,
             "local demo has no hunk row"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_from_stored_round_applies_forfeit() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "hf1".into(),
+                seed: 11,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 60,
+                installation_id: None,
+                owner: String::new(),
+                repo: String::new(),
+                pr_number: 0,
+                pr_head_sha: String::new(),
+                pr_base_sha: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::insert_hunk(
+            &pool,
+            &crate::db::NewHunk {
+                match_id: "hf1",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::db::set_hunk_winner(&pool, "hf1", 0, "forfeit_ours", false)
+                .await
+                .unwrap()
+        );
+        let hunks = crate::db::list_hunks(&pool, "hf1").await.unwrap();
+        let hash = hash_from_stored_round(&pool, "hf1", 11, &hunks, 0)
+            .await
+            .expect("forfeit hash");
+        let mut sim = FightState::new(
+            round_seed(11, 0),
+            FighterStats::default(),
+            FighterStats::default(),
+        );
+        sim.forfeit(Side::Ours);
+        let (lo, hi) = split_hash(sim.state_hash());
+        assert_eq!(hash, format!("{hi:08x}{lo:08x}"));
+    }
+
+    #[tokio::test]
+    async fn hash_from_stored_round_retries_when_winner_but_sim_open() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "hf2".into(),
+                seed: 11,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: "o".into(),
+                theirs_token: "t".into(),
+                expire_secs: 60,
+                installation_id: None,
+                owner: String::new(),
+                repo: String::new(),
+                pr_number: 0,
+                pr_head_sha: String::new(),
+                pr_base_sha: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::insert_hunk(
+            &pool,
+            &crate::db::NewHunk {
+                match_id: "hf2",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crate::db::set_hunk_winner(&pool, "hf2", 0, "ours", false)
+            .await
+            .unwrap());
+        let hunks = crate::db::list_hunks(&pool, "hf2").await.unwrap();
+        assert!(
+            hash_from_stored_round(&pool, "hf2", 11, &hunks, 0)
+                .await
+                .is_none(),
+            "do not hash an unfinished sim as a fake final_hash"
         );
     }
 

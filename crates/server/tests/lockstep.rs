@@ -462,7 +462,8 @@ async fn scored_rounds_resume_finishes_without_replaying() {
         )
         .await
         .unwrap();
-        git_fight_server::db::set_hunk_winner(&pool, id, round, "ours", false)
+        let tag = if round == 1 { "forfeit_ours" } else { "ours" };
+        git_fight_server::db::set_hunk_winner(&pool, id, round, tag, false)
             .await
             .unwrap();
     }
@@ -560,7 +561,7 @@ async fn scored_all_past_deadline_finishes_not_expires() {
     )
     .await
     .unwrap();
-    git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours", false)
+    git_fight_server::db::set_hunk_winner(&pool, id, 0, "forfeit_ours", false)
         .await
         .unwrap();
     git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
@@ -603,6 +604,100 @@ async fn scored_all_past_deadline_finishes_not_expires() {
         status, "finished",
         "a fully scored fight past expires_at must finish, not expire"
     );
+}
+
+#[tokio::test]
+async fn scored_all_without_terminal_sim_does_not_fake_hash() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = git_fight_server::test_tmp_dir("gf-scored-nohash");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "scoredallnohash0000000000000000";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunk(
+        &pool,
+        &NewHunk {
+            match_id: id,
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: Some("bob"),
+            ours_stats: FighterStats::default(),
+            theirs_stats: FighterStats::default(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::set_hunk_winner(&pool, id, 0, "ours", false)
+        .await
+        .unwrap();
+    git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let err = wait_type(&mut stream, "error").await;
+    assert_eq!(
+        err["message"].as_str(),
+        Some("preparing"),
+        "a scored row with no terminal sim must not write a fake final_hash"
+    );
+    let row = git_fight_server::db::get_match(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "in_progress");
+    assert!(row.final_hash.is_none());
 }
 
 #[tokio::test]
