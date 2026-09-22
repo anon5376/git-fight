@@ -370,7 +370,7 @@ A repo can be huge, contain symlink farms, `.git` path tricks, enormous blobs, o
 
 `/fight` in a loop, or a bot that replies to itself, burns clone quota and floods the PR.
 
-**Mitigation:** Ignore this app's own comments and `sender.type == Bot` unless we have a specific allow-list (we do not). One active `pending`/`in_progress` match per PR; extra `/fight` gets the existing link. Owner/repo casing cannot open a second slot or reset the per-PR rate limit. Per-PR and per-installation rate limits on starting matches. `auto_challenge` defaults off. Webhook delivery dedup. Clone/size/hunk limits still apply.
+**Mitigation:** Ignore this app's own comments and `sender.type == Bot` unless we have a specific allow-list (we do not). One active `pending`/`in_progress` match per PR; extra `/fight` gets the existing link. Owner/repo casing cannot open a second slot or reset the per-PR rate limit. Per-PR and per-installation rate limits on starting matches. The pending-row insert is gated on those counts in the same statement so a mergeability poll cannot sneak a fight over the cap. `auto_challenge` defaults off. Webhook delivery dedup. Clone/size/hunk limits still apply.
 
 ## Milestone map
 

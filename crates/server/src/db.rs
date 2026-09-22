@@ -864,6 +864,93 @@ pub async fn insert_full_match(pool: &SqlitePool, m: &NewMatch) -> Result<(), sq
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InsertRated {
+    Inserted,
+    RateLimitedPr,
+    RateLimitedInstall,
+}
+
+/// Zero-row insert: prefer the PR cap, else the installation cap.
+pub(crate) fn insert_rated_followup(pr: i64, install: i64) -> InsertRated {
+    match (
+        pr >= crate::limits::MAX_MATCHES_PER_PR_HOUR,
+        install >= crate::limits::MAX_MATCHES_PER_INSTALL_HOUR,
+    ) {
+        (true, _) => InsertRated::RateLimitedPr,
+        (false, true) | (false, false) => InsertRated::RateLimitedInstall,
+    }
+}
+
+/// Same row as `insert_full_match`, but only if both hourly caps still have
+/// room. Mergeability HTTP must not sneak a fight over the limit.
+pub async fn insert_rated_match(
+    pool: &SqlitePool,
+    m: &NewMatch,
+) -> Result<InsertRated, sqlx::Error> {
+    let now = Utc::now();
+    let expires = now + Duration::seconds(m.expire_secs);
+    let created = now.to_rfc3339();
+    let cutoff = (now - Duration::seconds(3600)).to_rfc3339();
+    let owner = crate::gh::fold_github_name(&m.owner);
+    let repo = crate::gh::fold_github_name(&m.repo);
+    let ours_login = crate::gh::fold_github_login_opt(m.ours_login.as_deref());
+    let theirs_login = crate::gh::fold_github_login_opt(m.theirs_login.as_deref());
+    let inst = m.installation_id.unwrap_or(-1);
+    let res = sqlx::query(
+        "INSERT INTO matches (
+            id, installation_id, owner, repo, pr_number, pr_head_sha, pr_base_sha,
+            seed, status, ours_login, theirs_login, ours_name, theirs_name,
+            ours_kind, theirs_kind, ours_token, theirs_token, input_delay_ticks,
+            created_at, expires_at
+        ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE (
+            SELECT COUNT(*) FROM matches
+            WHERE owner = ? COLLATE NOCASE AND repo = ? COLLATE NOCASE
+              AND pr_number = ? AND created_at >= ?
+          ) < ?
+          AND (
+            SELECT COUNT(*) FROM matches
+            WHERE installation_id = ? AND created_at >= ?
+          ) < ?",
+    )
+    .bind(&m.id)
+    .bind(m.installation_id)
+    .bind(&owner)
+    .bind(&repo)
+    .bind(m.pr_number)
+    .bind(&m.pr_head_sha)
+    .bind(&m.pr_base_sha)
+    .bind(m.seed.to_string())
+    .bind(ours_login)
+    .bind(theirs_login)
+    .bind(&m.ours_name)
+    .bind(&m.theirs_name)
+    .bind(&m.ours_kind)
+    .bind(&m.theirs_kind)
+    .bind(&m.ours_token)
+    .bind(&m.theirs_token)
+    .bind(i64::from(m.delay))
+    .bind(&created)
+    .bind(expires.to_rfc3339())
+    .bind(&owner)
+    .bind(&repo)
+    .bind(m.pr_number)
+    .bind(&cutoff)
+    .bind(crate::limits::MAX_MATCHES_PER_PR_HOUR)
+    .bind(inst)
+    .bind(&cutoff)
+    .bind(crate::limits::MAX_MATCHES_PER_INSTALL_HOUR)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() > 0 {
+        return Ok(InsertRated::Inserted);
+    }
+    let pr = count_recent_matches_for_pr(pool, &owner, &repo, m.pr_number as u64, 3600).await?;
+    let install = count_recent_matches_for_install(pool, inst.max(0) as u64, 3600).await?;
+    Ok(insert_rated_followup(pr, install))
+}
+
 pub fn is_unique_violation(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db) => db.is_unique_violation(),
@@ -2701,6 +2788,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(open.id, "open2");
+    }
+
+    fn gh_match(id: &str, inst: i64, pr: i64) -> NewMatch {
+        NewMatch {
+            id: id.into(),
+            seed: 1,
+            delay: 3,
+            ours_name: "a".into(),
+            theirs_name: "b".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "cpu".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "o".into(),
+            theirs_token: "t".into(),
+            expire_secs: 3600,
+            installation_id: Some(inst),
+            owner: "acme".into(),
+            repo: "box".into(),
+            pr_number: pr,
+            pr_head_sha: "h".into(),
+            pr_base_sha: "b".into(),
+        }
+    }
+
+    #[test]
+    fn insert_rated_followup_prefers_the_pr_cap() {
+        assert_eq!(
+            insert_rated_followup(crate::limits::MAX_MATCHES_PER_PR_HOUR, 0),
+            InsertRated::RateLimitedPr
+        );
+        assert_eq!(
+            insert_rated_followup(
+                crate::limits::MAX_MATCHES_PER_PR_HOUR,
+                crate::limits::MAX_MATCHES_PER_INSTALL_HOUR
+            ),
+            InsertRated::RateLimitedPr
+        );
+        assert_eq!(
+            insert_rated_followup(0, crate::limits::MAX_MATCHES_PER_INSTALL_HOUR),
+            InsertRated::RateLimitedInstall
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_rated_match_enforces_both_hourly_caps() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        for i in 0..crate::limits::MAX_MATCHES_PER_PR_HOUR {
+            let id = format!("prcap{i}");
+            insert_full_match(&pool, &gh_match(&id, 1, 1))
+                .await
+                .unwrap();
+            set_status(&pool, &id, "finished", true, true, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            insert_rated_match(&pool, &gh_match("pr-over", 1, 1))
+                .await
+                .unwrap(),
+            InsertRated::RateLimitedPr
+        );
+        assert!(
+            get_match(&pool, "pr-over").await.unwrap().is_none(),
+            "a rate-limited insert must not leave a pending row"
+        );
+
+        for i in 0..crate::limits::MAX_MATCHES_PER_INSTALL_HOUR {
+            insert_full_match(&pool, &gh_match(&format!("instcap{i}"), 2, 100 + i))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            insert_rated_match(&pool, &gh_match("inst-over", 2, 999))
+                .await
+                .unwrap(),
+            InsertRated::RateLimitedInstall
+        );
+        assert!(get_match(&pool, "inst-over").await.unwrap().is_none());
+
+        assert_eq!(
+            insert_rated_match(&pool, &gh_match("under", 3, 1))
+                .await
+                .unwrap(),
+            InsertRated::Inserted
+        );
+        assert_eq!(
+            get_match(&pool, "under").await.unwrap().unwrap().status,
+            "pending"
+        );
     }
 
     #[tokio::test]

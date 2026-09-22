@@ -359,7 +359,7 @@ pub async fn start_challenge(
     let id = uuid::Uuid::new_v4().simple().to_string();
     let seed = uuid::Uuid::new_v4().as_u128() as u64;
     // Share tokens are local-demo only. GitHub matches assign roles from the session.
-    match db::insert_full_match(
+    match db::insert_rated_match(
         &ctx.pool,
         &NewMatch {
             id: id.clone(),
@@ -384,7 +384,13 @@ pub async fn start_challenge(
     )
     .await
     {
-        Ok(()) => {}
+        Ok(db::InsertRated::Inserted) => {}
+        Ok(db::InsertRated::RateLimitedPr) => {
+            return Ok(note("too many fights on this pull request; try later"));
+        }
+        Ok(db::InsertRated::RateLimitedInstall) => {
+            return Ok(note("too many fights from this installation; try later"));
+        }
         Err(e) if db::is_unique_violation(&e) => {
             return Ok(already_open_now(ctx, &owner, &repo, number).await);
         }
