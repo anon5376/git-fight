@@ -191,8 +191,18 @@ impl AppState {
         }
     }
 
-    fn is_closing(&self, id: &str) -> bool {
-        self.closing.lock().map(|g| g.contains(id)).unwrap_or(false)
+    /// Join: known closing is outdated; a poisoned lock is preparing
+    /// (reconnect), not terminal outdated for every match.
+    fn join_closing_followup(closing: Result<bool, ()>) -> Option<&'static str> {
+        match closing {
+            Ok(true) => Some("outdated"),
+            Ok(false) => None,
+            Err(()) => Some("preparing"),
+        }
+    }
+
+    fn closing_for_join(&self, id: &str) -> Result<bool, ()> {
+        self.closing.lock().map(|g| g.contains(id)).map_err(|_| ())
     }
 
     /// Poisoned lock is treated as closing so a fight link cannot sneak out.
@@ -406,12 +416,15 @@ impl AppState {
                 hunks.len(),
             );
             self.comments.mark(&row.id);
-            match crate::webhook::open_for_comment_retry(&self.pool, &row.id).await {
-                Ok(true) => {}
-                Ok(false) | Err(_) => {
-                    self.comments.unmark(&row.id);
-                    continue;
-                }
+            if !crate::webhook::may_post_fight_link(
+                &self.pool,
+                self.blocks_fight_link(&row.id),
+                &row.id,
+            )
+            .await
+            {
+                self.comments.unmark(&row.id);
+                continue;
             }
             let posted = gh
                 .comment(inst, &row.owner, &row.repo, row.pr_number as u64, &body)
@@ -448,8 +461,8 @@ impl AppState {
             self.unmark_closing(&fresh.id);
             return Err(message.to_string());
         }
-        if self.is_closing(&fresh.id) {
-            return Err("outdated".into());
+        if let Some(message) = Self::join_closing_followup(self.closing_for_join(&fresh.id)) {
+            return Err(message.into());
         }
         let mut rooms = self.rooms.lock().await;
         if let Some(existing) = rooms.get(&fresh.id) {
@@ -880,8 +893,8 @@ async fn handle_socket(
         reject_socket(socket, message).await;
         return;
     }
-    if state.is_closing(&row.id) {
-        reject_socket(socket, "outdated").await;
+    if let Some(message) = AppState::join_closing_followup(state.closing_for_join(&row.id)) {
+        reject_socket(socket, message).await;
         return;
     }
     let hunks = db::list_hunks(&state.pool, &row.id)
@@ -1194,6 +1207,17 @@ mod tests {
             "every hunk scored: no current theirs"
         );
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn poisoned_closing_lock_is_preparing_not_outdated() {
+        assert_eq!(AppState::join_closing_followup(Ok(true)), Some("outdated"));
+        assert_eq!(AppState::join_closing_followup(Ok(false)), None);
+        assert_eq!(
+            AppState::join_closing_followup(Err(())),
+            Some("preparing"),
+            "a poisoned closing lock must not terminal-outdated every socket"
+        );
     }
 
     #[test]

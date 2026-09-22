@@ -440,6 +440,22 @@ pub(crate) async fn open_for_comment_retry(
     }
 }
 
+/// Last-millisecond gate immediately before `gh.comment`. Closing latch
+/// or anything other than `Ok(true)` must not POST a match URL.
+pub(crate) fn last_fight_link_followup(closing: bool, open: Result<bool, ()>) -> bool {
+    !closing && matches!(open, Ok(true))
+}
+
+pub(crate) async fn may_post_fight_link(pool: &sqlx::SqlitePool, closing: bool, id: &str) -> bool {
+    last_fight_link_followup(
+        closing,
+        match open_for_comment_retry(pool, id).await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(()),
+        },
+    )
+}
+
 fn schedule_challenge_comment(
     ctx: ChallengeCtx,
     inst: u64,
@@ -485,7 +501,7 @@ async fn post_challenge_comment(
     start: &challenge::ChallengeStart,
 ) {
     if let Some(match_id) = start.match_id.as_deref() {
-        if ctx.blocks_fight_link(match_id) {
+        if !may_post_fight_link(&ctx.pool, ctx.blocks_fight_link(match_id), match_id).await {
             ctx.comments.unmark(match_id);
             return;
         }
@@ -668,6 +684,20 @@ mod tests {
             Ok(false) => "skip",
             Err(()) => "retry",
         }
+    }
+
+    #[test]
+    fn last_millisecond_fight_link_is_fail_closed() {
+        assert!(last_fight_link_followup(false, Ok(true)));
+        assert!(
+            !last_fight_link_followup(true, Ok(true)),
+            "closing latch wins even if the row is still open"
+        );
+        assert!(
+            !last_fight_link_followup(false, Err(())),
+            "busy open-status immediately before POST must not publish a match URL"
+        );
+        assert!(!last_fight_link_followup(false, Ok(false)));
     }
 
     #[test]
