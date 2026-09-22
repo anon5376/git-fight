@@ -8,7 +8,7 @@ use crate::protocol::INPUT_DELAY;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -164,6 +164,16 @@ pub struct ChallengeCtx {
     pub expire_secs: i64,
     pub comments: CommentTrack,
     pub start_notes: StartNoteTrack,
+    /// Same latch as `AppState.closing`. Poisoned lock blocks the link.
+    pub closing: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ChallengeCtx {
+    /// SHA-drift abort is in flight: do not POST a fight link.
+    /// A poisoned lock is treated as closing (fail closed).
+    pub(crate) fn blocks_fight_link(&self, id: &str) -> bool {
+        self.closing.lock().map(|g| g.contains(id)).unwrap_or(true)
+    }
 }
 
 pub struct ChallengeStart {
@@ -530,7 +540,7 @@ pub async fn start_challenge(
     } else {
         "github"
     };
-    if db::update_match_fighters(
+    match db::update_match_fighters(
         &ctx.pool,
         &id,
         ours_kind,
@@ -539,9 +549,10 @@ pub async fn start_challenge(
         theirs_login.as_deref(),
     )
     .await
-    .is_err()
     {
-        return Ok(abort_start_quiet(ctx, &id, "clone").await);
+        Ok(true) => {}
+        Ok(false) => return Ok(silent()),
+        Err(_) => return Ok(abort_start_quiet(ctx, &id, "clone").await),
     }
 
     let new_hunks: Vec<db::NewHunk<'_>> = hunks
@@ -564,6 +575,9 @@ pub async fn start_challenge(
         .collect();
     // Hold the fight-link slot before hunks become visible so the 5s
     // expirer cannot POST while clone finish is still posting.
+    if ctx.blocks_fight_link(&id) {
+        return Ok(silent());
+    }
     ctx.comments.mark(&id);
     if db::insert_hunks(&ctx.pool, &new_hunks).await.is_err() {
         ctx.comments.unmark(&id);
@@ -571,9 +585,13 @@ pub async fn start_challenge(
     }
 
     let rounds = hunks.len();
-    // Only Ok(true) returns a fight link. Busy or already-closed is silent
-    // (no match_id) so spawn_challenge cannot POST after the row closed.
+    // Only Ok(true) returns a fight link. Busy, already-closed, or a
+    // closing latch (SHA-drift abort in flight) is silent (no match_id).
     // The 5s expirer posts uncommented open rows that still have hunks.
+    if ctx.blocks_fight_link(&id) {
+        ctx.comments.unmark(&id);
+        return Ok(silent());
+    }
     match db::is_open_match(&ctx.pool, &id).await {
         Ok(true) => {}
         Ok(false) | Err(_) => {
@@ -754,10 +772,28 @@ mod tests {
     }
 
     fn final_open_followup(open: Result<bool, ()>) -> &'static str {
+        fight_link_gate_followup(false, open)
+    }
+
+    fn fight_link_gate_followup(closing: bool, open: Result<bool, ()>) -> &'static str {
+        if closing {
+            return "silent";
+        }
         match open {
             Ok(true) => "post",
             Ok(false) | Err(()) => "silent",
         }
+    }
+
+    #[test]
+    fn closing_latch_is_silent_before_a_fight_link() {
+        assert_eq!(fight_link_gate_followup(false, Ok(true)), "post");
+        assert_eq!(
+            fight_link_gate_followup(true, Ok(true)),
+            "silent",
+            "SHA-drift closing must not return a match URL while abort is busy"
+        );
+        assert_eq!(fight_link_gate_followup(true, Err(())), "silent");
     }
 
     #[test]
@@ -796,6 +832,7 @@ mod tests {
             expire_secs: 3600,
             comments: CommentTrack::default(),
             start_notes: StartNoteTrack::default(),
+            closing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 

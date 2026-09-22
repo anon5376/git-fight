@@ -338,6 +338,7 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
         expire_secs: state.config.expire_secs,
         comments: state.comments.clone(),
         start_notes: state.start_notes.clone(),
+        closing: state.closing.clone(),
     };
     let owner = crate::gh::fold_github_name(&repo.owner.login);
     let name = crate::gh::fold_github_name(&repo.name);
@@ -355,6 +356,10 @@ async fn spawn_challenge(state: &crate::app::AppState, hook: &Hook, number: u64)
             return;
         }
         if let Some(ref match_id) = start.match_id {
+            if ctx.blocks_fight_link(match_id) {
+                ctx.comments.unmark(match_id);
+                return;
+            }
             match open_for_comment_retry(&ctx.pool, match_id).await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -449,6 +454,10 @@ fn schedule_challenge_comment(
             let Some(ref match_id) = start.match_id else {
                 return;
             };
+            if ctx.blocks_fight_link(match_id) {
+                ctx.comments.unmark(match_id);
+                return;
+            }
             match db::is_open_match(&ctx.pool, match_id).await {
                 Ok(true) => {
                     post_challenge_comment(&ctx, inst, &owner, &name, number, &start).await;
@@ -475,6 +484,12 @@ async fn post_challenge_comment(
     number: u64,
     start: &challenge::ChallengeStart,
 ) {
+    if let Some(match_id) = start.match_id.as_deref() {
+        if ctx.blocks_fight_link(match_id) {
+            ctx.comments.unmark(match_id);
+            return;
+        }
+    }
     let posted = ctx.gh.comment(inst, owner, name, number, &start.body).await;
     if let Some(match_id) = start.match_id.as_deref() {
         crate::challenge::persist_challenge_comment(&ctx.pool, &ctx.comments, match_id, posted)
@@ -634,14 +649,36 @@ mod tests {
     }
 
     fn fight_link_followup(has_match: bool, open: Result<bool, ()>) -> &'static str {
+        fight_link_post_followup(has_match, false, open)
+    }
+
+    fn fight_link_post_followup(
+        has_match: bool,
+        closing: bool,
+        open: Result<bool, ()>,
+    ) -> &'static str {
         if !has_match {
             return "post";
+        }
+        if closing {
+            return "skip";
         }
         match open {
             Ok(true) => "post",
             Ok(false) => "skip",
             Err(()) => "retry",
         }
+    }
+
+    #[test]
+    fn fight_link_is_not_posted_while_closing() {
+        assert_eq!(
+            fight_link_post_followup(true, true, Ok(true)),
+            "skip",
+            "SHA-drift closing must not POST a match URL"
+        );
+        assert_eq!(fight_link_post_followup(true, false, Ok(true)), "post");
+        assert_eq!(fight_link_post_followup(false, true, Ok(true)), "post");
     }
 
     #[test]

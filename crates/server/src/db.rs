@@ -878,11 +878,11 @@ pub async fn update_match_fighters(
     theirs_kind: &str,
     theirs_name: &str,
     theirs_login: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let theirs_login = crate::gh::fold_github_login_opt(theirs_login);
-    sqlx::query(
+    let res = sqlx::query(
         "UPDATE matches SET ours_kind = ?, theirs_kind = ?, theirs_name = ?, theirs_login = ?
-         WHERE id = ?",
+         WHERE id = ? AND status IN ('pending', 'in_progress')",
     )
     .bind(ours_kind)
     .bind(theirs_kind)
@@ -891,7 +891,7 @@ pub async fn update_match_fighters(
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 #[derive(Clone, Copy)]
@@ -940,12 +940,14 @@ where
         return Err(sqlx::Error::Protocol("path".into()));
     }
     let theirs_login = crate::gh::fold_github_login_opt(h.theirs_login);
-    sqlx::query(
+    let res = sqlx::query(
         "INSERT INTO match_hunks (
             match_id, round_index, path, hunk_index, ours_bytes, theirs_bytes, base_bytes,
             theirs_login, theirs_name,
             ours_hp, ours_armor, ours_special, theirs_hp, theirs_armor, theirs_special
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          FROM matches
+          WHERE id = ? AND status IN ('pending', 'in_progress')",
     )
     .bind(h.match_id)
     .bind(h.round)
@@ -962,8 +964,12 @@ where
     .bind(i64::from(h.theirs_stats.hp))
     .bind(h.theirs_stats.armor as i64)
     .bind(h.theirs_stats.special as i64)
+    .bind(h.match_id)
     .execute(executor)
     .await?;
+    if res.rows_affected() == 0 {
+        return Err(sqlx::Error::Protocol("closed".into()));
+    }
     Ok(())
 }
 
@@ -1954,6 +1960,41 @@ mod tests {
         assert!(
             list_hunks(&pool, "batch1").await.unwrap().is_empty(),
             "a failed later hunk must not leave a partial open match"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_hunks_skips_a_closed_match() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_match(&pool, "closed1", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(abort_open_match(&pool, "closed1", "outdated")
+            .await
+            .unwrap());
+        let hunk = NewHunk {
+            match_id: "closed1",
+            round: 0,
+            path: "lib.rs",
+            hunk_index: 0,
+            ours: b"a",
+            theirs: b"b",
+            base: b"c",
+            theirs_login: None,
+            theirs_name: None,
+            ours_stats: git_fight_core::FighterStats::default(),
+            theirs_stats: git_fight_core::FighterStats::default(),
+        };
+        assert!(insert_hunks(&pool, &[hunk]).await.is_err());
+        assert!(
+            list_hunks(&pool, "closed1").await.unwrap().is_empty(),
+            "an aborted row must not gain fightable hunks"
+        );
+        assert!(
+            !update_match_fighters(&pool, "closed1", "github", "cpu", "bob", None)
+                .await
+                .unwrap(),
+            "a closed row must not take fighter identities"
         );
     }
 
@@ -3073,7 +3114,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(is_fk(&err), "{err}");
+        assert!(
+            is_fk(&err) || matches!(&err, sqlx::Error::Protocol(msg) if msg == "closed"),
+            "missing match must not store hunks: {err}"
+        );
         insert_input(&pool, "missing", 0, 0, 1, 2).await.unwrap();
         assert!(
             load_inputs(&pool, "missing", 0).await.unwrap().is_empty(),

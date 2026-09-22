@@ -117,8 +117,9 @@ pub struct AppState {
     /// SHA-drift aborts that exhausted the short retry loop. Restart loses
     /// this map; the next `synchronize` or 24h expiry covers leftover rows.
     pending_aborts: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    /// SHA-drift close-before-abort. Join must not respawn lockstep.
-    closing: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// SHA-drift close-before-abort. Join must not respawn lockstep,
+    /// and fight-link POSTs must not publish a match URL.
+    pub(crate) closing: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Busy `synchronize` lookups that exhausted the short retry loop.
     pub(crate) lookups: crate::webhook::LookupTrack,
     pub(crate) comments: crate::challenge::CommentTrack,
@@ -192,6 +193,11 @@ impl AppState {
 
     fn is_closing(&self, id: &str) -> bool {
         self.closing.lock().map(|g| g.contains(id)).unwrap_or(false)
+    }
+
+    /// Poisoned lock is treated as closing so a fight link cannot sneak out.
+    fn blocks_fight_link(&self, id: &str) -> bool {
+        self.closing.lock().map(|g| g.contains(id)).unwrap_or(true)
     }
 
     async fn record_missing_stats(&self) {
@@ -364,6 +370,9 @@ impl AppState {
         };
         for row in rows {
             if self.comments.is_inflight(&row.id) || self.comments.has_pending(&row.id) {
+                continue;
+            }
+            if self.blocks_fight_link(&row.id) {
                 continue;
             }
             if row.pr_number <= 0 || row.owner.is_empty() {
