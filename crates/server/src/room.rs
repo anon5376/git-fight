@@ -388,44 +388,73 @@ async fn run_room(
                                             &mut ours,
                                             &mut theirs,
                                         );
-                                        if ours.seen && theirs.seen && started_at.is_none() {
-                                            match db::start_open_match(&pool, &id).await {
-                                                Ok(true) => started_at = Some(Instant::now()),
-                                                Ok(false) => {
-                                                    send_closed(&tx, &pool, &id).await;
-                                                    expire_now(
-                                                        &pool,
-                                                        &id,
-                                                        &conns,
-                                                        settings.result.as_ref(),
-                                                        &rooms,
-                                                    )
-                                                    .await;
-                                                    done = true;
-                                                }
-                                                Err(_) => {}
+                                        let start = if ours.seen && theirs.seen && started_at.is_none()
+                                        {
+                                            Some(
+                                                db::start_open_match(&pool, &id)
+                                                    .await
+                                                    .map_err(|_| ()),
+                                            )
+                                        } else {
+                                            None
+                                        };
+                                        match join_start_followup(start) {
+                                            JoinStart::Closed => {
+                                                send_closed(&tx, &pool, &id).await;
+                                                expire_now(
+                                                    &pool,
+                                                    &id,
+                                                    &conns,
+                                                    settings.result.as_ref(),
+                                                    &rooms,
+                                                )
+                                                .await;
+                                                done = true;
                                             }
-                                        }
-                                        if !done {
-                                            send_catch_up(
-                                                &tx,
-                                                &id,
-                                                seed,
-                                                delay,
-                                                role.as_str(),
-                                                conns
-                                                    .get(&conn_id)
-                                                    .and_then(|c| c.login.as_deref())
-                                                    .unwrap_or(""),
-                                                &ours_name,
-                                                &theirs_name,
-                                                round,
-                                                total_rounds,
-                                                confirmed,
-                                                db::stats_for_round(&hunks, round),
-                                                &hunks,
-                                                &log,
-                                            );
+                                            JoinStart::Preparing => {
+                                                // Busy pending→in_progress: do
+                                                // not Hello. Canvas reconnects.
+                                                conns.remove(&conn_id);
+                                                refresh_slots(
+                                                    &conns,
+                                                    &row,
+                                                    &hunks,
+                                                    round,
+                                                    github,
+                                                    &mut ours,
+                                                    &mut theirs,
+                                                );
+                                                try_send_or_spawn(
+                                                    &tx,
+                                                    encode(&ServerMsg::Error {
+                                                        message: "preparing".into(),
+                                                    }),
+                                                );
+                                            }
+                                            JoinStart::Hello => {
+                                                if start.is_some() {
+                                                    started_at = Some(Instant::now());
+                                                }
+                                                send_catch_up(
+                                                    &tx,
+                                                    &id,
+                                                    seed,
+                                                    delay,
+                                                    role.as_str(),
+                                                    conns
+                                                        .get(&conn_id)
+                                                        .and_then(|c| c.login.as_deref())
+                                                        .unwrap_or(""),
+                                                    &ours_name,
+                                                    &theirs_name,
+                                                    round,
+                                                    total_rounds,
+                                                    confirmed,
+                                                    db::stats_for_round(&hunks, round),
+                                                    &hunks,
+                                                    &log,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -866,6 +895,23 @@ enum JoinAdmit {
     Unknown,
     ScoredAll,
     Enter,
+}
+
+/// After both slots are seen: the pending→in_progress write must land
+/// before Hello. A busy write is preparing (canvas reconnects).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinStart {
+    Hello,
+    Closed,
+    Preparing,
+}
+
+fn join_start_followup(start: Option<Result<bool, ()>>) -> JoinStart {
+    match start {
+        None | Some(Ok(true)) => JoinStart::Hello,
+        Some(Ok(false)) => JoinStart::Closed,
+        Some(Err(())) => JoinStart::Preparing,
+    }
 }
 
 /// After every hunk already has a winner: finish+publish, do not
@@ -2577,6 +2623,14 @@ mod tests {
             join_replay_followup(false),
             "preparing",
             "Join must not sit mute while match_inputs replay is still retrying"
+        );
+        assert_eq!(join_start_followup(None), JoinStart::Hello);
+        assert_eq!(join_start_followup(Some(Ok(true))), JoinStart::Hello);
+        assert_eq!(join_start_followup(Some(Ok(false))), JoinStart::Closed);
+        assert_eq!(
+            join_start_followup(Some(Err(()))),
+            JoinStart::Preparing,
+            "a busy pending→in_progress write must not Hello a mute room"
         );
         assert!(
             playable_room_hunks(0, &[]),
