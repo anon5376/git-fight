@@ -69,18 +69,32 @@ impl ResultCtx {
         self.publishing.lock().await.remove(id);
     }
 
+    /// A busy row read is not vanished. Keep the PATCH queued.
+    pub(crate) fn pending_expired_followup(row: Result<Option<&str>, ()>) -> &'static str {
+        match row {
+            Err(()) => "retry",
+            Ok(Some("expired")) => "comment",
+            Ok(Some(_)) | Ok(None) => "dequeue",
+        }
+    }
+
     pub(crate) async fn retry_pending_expired(&self) {
         for id in self.expired_snapshot() {
-            let Ok(Some(row)) = db::get_match(&self.pool, &id).await else {
-                self.dequeue_expired(&id);
-                continue;
+            let looked = match db::get_match(&self.pool, &id).await {
+                Ok(v) => v,
+                Err(_) => continue,
             };
-            if row.status != "expired" {
-                self.dequeue_expired(&id);
-                continue;
-            }
-            if comment_expired(self, &row).await.is_ok() {
-                self.dequeue_expired(&id);
+            match Self::pending_expired_followup(Ok(looked.as_ref().map(|r| r.status.as_str()))) {
+                "comment" => match looked {
+                    Some(row) => {
+                        if comment_expired(self, &row).await.is_ok() {
+                            self.dequeue_expired(&id);
+                        }
+                    }
+                    None => self.dequeue_expired(&id),
+                },
+                "dequeue" => self.dequeue_expired(&id),
+                _ => {}
             }
         }
     }
@@ -699,6 +713,24 @@ mod tests {
             expired_comment_followup(Err(())),
             "queue",
             "a failed expiry PATCH must not go silent"
+        );
+    }
+
+    #[test]
+    fn busy_expired_lookup_stays_queued() {
+        assert_eq!(
+            ResultCtx::pending_expired_followup(Ok(Some("expired"))),
+            "comment"
+        );
+        assert_eq!(ResultCtx::pending_expired_followup(Ok(None)), "dequeue");
+        assert_eq!(
+            ResultCtx::pending_expired_followup(Ok(Some("finished"))),
+            "dequeue"
+        );
+        assert_eq!(
+            ResultCtx::pending_expired_followup(Err(())),
+            "retry",
+            "a busy get_match must not drop the expiry PATCH queue"
         );
     }
 

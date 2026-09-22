@@ -323,6 +323,48 @@ impl AppState {
         }
     }
 
+    /// Busy get_match keeps the queued decision body. Vanished dequeues.
+    fn start_note_row_followup(row: Result<Option<()>, ()>) -> &'static str {
+        match row {
+            Err(()) => "retry",
+            Ok(None) => "dequeue",
+            Ok(Some(())) => "check",
+        }
+    }
+
+    /// First expiry comment: a busy read must queue, not go silent.
+    fn expire_comment_start_followup(row: Result<Option<&str>, ()>) -> &'static str {
+        match row {
+            Err(()) => "queue",
+            Ok(Some("expired")) => "comment",
+            Ok(Some(_)) | Ok(None) => "drop",
+        }
+    }
+
+    async fn comment_just_expired(&self, id: &str) {
+        let looked = match db::get_match(&self.pool, id).await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(()),
+        };
+        let status = match &looked {
+            Err(()) => Err(()),
+            Ok(None) => Ok(None),
+            Ok(Some(row)) => Ok(Some(row.status.as_str())),
+        };
+        match Self::expire_comment_start_followup(status) {
+            "comment" => {
+                if let Ok(Some(row)) = looked {
+                    let ctx = self.result_ctx();
+                    if crate::result::comment_expired(&ctx, &row).await.is_err() {
+                        ctx.queue_expired(&row.id);
+                    }
+                }
+            }
+            "queue" => self.result_ctx().queue_expired(id),
+            _ => {}
+        }
+    }
+
     async fn retry_start_notes(&self) {
         let ctx = self.result_ctx();
         for (id, reason, body) in self.start_notes.snapshot() {
@@ -330,7 +372,19 @@ impl AppState {
                 Ok(true) | Ok(false) => {}
                 Err(_) => continue,
             }
-            let Ok(Some(row)) = db::get_match(&self.pool, &id).await else {
+            let looked = match db::get_match(&self.pool, &id).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match Self::start_note_row_followup(Ok(looked.as_ref().map(|_| ()))) {
+                "dequeue" => {
+                    self.start_notes.dequeue(&id);
+                    continue;
+                }
+                "check" => {}
+                _ => continue,
+            }
+            let Some(row) = looked else {
                 self.start_notes.dequeue(&id);
                 continue;
             };
@@ -551,14 +605,7 @@ pub async fn serve(listener: TcpListener, pool: SqlitePool, config: Config) -> s
                     expirer.close_room(&id).await;
                     let expirer = expirer.clone();
                     tokio::spawn(async move {
-                        if let Ok(Some(row)) = db::get_match(&expirer.pool, &id).await {
-                            if row.status == "expired" {
-                                let ctx = expirer.result_ctx();
-                                if crate::result::comment_expired(&ctx, &row).await.is_err() {
-                                    ctx.queue_expired(&row.id);
-                                }
-                            }
-                        }
+                        expirer.comment_just_expired(&id).await;
                     });
                 }
             }
@@ -1416,6 +1463,35 @@ mod tests {
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
         assert!(state.pending_aborts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_start_note_row_stays_queued() {
+        assert_eq!(AppState::start_note_row_followup(Ok(Some(()))), "check");
+        assert_eq!(AppState::start_note_row_followup(Ok(None)), "dequeue");
+        assert_eq!(
+            AppState::start_note_row_followup(Err(())),
+            "retry",
+            "a busy get_match must not drop the decision comment"
+        );
+    }
+
+    #[test]
+    fn busy_first_expiry_read_is_queued() {
+        assert_eq!(
+            AppState::expire_comment_start_followup(Ok(Some("expired"))),
+            "comment"
+        );
+        assert_eq!(AppState::expire_comment_start_followup(Ok(None)), "drop");
+        assert_eq!(
+            AppState::expire_comment_start_followup(Ok(Some("finished"))),
+            "drop"
+        );
+        assert_eq!(
+            AppState::expire_comment_start_followup(Err(())),
+            "queue",
+            "a busy first expiry read must not go silent"
+        );
     }
 
     #[test]
