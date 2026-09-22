@@ -114,14 +114,16 @@ function startFight(mode: Mode, fromDemo: boolean): void {
       leftover -= tickMs;
       stepOnce();
     }
-    paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
+    const youSide = mode.kind === "two" ? "both" : mode.human;
+    paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1", undefined, undefined, youSide);
     if (fight.result() !== -1) {
       finish();
     }
     requestAnimationFrame(loop);
   };
 
-  paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
+  const youSide = mode.kind === "two" ? "both" : mode.human;
+  paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1", undefined, undefined, youSide);
   requestAnimationFrame(loop);
   running = {
     stop: () => {
@@ -196,6 +198,7 @@ async function main(): Promise<void> {
   if (await bootOnline()) {
     return;
   }
+  // Menu starts hidden so vs-CPU is not clickable before wasm and listeners exist.
   document.querySelector("[data-testid=demo]")?.addEventListener("click", showDemo);
   document.querySelector("[data-testid=cpu]")?.addEventListener("click", showSidePick);
   document.querySelector("[data-testid=two]")?.addEventListener("click", () => {
@@ -219,6 +222,7 @@ async function main(): Promise<void> {
   });
   document.querySelector("[data-testid=back-demo]")?.addEventListener("click", showMenu);
   document.querySelector("[data-testid=back-side]")?.addEventListener("click", showMenu);
+  showMenu();
 }
 
 void main();

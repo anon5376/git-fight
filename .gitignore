@@ -13,3 +13,4 @@ web/playwright-report/
 web/test-results/
 crates/wasm/pkg/
 crates/wasm/target/
+**/__pycache__/

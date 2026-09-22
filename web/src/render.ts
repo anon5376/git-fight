@@ -57,6 +57,7 @@ export type Frame = {
   theirsSprite: string[];
   timer: string;
   roundLabel: string;
+  youSide?: string;
 };
 
 export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
@@ -78,6 +79,14 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
 
   ctx.fillText(padName(frame.oursName, 12), 24, 48);
   ctx.fillText(padName(frame.theirsName, 12).trimEnd(), w - 24 - 12 * 11, 48);
+  if (frame.youSide === "ours" || frame.youSide === "both") {
+    ctx.fillStyle = OURS;
+    ctx.fillText("YOU", 24 + 12 * 11 + 4, 48);
+  }
+  if (frame.youSide === "theirs" || frame.youSide === "both") {
+    ctx.fillStyle = THEIRS;
+    ctx.fillText("YOU", w - 24 - 12 * 11 - 36, 48);
+  }
   drawBar(ctx, 24, 72, 280, frame.oursHp, frame.oursMax, OURS);
   drawBar(ctx, w - 304, 72, 280, frame.theirsHp, frame.theirsMax, THEIRS);
   ctx.fillStyle = OURS;

@@ -4,6 +4,7 @@ test("cpu match reaches the KO screen", async ({ page }) => {
   await page.goto("/?smoke=1");
   await expect(page.getByTestId("menu")).toBeVisible();
   await page.getByTestId("cpu").click();
+  await expect(page.getByTestId("side-pick")).toBeVisible();
   await page.getByTestId("play-ours").click();
   const stage = page.getByTestId("stage");
   await expect(stage).toBeVisible();

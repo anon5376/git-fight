@@ -1,5 +1,6 @@
 use clap::Parser;
 use git_fight_server::Config;
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,11 +26,18 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
     /// SQLite URL, e.g. sqlite://data/git-fight.db
-    #[arg(long, default_value = "sqlite://data/git-fight.db")]
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "sqlite://data/git-fight.db"
+    )]
     db: String,
     /// Directory of the Vite build (index.html + assets).
     #[arg(long)]
     r#static: Option<PathBuf>,
+    /// Confirm ticks as fast as inputs arrive (lockstep tests, not production).
+    #[arg(long, default_value_t = false)]
+    instant: bool,
 }
 
 #[tokio::main]
@@ -51,21 +59,42 @@ async fn main() {
             eprintln!("database: {e}");
             std::process::exit(1);
         });
-    let config = Config {
+    let mut config = Config {
         lag: Duration::from_millis(args.lag_ms),
-        instant: false,
+        instant: args.instant,
         static_dir: args.r#static.or_else(|| {
             let p = PathBuf::from("web/dist");
             p.exists().then_some(p)
         }),
         expire_secs: git_fight_server::protocol::EXPIRE_SECS,
         disconnect: Duration::from_secs(git_fight_server::protocol::DISCONNECT_SECS),
+        ..Config::default()
     };
+    config.auth.public_url =
+        env::var("GIT_FIGHT_PUBLIC_URL").unwrap_or_else(|_| format!("http://{}", args.bind));
+    if let Ok(key) = env::var("SESSION_KEY") {
+        config.auth.session_key = key.into_bytes();
+    }
+    config.webhook_secret = env::var("GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .map(|s| s.into_bytes());
+    config.github = match git_fight_server::github_from_env() {
+        Ok(gh) => gh,
+        Err(name) => {
+            eprintln!("{name} is required when GitHub App credentials are set");
+            std::process::exit(1);
+        }
+    };
+    if let Err(name) = config.require_live_github_secrets() {
+        eprintln!("{name} is required when GitHub App credentials are set");
+        std::process::exit(1);
+    }
     let listener = TcpListener::bind(args.bind).await.unwrap_or_else(|e| {
         eprintln!("bind: {e}");
         std::process::exit(1);
     });
-    eprintln!("git-fight-server on http://{}", args.bind);
+    let addr = listener.local_addr().unwrap_or(args.bind);
+    eprintln!("git-fight-server on http://{addr}");
     if let Err(e) = git_fight_server::serve(listener, pool, config).await {
         eprintln!("server: {e}");
         std::process::exit(1);

@@ -1,0 +1,756 @@
+use git_fight_server::gh::{GitHub, LoginLookup};
+use serde_json::json;
+use std::time::Duration;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+const APP_PEM: &str = include_str!("fixtures/app_key.txt");
+const SECRET: &str = "oauth-client-secret-do-not-leak";
+
+fn client(mock: &MockServer) -> GitHub {
+    GitHub::new(
+        mock.uri(),
+        mock.uri(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    )
+}
+
+#[tokio::test]
+async fn installation_token_is_cached_in_memory() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "size": 12,
+            "default_branch": "main"
+        })))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    let a = gh.get_repo(1, "acme", "box").await.unwrap();
+    let b = gh.get_repo(1, "acme", "box").await.unwrap();
+    assert_eq!(a.size, 12);
+    assert_eq!(b.size, 12);
+}
+
+#[tokio::test]
+async fn installation_token_rejects_huge_json() {
+    let mock = MockServer::start().await;
+    let huge = format!(
+        r#"{{"token":"{}","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        "a".repeat(32 * 1024)
+    );
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_string(huge))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert!(gh.installation_token(1).await.is_err());
+}
+
+#[tokio::test]
+async fn poll_mergeable_gives_up_with_none() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/pulls/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 1,
+            "mergeable": null,
+            "head": { "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ref": "pr" },
+            "base": { "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ref": "main" },
+            "user": { "login": "alice" }
+        })))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock).with_poll_wait(Duration::from_millis(1));
+    let pr = gh.poll_mergeable(1, "acme", "box", 1).await.unwrap();
+    assert_eq!(pr.mergeable, None);
+    let pulls = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/repos/acme/box/pulls/1")
+        .count();
+    assert_eq!(pulls, 8, "short cap is eight mergeable polls");
+}
+
+#[tokio::test]
+async fn get_pull_rejects_short_shas() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/pulls/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 1,
+            "mergeable": false,
+            "head": { "sha": "HEAD", "ref": "pr" },
+            "base": { "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ref": "main" },
+            "user": { "login": "alice" }
+        })))
+        .mount(&mock)
+        .await;
+    let err = client(&mock)
+        .get_pull(1, "acme", "box", 1)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "pull sha");
+}
+
+#[test]
+fn debug_omits_secrets() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    let shown = format!("{gh:?}");
+    assert!(!shown.contains(SECRET), "{shown}");
+    assert!(!shown.contains("BEGIN"), "{shown}");
+    assert!(!shown.contains("PRIVATE KEY"), "{shown}");
+}
+
+#[test]
+fn github_names_reject_host_tricks() {
+    use git_fight_server::gh::is_safe_github_name;
+    assert!(is_safe_github_name("acme"));
+    assert!(is_safe_github_name("git-fight"));
+    assert!(is_safe_github_name(".github"));
+    assert!(!is_safe_github_name(""));
+    assert!(!is_safe_github_name("acme/other"));
+    assert!(!is_safe_github_name("acme.git@evil"));
+    assert!(!is_safe_github_name("../acme"));
+    assert!(!is_safe_github_name("acme/../x"));
+    assert!(!is_safe_github_name("https://github.com"));
+}
+
+#[tokio::test]
+async fn github_api_rejects_unsafe_owner_before_http() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(gh.get_repo(1, "acme/other", "box").await.is_err());
+    assert!(gh.get_pull(1, "acme", "box.git@evil", 1).await.is_err());
+    assert!(gh.comment(1, "../acme", "box", 1, "hi").await.is_err());
+    assert!(gh.edit_comment(1, "acme", "..", 99, "hi").await.is_err());
+}
+
+#[tokio::test]
+async fn login_for_commit_rejects_option_shas() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", "HEAD").await,
+        LoginLookup::None
+    );
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", "--upload-pack=true")
+            .await,
+        LoginLookup::None
+    );
+    assert_eq!(
+        gh.login_for_commit(
+            1,
+            "acme/other",
+            "box",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .await,
+        LoginLookup::None
+    );
+}
+
+#[tokio::test]
+async fn auto_challenge_skips_unsafe_ref() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(
+        !gh.auto_challenge_enabled(1, "acme", "box", "--upload-pack=true")
+            .await
+    );
+    assert!(!gh.auto_challenge_enabled(1, "acme", "box", "../main").await);
+}
+
+async fn auto_challenge_with(body: serde_json::Value) -> bool {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/contents/.github/git-fight.yml"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&mock)
+        .await;
+    client(&mock)
+        .auto_challenge_enabled(1, "acme", "box", "main")
+        .await
+}
+
+#[tokio::test]
+async fn auto_challenge_requires_small_base64_file() {
+    // `auto_challenge: true\n` as GitHub contents (base64, optional wrap newline).
+    let b64 = "YXV0b19jaGFsbGVuZ2U6IHRydWUK";
+    assert!(
+        auto_challenge_with(json!({
+            "type": "file",
+            "encoding": "base64",
+            "size": 21,
+            "content": format!("{b64}\n"),
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "type": "symlink",
+            "encoding": "base64",
+            "size": 21,
+            "content": b64,
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "type": "file",
+            "encoding": "utf-8",
+            "size": 21,
+            "content": "auto_challenge: true\n",
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "encoding": "base64",
+            "size": 21,
+            "content": b64,
+        }))
+        .await
+    );
+    assert!(
+        !auto_challenge_with(json!({
+            "type": "file",
+            "encoding": "base64",
+            "size": 1_000_000,
+            "content": b64,
+        }))
+        .await
+    );
+    assert!(!auto_challenge_with(json!([{ "type": "file" }])).await);
+}
+
+#[tokio::test]
+async fn login_for_email_rejects_injection() {
+    let gh = GitHub::new(
+        "http://example.test".into(),
+        "http://example.test".into(),
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "x@y.com&per_page=100")
+            .await,
+        LoginLookup::None
+    );
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "x@y.com\nAuthorization: bearer x")
+            .await,
+        LoginLookup::None
+    );
+    assert_eq!(
+        gh.login_for_email(1, "acme/other", "box", "bob@example.com")
+            .await,
+        LoginLookup::None
+    );
+}
+
+#[tokio::test]
+async fn login_for_email_queries_author() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "author": { "login": "bob" },
+            "commit": { "author": { "email": "bob@example.com" } }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "bob@example.com")
+            .await,
+        LoginLookup::Found("bob".into())
+    );
+    let asked = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|r| {
+            r.method.as_str() == "GET"
+                && r.url.path() == "/repos/acme/box/commits"
+                && r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "author" && v == "bob@example.com")
+        });
+    assert!(asked, "commits list must filter by author email");
+}
+
+#[tokio::test]
+async fn login_for_email_matches_ignore_case() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "author": { "login": "Bob" },
+            "commit": { "author": { "email": "Bob@Example.COM" } }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "bob@example.com")
+            .await,
+        LoginLookup::Found("bob".into())
+    );
+}
+
+#[tokio::test]
+async fn login_for_commit_uses_list_api_not_files_payload() {
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/acme/box/commits/{sha}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sha": sha,
+            "author": { "login": "from-files-endpoint" },
+            "files": [{ "filename": "huge.rs", "patch": "x".repeat(1024) }]
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "sha": sha,
+            "author": { "login": "bob" }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", sha).await,
+        LoginLookup::Found("bob".into())
+    );
+    let asked = mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|r| {
+            r.method.as_str() == "GET"
+                && r.url.path() == "/repos/acme/box/commits"
+                && r.url.query_pairs().any(|(k, v)| k == "sha" && v == sha)
+                && r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "per_page" && v == "1")
+        });
+    assert!(
+        asked,
+        "login_for_commit must use list-commits ?sha=&per_page=1"
+    );
+}
+
+#[tokio::test]
+async fn login_for_commit_drops_unsafe_login() {
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "sha": sha,
+            "author": { "login": "acme/other" }
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", sha).await,
+        LoginLookup::Rejected
+    );
+}
+
+#[tokio::test]
+async fn login_for_commit_http_failure_is_unavailable() {
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", sha).await,
+        LoginLookup::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn login_for_commit_not_found_is_unavailable() {
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", sha).await,
+        LoginLookup::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn login_for_commit_null_author_is_no_account() {
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "sha": sha,
+            "author": null
+        }])))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_commit(1, "acme", "box", sha).await,
+        LoginLookup::None
+    );
+}
+
+#[tokio::test]
+async fn login_for_email_http_failure_is_unavailable() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box/commits"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert_eq!(
+        gh.login_for_email(1, "acme", "box", "bob@example.com")
+            .await,
+        LoginLookup::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn github_http_does_not_follow_redirects() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/app/installations/1/access_tokens"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "token": "ghs_cached_token",
+            "expires_at": "2099-01-01T00:00:00Z"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/box"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("Location", format!("{}/stolen", mock.uri())),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/stolen"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "size": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    assert!(gh.get_repo(1, "acme", "box").await.is_err());
+}
+
+async fn read_http1_request(sock: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let mut tmp = [0u8; 2048];
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = &buf[..pos];
+            let mut content_length = 0usize;
+            for line in headers.split(|&b| b == b'\n') {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let Ok(s) = std::str::from_utf8(line) else {
+                    continue;
+                };
+                if let Some((k, v)) = s.split_once(':') {
+                    if k.eq_ignore_ascii_case("content-length") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let need = header_end + content_length;
+            while buf.len() < need {
+                let mut tmp = [0u8; 2048];
+                let n = sock.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            return Ok(buf);
+        }
+        if buf.len() > 64 * 1024 {
+            return Ok(buf);
+        }
+    }
+}
+
+async fn write_chunked(
+    sock: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    sock.write_all(
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await?;
+    for chunk in body.chunks(512) {
+        sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await?;
+        sock.write_all(chunk).await?;
+        sock.write_all(b"\r\n").await?;
+    }
+    sock.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+async fn serve_chunked_token(body: String) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_http1_request(&mut sock).await;
+        let _ = write_chunked(&mut sock, 201, "Created", body.as_bytes()).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn installation_token_parses_chunked_json_without_content_length() {
+    let body = r#"{"token":"ghs_chunked","expires_at":"2099-01-01T00:00:00Z"}"#.to_string();
+    let base = serve_chunked_token(body).await;
+    let gh = GitHub::new(
+        base.clone(),
+        base,
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert_eq!(gh.installation_token(1).await.unwrap(), "ghs_chunked");
+}
+
+#[tokio::test]
+async fn installation_token_caps_chunked_json_without_content_length() {
+    let huge = format!(
+        r#"{{"token":"{}","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        "a".repeat(32 * 1024)
+    );
+    let base = serve_chunked_token(huge).await;
+    let gh = GitHub::new(
+        base.clone(),
+        base,
+        1,
+        APP_PEM.to_string(),
+        "cid".into(),
+        SECRET.into(),
+    );
+    assert!(gh.installation_token(1).await.is_err());
+}
+
+#[tokio::test]
+async fn oauth_user_posts_form_not_json() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/oauth/access_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "ghu_test"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "login": "alice"
+        })))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    let verifier = "a".repeat(43);
+    let (id, login) = gh
+        .oauth_user(
+            "abc",
+            "http://127.0.0.1:8080/auth/github/callback",
+            &verifier,
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(login, "alice");
+    let rec = mock.received_requests().await.unwrap();
+    let token = rec
+        .iter()
+        .find(|r| r.url.path().ends_with("/access_token"))
+        .expect("token exchange");
+    let ct = token
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("application/x-www-form-urlencoded"), "{ct}");
+    let body = String::from_utf8_lossy(&token.body);
+    assert!(!body.trim_start().starts_with('{'), "{body}");
+    assert!(body.contains("code=abc"), "{body}");
+    assert!(
+        body.contains(&format!("code_verifier={verifier}")),
+        "{body}"
+    );
+}

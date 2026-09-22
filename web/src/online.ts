@@ -24,22 +24,81 @@ type Hello = {
   seed_hi: number;
   input_delay: number;
   your_role: string;
+  you_are?: string;
   ours: string;
   theirs: string;
   round: number;
+  total_rounds?: number;
   confirmed_tick: number;
+  ours_hp?: number;
+  ours_armor?: boolean;
+  ours_special?: boolean;
+  theirs_hp?: number;
+  theirs_armor?: boolean;
+  theirs_special?: boolean;
+  path?: string;
+  hunk_index?: number;
 };
 
 type TickMsg = { type: "tick"; n: number; ours: number; theirs: number };
+type HashMsg = { type: "hash"; n: number; hi: number; lo: number };
+type SnapshotMsg = {
+  type: "snapshot";
+  seed_lo: number;
+  seed_hi: number;
+  round: number;
+  confirmed_tick: number;
+  ours_hp?: number;
+  ours_armor?: boolean;
+  ours_special?: boolean;
+  theirs_hp?: number;
+  theirs_armor?: boolean;
+  theirs_special?: boolean;
+  ticks: number[][];
+  path?: string;
+  hunk_index?: number;
+};
 type EndMsg = {
   type: "end";
   result: number;
   hash_hi: number;
   hash_lo: number;
   tick: number;
+  round?: number;
+  match_over?: boolean;
 };
 type ErrMsg = { type: "error"; message: string };
-type ServerMsg = Hello | TickMsg | EndMsg | ErrMsg | { type: string };
+type ServerMsg = Hello | TickMsg | HashMsg | SnapshotMsg | EndMsg | ErrMsg | { type: string };
+
+function u32(n: number): number {
+  return n >>> 0;
+}
+
+function hashesMatch(fight: WasmFight, hi: number, lo: number): boolean {
+  return u32(fight.state_hash_hi()) === u32(hi) && u32(fight.state_hash_lo()) === u32(lo);
+}
+
+function fightFromWire(
+  seedLo: number,
+  seedHi: number,
+  oursHp?: number,
+  oursArmor?: boolean,
+  oursSpecial?: boolean,
+  theirsHp?: number,
+  theirsArmor?: boolean,
+  theirsSpecial?: boolean,
+): WasmFight {
+  return WasmFight.from_seed_stats(
+    seedLo,
+    seedHi,
+    oursHp ?? 100,
+    oursArmor ?? false,
+    oursSpecial ?? false,
+    theirsHp ?? 100,
+    theirsArmor ?? false,
+    theirsSpecial ?? false,
+  );
+}
 
 export function sprite(side: number, pose: number): string[] {
   const rows = sprite_rows();
@@ -56,6 +115,10 @@ export function paintFight(
   oursName: string,
   theirsName: string,
   roundLabel: string,
+  path?: string,
+  hunkIndex?: number,
+  youSide?: string,
+  youAre?: string,
 ): void {
   const tps = ticks_per_second();
   const round = round_ticks();
@@ -74,9 +137,21 @@ export function paintFight(
     theirsSprite: sprite(1, fight.theirs_pose()),
     timer: String(secs).padStart(2, " "),
     roundLabel,
+    youSide,
   });
   stage.dataset.oursHp = String(fight.ours_hp());
   stage.dataset.theirsHp = String(fight.theirs_hp());
+  stage.dataset.round = String(roundLabel);
+  stage.dataset.role = youSide ?? "";
+  stage.dataset.youAre = youAre ?? "";
+  stage.dataset.oursName = oursName;
+  stage.dataset.theirsName = theirsName;
+  if (path) {
+    stage.dataset.path = path;
+  }
+  if (hunkIndex !== undefined) {
+    stage.dataset.hunk = String(hunkIndex);
+  }
 }
 
 export function showKo(ko: HTMLElement, result: number): void {
@@ -101,6 +176,12 @@ function wsUrl(matchId: string, token: string | null): string {
   return url.toString();
 }
 
+function roundCaption(kind: string, round: number, total: number, path: string): string {
+  const n = `${round + 1}/${total}`;
+  const file = path.trim();
+  return file ? `${kind} ${n} ${file}` : `${kind} ${n}`;
+}
+
 export function startOnline(matchId: string, token: string | null, ui: OnlineUi): { stop: () => void } {
   let stopped = false;
   let fight: WasmFight | null = null;
@@ -109,13 +190,53 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let nextSend = 0;
   let confirmed = -1;
   let held = 0;
+  let heldTheirs = 0;
   let oursName = "ours";
   let theirsName = "theirs";
   let finished = false;
+  let round = 0;
+  let totalRounds = 1;
+  let path = "";
+  let hunkIndex = 0;
+  let youAre = "";
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
   let leftover = 0;
+
+  const applySnapshot = (snap: SnapshotMsg): void => {
+    const rebuilt = fightFromWire(
+      snap.seed_lo,
+      snap.seed_hi,
+      snap.ours_hp,
+      snap.ours_armor,
+      snap.ours_special,
+      snap.theirs_hp,
+      snap.theirs_armor,
+      snap.theirs_special,
+    );
+    for (const pair of snap.ticks ?? []) {
+      const n = pair[0] ?? 0;
+      const oursBtn = pair[1] ?? 0;
+      const theirsBtn = pair[2] ?? 0;
+      if (n === rebuilt.tick()) {
+        rebuilt.step(oursBtn, theirsBtn);
+      }
+    }
+    fight = rebuilt;
+    confirmed = snap.confirmed_tick;
+    round = snap.round ?? round;
+    if (snap.path) {
+      path = snap.path;
+    }
+    if (snap.hunk_index !== undefined) {
+      hunkIndex = snap.hunk_index;
+    }
+    nextSend = Math.max(0, confirmed + 1);
+    if (rebuilt.tick() > 0 && role !== "spectator") {
+      ui.wait.classList.add("hidden");
+    }
+  };
 
   ui.wait.classList.remove("hidden");
   ui.wait.textContent = "connecting…";
@@ -133,36 +254,86 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     ui.onQuit();
   });
 
-  const ws = new WebSocket(wsUrl(matchId, token));
+  let ws: WebSocket | null = null;
+  let gen = 0;
+  let reconnectTimer: number | null = null;
+  let reconnectAttempts = 0;
+  let preparing = false;
+  let busy = false;
+  const maxReconnects = 8;
 
-  const flush = (latest: number) => {
-    if (role === "spectator" || ws.readyState !== WebSocket.OPEN) {
+  const clearReconnect = () => {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  const flush = (oursBtn: number, theirsBtn: number) => {
+    if (role === "spectator" || !ws || ws.readyState !== WebSocket.OPEN) {
       return;
     }
     const horizon = Math.max(0, confirmed + 1) + delay;
     while (nextSend <= horizon) {
-      const buttons = nextSend === horizon ? latest : 0;
-      ws.send(JSON.stringify({ type: "input", tick: nextSend, buttons }));
+      const buttons = nextSend === horizon ? oursBtn : 0;
+      const theirs = nextSend === horizon ? theirsBtn : 0;
+      const payload: {
+        type: string;
+        tick: number;
+        buttons: number;
+        round: number;
+        theirs?: number;
+      } = {
+        type: "input",
+        tick: nextSend,
+        buttons,
+        round,
+      };
+      if (role === "both") {
+        payload.theirs = theirs;
+      }
+      ws.send(JSON.stringify(payload));
       nextSend += 1;
     }
   };
 
-  ws.addEventListener("open", () => {
-    ui.wait.textContent = "waiting for opponent…";
-  });
-  ws.addEventListener("close", () => {
-    if (!finished && !stopped) {
-      ui.wait.classList.remove("hidden");
-      ui.wait.textContent = "disconnected — reconnecting in 2s";
-      window.setTimeout(() => {
-        if (!stopped && !finished) {
-          window.location.reload();
-        }
-      }, 2000);
+  const scheduleReconnect = (why: string) => {
+    if (stopped || finished) {
+      return;
     }
-  });
-  ws.addEventListener("message", (ev) => {
+    ui.wait.classList.remove("hidden");
+    if (preparing || busy) {
+      ui.wait.textContent = preparing ? "preparing match…" : "match busy — retrying";
+      reconnectAttempts = 0;
+      clearReconnect();
+      reconnectTimer = window.setTimeout(() => {
+        openSocket();
+      }, 400);
+      return;
+    }
+    reconnectAttempts += 1;
+    if (reconnectAttempts > maxReconnects) {
+      ui.wait.textContent = "desync — reloading";
+      window.location.reload();
+      return;
+    }
+    ui.wait.textContent = why;
+    clearReconnect();
+    reconnectTimer = window.setTimeout(() => {
+      openSocket();
+    }, 400);
+  };
+
+  const onMessage = (ev: MessageEvent) => {
     const msg = JSON.parse(String(ev.data)) as ServerMsg;
+    // After last-round End or a terminal Error, ignore the rest of this
+    // socket — including a later Error. Shutdown drain defaults to
+    // `outdated` when get_match is busy and must not replace expiry
+    // text or a replay URL. A terminal Error still wins over Hello
+    // that has not set `finished`.
+    if (finished) {
+      return;
+    }
     if (msg.type === "hello") {
       const hello = msg as Hello;
       role = hello.your_role;
@@ -170,9 +341,46 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       confirmed = hello.confirmed_tick;
       oursName = hello.ours;
       theirsName = hello.theirs;
-      fight = WasmFight.from_seed(hello.seed_lo, hello.seed_hi);
+      round = hello.round ?? 0;
+      totalRounds = hello.total_rounds ?? 1;
+      path = hello.path ?? "";
+      hunkIndex = hello.hunk_index ?? 0;
+      youAre = hello.you_are ?? "";
+      nextSend = Math.max(0, confirmed + 1);
+      // A leftover key from the previous KO must not confirm on the new
+      // round. The server drops Input with the old Hello `round`; held
+      // buttons would be sent with the new one.
+      held = 0;
+      heldTheirs = 0;
+      finished = false;
+      preparing = false;
+      busy = false;
+      reconnectAttempts = 0;
+      ui.ko.classList.add("hidden");
+      fight = fightFromWire(
+        hello.seed_lo,
+        hello.seed_hi,
+        hello.ours_hp,
+        hello.ours_armor,
+        hello.ours_special,
+        hello.theirs_hp,
+        hello.theirs_armor,
+        hello.theirs_special,
+      );
       if (role === "spectator") {
-        ui.wait.textContent = "spectating";
+        ui.wait.classList.remove("hidden");
+        if (!ui.wait.querySelector("[data-testid=\"github-login\"]")) {
+          ui.wait.textContent = youAre ? `spectating as ${youAre}` : "spectating";
+          if (!youAre) {
+            void offerGithubLogin(matchId, ui);
+          }
+        }
+      } else {
+        const who = hello.you_are ? hello.you_are : hello.your_role;
+        ui.wait.textContent =
+          role === "both"
+            ? `you are ${who} · both sides`
+            : `you are ${who} · waiting for opponent…`;
       }
     } else if (msg.type === "tick") {
       const tick = msg as TickMsg;
@@ -182,20 +390,144 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       if (tick.n === fight.tick()) {
         fight.step(tick.ours, tick.theirs);
         confirmed = tick.n;
+        nextSend = Math.max(nextSend, confirmed + 1);
         ui.wait.classList.add("hidden");
+      }
+    } else if (msg.type === "hash") {
+      const hash = msg as HashMsg;
+      if (!fight || finished) {
+        return;
+      }
+      if (hash.n !== fight.tick() || !hashesMatch(fight, hash.hi, hash.lo)) {
+        ui.wait.classList.remove("hidden");
+        ui.wait.textContent = "desync — reconnecting";
+        ws?.close();
+      }
+    } else if (msg.type === "snapshot") {
+      const snap = msg as SnapshotMsg;
+      const expect = snap.confirmed_tick < 0 ? 0 : snap.confirmed_tick + 1;
+      if (!fight || fight.tick() !== expect) {
+        applySnapshot(snap);
       }
     } else if (msg.type === "end") {
       const end = msg as EndMsg;
-      finished = true;
+      const matchOver = end.match_over === true;
+      const endedRound = end.round ?? round;
       ui.wait.classList.add("hidden");
       showKo(ui.ko, end.result);
-      ui.resolved.textContent = `replay /replay/${matchId}`;
+      if (matchOver) {
+        finished = true;
+      } else {
+        held = 0;
+        heldTheirs = 0;
+        // Next-round Hello is try_send. If it is late or dropped, Input
+        // tagged with the finished Hello `round` is ignored and --instant
+        // never idles — the canvas stays on "round 1/2".
+        round = endedRound + 1;
+        confirmed = -1;
+        nextSend = 0;
+      }
+      if (fight && end.tick === fight.tick() && !hashesMatch(fight, end.hash_hi, end.hash_lo)) {
+        ui.resolved.textContent = "desync — server result stands";
+      } else if (matchOver) {
+        ui.resolved.textContent = `replay /replay/${matchId}`;
+      } else {
+        ui.resolved.textContent = `round ${endedRound + 1}/${totalRounds}`;
+      }
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
       ui.wait.classList.remove("hidden");
-      ui.wait.textContent = err.message;
+      const terminal =
+        err.message === "expired" ||
+        err.message === "aborted" ||
+        err.message === "not found" ||
+        err.message === "outdated" ||
+        err.message === "finished";
+      if (err.message === "preparing") {
+        preparing = true;
+        busy = false;
+        ui.wait.textContent = "preparing match…";
+        reconnectAttempts = 0;
+        // Reconnect only runs on close. A scored-all preparing Error
+        // used to leave this socket open and mute.
+        ws?.close();
+      } else if (err.message === "busy") {
+        busy = true;
+        preparing = false;
+        ui.wait.textContent = "match busy — retrying";
+        reconnectAttempts = 0;
+        ws?.close();
+      } else if (err.message === "expired") {
+        preparing = false;
+        busy = false;
+        ui.wait.textContent = "this match expired";
+      } else if (err.message === "outdated") {
+        preparing = false;
+        busy = false;
+        ui.wait.textContent = "PR moved — comment /fight for a rematch";
+      } else if (err.message === "aborted") {
+        preparing = false;
+        busy = false;
+        ui.wait.textContent = "this match could not start";
+      } else if (err.message === "not found") {
+        preparing = false;
+        busy = false;
+        ui.wait.textContent = "match not found";
+      } else if (err.message === "finished") {
+        preparing = false;
+        busy = false;
+        ui.wait.textContent = "this match is over";
+        ui.resolved.textContent = `replay /replay/${matchId}`;
+      } else {
+        preparing = false;
+        busy = false;
+        ui.wait.textContent = err.message;
+      }
+      if (terminal) {
+        finished = true;
+        clearReconnect();
+        ws?.close();
+      }
     }
-  });
+  };
+
+  const openSocket = () => {
+    if (stopped || finished) {
+      return;
+    }
+    gen += 1;
+    const myGen = gen;
+    const socket = new WebSocket(wsUrl(matchId, token));
+    ws = socket;
+    socket.addEventListener("open", () => {
+      if (myGen !== gen || finished) {
+        return;
+      }
+      // Hello or Error owns the banner. A TCP open during clone must not
+      // flash "waiting for opponent…" over preparing/connecting.
+      if (preparing) {
+        ui.wait.textContent = "preparing match…";
+      } else if (busy) {
+        ui.wait.textContent = "match busy — retrying";
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (myGen !== gen) {
+        return;
+      }
+      if (!finished && !stopped) {
+        scheduleReconnect("disconnected — reconnecting");
+      }
+    });
+    socket.addEventListener("message", (ev) => {
+      if (myGen !== gen) {
+        return;
+      }
+      onMessage(ev);
+    });
+  };
+
+  openSocket();
 
   const loop = (now: number) => {
     if (stopped) {
@@ -206,19 +538,41 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     while (leftover >= tickMs) {
       leftover -= tickMs;
       const queued = keys.poll();
-      const latest = buttonsForRole(role, queued) || held;
-      if (role !== "spectator") {
+      if (role === "both") {
         const horizon = Math.max(0, confirmed + 1) + delay;
         if (nextSend <= horizon) {
-          flush(latest);
+          flush(queued.ours || held, queued.theirs || heldTheirs);
           held = 0;
+          heldTheirs = 0;
         } else {
-          held = latest;
+          held = queued.ours || held;
+          heldTheirs = queued.theirs || heldTheirs;
+        }
+      } else {
+        const latest = buttonsForRole(role, queued) || held;
+        if (role !== "spectator") {
+          const horizon = Math.max(0, confirmed + 1) + delay;
+          if (nextSend <= horizon) {
+            flush(latest, 0);
+            held = 0;
+          } else {
+            held = latest;
+          }
         }
       }
     }
     if (fight) {
-      paintFight(ui.stage, fight, oursName, theirsName, "online 1/1");
+      paintFight(
+        ui.stage,
+        fight,
+        oursName,
+        theirsName,
+        roundCaption("online", round, totalRounds, path),
+        path,
+        hunkIndex,
+        role,
+        youAre,
+      );
     }
     requestAnimationFrame(loop);
   };
@@ -227,8 +581,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   return {
     stop: () => {
       stopped = true;
+      clearReconnect();
+      gen += 1;
       keys.unbind();
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         ws.close();
       }
     },
@@ -249,15 +605,63 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
     seed: string;
     ticks: number[][];
     final_hash?: string;
+    ours_hp?: number;
+    ours_armor?: boolean;
+    ours_special?: boolean;
+    theirs_hp?: number;
+    theirs_armor?: boolean;
+    theirs_special?: boolean;
+    rounds?: Array<{
+      round: number;
+      seed_lo: number;
+      seed_hi: number;
+      ticks: number[][];
+      path?: string;
+      hunk_index?: number;
+      ours_hp?: number;
+      ours_armor?: boolean;
+      ours_special?: boolean;
+      theirs_hp?: number;
+      theirs_armor?: boolean;
+      theirs_special?: boolean;
+    }>;
   };
-  const seed = BigInt(data.seed);
-  const seedLo = Number(seed & 0xffffffffn);
-  const seedHi = Number(seed >> 32n);
-  const fight = WasmFight.from_seed(seedLo, seedHi);
-  const ticks = data.ticks ?? [];
+  const rounds =
+    data.rounds && data.rounds.length > 0
+      ? data.rounds
+      : [
+          {
+            round: 0,
+            seed_lo: Number(BigInt(data.seed) & 0xffffffffn),
+            seed_hi: Number(BigInt(data.seed) >> 32n),
+            ticks: data.ticks ?? [],
+            ours_hp: data.ours_hp,
+            ours_armor: data.ours_armor,
+            ours_special: data.ours_special,
+            theirs_hp: data.theirs_hp,
+            theirs_armor: data.theirs_armor,
+            theirs_special: data.theirs_special,
+          },
+        ];
+  const makeFight = (round: (typeof rounds)[0]): WasmFight =>
+    fightFromWire(
+      round.seed_lo,
+      round.seed_hi,
+      round.ours_hp,
+      round.ours_armor,
+      round.ours_special,
+      round.theirs_hp,
+      round.theirs_armor,
+      round.theirs_special,
+    );
+  let ri = 0;
+  let fight = makeFight(rounds[0]);
+  let ticks = rounds[0]?.ticks ?? [];
   let i = 0;
   let stopped = false;
   let finished = false;
+  let between = false;
+  let hold = 0;
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
   let last = performance.now();
@@ -277,10 +681,31 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
     last = now;
     while (leftover >= tickMs) {
       leftover -= tickMs;
+      if (hold > 0) {
+        hold -= 1;
+        continue;
+      }
+      if (between) {
+        between = false;
+        ri += 1;
+        const next = rounds[ri];
+        fight = makeFight(next);
+        ticks = next.ticks ?? [];
+        i = 0;
+        ui.ko.classList.add("hidden");
+        continue;
+      }
       if (i < ticks.length) {
         const pair = ticks[i] ?? [0, 0];
         fight.step(pair[0] ?? 0, pair[1] ?? 0);
         i += 1;
+      } else if (ri + 1 < rounds.length) {
+        const result = fight.result();
+        if (result !== -1) {
+          showKo(ui.ko, result);
+        }
+        hold = Math.max(1, Math.floor(tps / 2));
+        between = true;
       } else if (!finished) {
         finished = true;
         const result = fight.result();
@@ -290,7 +715,18 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
         ui.resolved.textContent = data.final_hash ? `hash ${data.final_hash}` : "";
       }
     }
-    paintFight(ui.stage, fight, "ours", "theirs", "replay 1/1");
+    const current = rounds[ri];
+    paintFight(
+      ui.stage,
+      fight,
+      "ours",
+      "theirs",
+      roundCaption("replay", ri, rounds.length, current?.path ?? ""),
+      current?.path,
+      current?.hunk_index,
+      "spectator",
+      "",
+    );
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
@@ -300,6 +736,32 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
       keys.unbind();
     },
   };
+}
+
+async function offerGithubLogin(matchId: string, ui: OnlineUi): Promise<void> {
+  try {
+    const info = await fetch(`/api/matches/${matchId}`, { credentials: "include" });
+    if (!info.ok) {
+      return;
+    }
+    const body = (await info.json()) as { ours_login?: string; theirs_login?: string };
+    if (!body.ours_login && !body.theirs_login) {
+      return;
+    }
+    const me = await fetch("/api/me", { credentials: "include" });
+    if (me.ok) {
+      return;
+    }
+    ui.wait.textContent = "";
+    const a = document.createElement("a");
+    a.href = `/auth/github?return=/match/${matchId}`;
+    a.textContent = "log in with GitHub to take a fighter slot";
+    a.dataset.testid = "github-login";
+    ui.wait.appendChild(a);
+    ui.wait.classList.remove("hidden");
+  } catch {
+    /* offline */
+  }
 }
 
 export async function hostMatch(): Promise<void> {

@@ -238,7 +238,9 @@ impl FightState {
         h
     }
 
-    pub fn cpu_input(&mut self, side: Side) -> Input {
+    /// Pick a CPU button from the current frame. Does **not** advance `rng`:
+    /// lockstep clients apply the Tick buttons and must hash the same state.
+    pub fn cpu_input(&self, side: Side) -> Input {
         let me = match side {
             Side::Ours => &self.ours,
             Side::Theirs => &self.theirs,
@@ -252,7 +254,7 @@ impl FightState {
         };
         let dist = (self.theirs.x - self.ours.x).unsigned_abs();
         let foe_attacking = matches!(foe.anim, Anim::Attack { .. });
-        let roll = self.rng.next_bounded(10);
+        let roll = self.cpu_roll(side);
         if foe_attacking && dist < 20 && roll < 6 {
             return Input::Block;
         }
@@ -265,6 +267,19 @@ impl FightState {
             7 => Input::Block,
             _ => Input::None,
         }
+    }
+
+    fn cpu_roll(&self, side: Side) -> u32 {
+        let mut rng = self.rng.clone();
+        let side_bit = match side {
+            Side::Ours => 0u64,
+            Side::Theirs => 1,
+        };
+        rng.state = rng
+            .state
+            .wrapping_add(u64::from(self.tick).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_add(side_bit.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        rng.next_bounded(10)
     }
 
     pub fn step(&mut self, ours_in: Input, theirs_in: Input) {
@@ -665,6 +680,28 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn cpu_choice_does_not_change_hash() {
+        let f = FightState::new(9, FighterStats::default(), FighterStats::default());
+        let before = f.state_hash();
+        let _ = f.cpu_input(Side::Theirs);
+        let _ = f.cpu_input(Side::Ours);
+        assert_eq!(before, f.state_hash());
+    }
+
+    #[test]
+    fn recorded_cpu_buttons_match_on_a_second_sim() {
+        let mut server = FightState::new(9, FighterStats::default(), FighterStats::default());
+        let mut client = FightState::new(9, FighterStats::default(), FighterStats::default());
+        for _ in 0..80 {
+            let cpu = server.cpu_input(Side::Theirs);
+            assert_eq!(server.state_hash(), client.state_hash());
+            server.step(Input::Punch, cpu);
+            client.step(Input::Punch, cpu);
+            assert_eq!(server.state_hash(), client.state_hash());
+        }
     }
 
     #[test]

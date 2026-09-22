@@ -22,7 +22,7 @@ jobs:
       - name: Core compiles to wasm
         run: cargo check -p git-fight-core --target wasm32-unknown-unknown
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: sh scripts/install-wasm-pack.sh
       - name: Golden test in WebAssembly (Node)
         run: wasm-pack test --node crates/wasm
       - uses: actions/setup-node@v4
@@ -36,3 +36,86 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
           npm test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t git-fight:ci .
+      - name: Boot image local demo and GitHub App mode
+        run: |
+          set -euo pipefail
+          wait_health() {
+            local url="$1"
+            for _ in $(seq 1 60); do
+              if curl -fsS "$url/health"; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "container never became healthy at $url"
+            return 1
+          }
+          # Health is not /fight. The image must serve the canvas + WASM
+          # on `/` and the match SPA, or a deploy cannot play.
+          assert_client() {
+            python3 scripts/assert-docker-client.py "$1"
+          }
+          cleanup() {
+            docker logs git-fight-ci 2>/dev/null || true
+            docker logs git-fight-ci-app 2>/dev/null || true
+            docker rm -f git-fight-ci git-fight-ci-app git-fight-ci-partial 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name git-fight-ci -p 127.0.0.1:8080:8080 git-fight:ci
+          wait_health http://127.0.0.1:8080
+          assert_client http://127.0.0.1:8080
+          create=$(curl -sS -o /tmp/create.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8080/api/matches \
+            -H 'Content-Type: application/json' -d '{}')
+          test "$create" = 200
+          grep -q ours_token /tmp/create.json
+          grep -q theirs_token /tmp/create.json
+          docker rm -f git-fight-ci
+
+          pem=$(awk '{printf "%s\\n", $0}' crates/server/tests/fixtures/app_key.txt)
+          docker run -d --name git-fight-ci-app -p 127.0.0.1:8080:8080 \
+            -e GITHUB_APP_ID=1 \
+            -e "GITHUB_APP_PRIVATE_KEY=$pem" \
+            -e GITHUB_CLIENT_ID=Iv1.testclient \
+            -e GITHUB_CLIENT_SECRET=client-secret-for-tests \
+            -e GITHUB_WEBHOOK_SECRET=webhook-secret-for-tests \
+            -e SESSION_KEY=session-key-session-key-session! \
+            -e GIT_FIGHT_PUBLIC_URL=http://127.0.0.1:8080 \
+            git-fight:ci
+          wait_health http://127.0.0.1:8080
+          assert_client http://127.0.0.1:8080
+          unsigned=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8080/webhooks/github \
+            -H 'Content-Type: application/json' -d '{"action":"created"}')
+          test "$unsigned" = 401
+          mint=$(curl -sS -o /tmp/mint.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8080/api/matches \
+            -H 'Content-Type: application/json' -d '{}')
+          test "$mint" = 404
+          if grep -q ours_token /tmp/mint.json; then
+            echo "GitHub App image must not mint local tokens"
+            exit 1
+          fi
+          loc=$(curl -sS -D - -o /dev/null 'http://127.0.0.1:8080/auth/github?return=/match/abc')
+          echo "$loc" | grep -qi '^location: https://github.com/login/oauth/authorize?'
+          echo "$loc" | grep -q 'code_challenge_method=S256'
+          docker rm -f git-fight-ci-app
+
+          set +e
+          timeout 20 docker run --rm --name git-fight-ci-partial \
+            -e GITHUB_CLIENT_ID=Iv1.testclient \
+            git-fight:ci
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ] || [ "$code" -eq 124 ]; then
+            echo "partial App env must not listen (exit $code)"
+            exit 1
+          fi
