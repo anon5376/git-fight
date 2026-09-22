@@ -326,9 +326,12 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
 
   const onMessage = (ev: MessageEvent) => {
     const msg = JSON.parse(String(ev.data)) as ServerMsg;
-    // Terminal Error (outdated / finished / …) wins over a queued Hello
-    // still sitting on the same socket.
-    if (finished && msg.type !== "error") {
+    // After last-round End or a terminal Error, ignore the rest of this
+    // socket — including a later Error. Shutdown drain defaults to
+    // `outdated` when get_match is busy and must not replace expiry
+    // text or a replay URL. A terminal Error still wins over Hello
+    // that has not set `finished`.
+    if (finished) {
       return;
     }
     if (msg.type === "hello") {
