@@ -1407,10 +1407,25 @@ fn terminal_ws_error(row: &MatchRow) -> String {
         .to_string()
 }
 
+/// Busy SQLite is preparing (canvas reconnects). Only a real miss is
+/// terminal `not found`. A known row uses its closed-room Error.
+fn closed_ws_lookup_followup(row: Result<Option<()>, ()>) -> &'static str {
+    match row {
+        Ok(Some(())) => "terminal",
+        Ok(None) => "not found",
+        Err(()) => "preparing",
+    }
+}
+
 async fn closed_message(pool: &SqlitePool, id: &str) -> String {
-    match db::get_match(pool, id).await {
+    let looked = match db::get_match(pool, id).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::get_match(pool, id).await,
+    };
+    match looked {
         Ok(Some(row)) => terminal_ws_error(&row),
-        _ => "finished".into(),
+        Ok(None) => closed_ws_lookup_followup(Ok(None)).into(),
+        Err(_) => closed_ws_lookup_followup(Err(())).into(),
     }
 }
 
@@ -2375,6 +2390,13 @@ mod tests {
             closed_finish_followup(true, LastRoundStatus::Unknown),
             LastRound::Retry,
             "busy get_match must not send Error {{ finished }} in place of End"
+        );
+        assert_eq!(closed_ws_lookup_followup(Ok(Some(()))), "terminal");
+        assert_eq!(closed_ws_lookup_followup(Ok(None)), "not found");
+        assert_eq!(
+            closed_ws_lookup_followup(Err(())),
+            "preparing",
+            "a busy closed-room get_match must not lock the canvas on finished"
         );
         assert_eq!(latched_forfeit_followup(false, false, true), "finish");
         assert_eq!(

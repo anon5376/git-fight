@@ -274,19 +274,37 @@ impl AppState {
         }
     }
 
+    /// Rematch text is only for a row that actually aborted as outdated.
+    /// A finish that won the race dequeues without commenting.
+    fn abort_comment_followup(stored: Result<Option<&str>, ()>) -> &'static str {
+        match stored {
+            Err(()) => "retry",
+            Ok(Some("outdated")) => "comment",
+            Ok(Some(_)) | Ok(None) => "dequeue",
+        }
+    }
+
     async fn comment_abort_outcome(&self, id: &str, reason: &str) -> bool {
         if reason != "outdated" {
             return true;
         }
-        let Ok(row) = db::get_match(&self.pool, id).await else {
-            return false;
+        let looked = match db::get_match(&self.pool, id).await {
+            Ok(v) => v,
+            Err(_) => return false,
         };
-        let Some(row) = row else {
-            return true;
-        };
-        crate::result::comment_outdated(&self.result_ctx(), &row)
-            .await
-            .is_ok()
+        match Self::abort_comment_followup(Ok(looked
+            .as_ref()
+            .and_then(|r| r.abort_reason.as_deref())))
+        {
+            "comment" => match looked {
+                Some(row) => crate::result::comment_outdated(&self.result_ctx(), &row)
+                    .await
+                    .is_ok(),
+                None => true,
+            },
+            "retry" => false,
+            _ => true,
+        }
     }
 
     async fn retry_start_notes(&self) {
@@ -1347,6 +1365,53 @@ mod tests {
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
         assert!(state.pending_aborts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn outdated_comment_requires_a_stored_outdated_abort() {
+        assert_eq!(
+            AppState::abort_comment_followup(Ok(Some("outdated"))),
+            "comment"
+        );
+        assert_eq!(
+            AppState::abort_comment_followup(Ok(None)),
+            "dequeue",
+            "a vanished row must not keep the rematch queue"
+        );
+        assert_eq!(
+            AppState::abort_comment_followup(Ok(Some("expired"))),
+            "dequeue",
+            "a later close must not get SHA-drift rematch text"
+        );
+        assert_eq!(
+            AppState::abort_comment_followup(Err(())),
+            "retry",
+            "a busy get_match must keep the abort queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_pending_aborts_does_not_mark_a_finished_row_outdated() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "finab", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        assert!(crate::db::finish_open_match(&pool, "finab", "deadbeef")
+            .await
+            .unwrap());
+        let state = test_state(pool.clone());
+        state.queue_abort("finab".into(), "outdated".into());
+        state.retry_pending_aborts().await;
+        let row = crate::db::get_match(&pool, "finab").await.unwrap().unwrap();
+        assert_eq!(row.status, "finished");
+        assert!(
+            row.abort_reason.is_none(),
+            "finish must stay mutually exclusive with an outdated skip: {row:?}"
+        );
+        assert!(
+            state.pending_aborts.lock().unwrap().is_empty(),
+            "a finished row must dequeue without an outdated rematch comment"
+        );
     }
 
     #[tokio::test]
