@@ -417,27 +417,24 @@ async fn push_result_git(
             ),
         ));
     }
-    match gitutil::inspect_result_ref(
-        dest,
-        url,
-        branch,
-        match_id,
-        &row.pr_head_sha,
-        &row.pr_base_sha,
-        bearer,
-    )
-    .await
-    {
-        Ok(ExistingResult::Ours) => return Ok(()),
-        Ok(ExistingResult::Foreign) => {
-            return Err((
-                "exists",
-                format!(
-                    "git fight: nothing pushed — `{branch}` already exists. The bot never overwrites a branch. Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
-                ),
-            ));
-        }
-        Ok(ExistingResult::Missing) | Err(_) => {}
+    match inspect_push_followup(
+        gitutil::inspect_result_ref(
+            dest,
+            url,
+            branch,
+            match_id,
+            &row.pr_head_sha,
+            &row.pr_base_sha,
+            bearer,
+        )
+        .await
+        .map_err(|_| ()),
+        false,
+    ) {
+        "done" => return Ok(()),
+        "exists" => return Err(("exists", exists_skip_body(public, branch, match_id))),
+        "retry" => return Err(("push", inspect_retry_body(public, branch, match_id))),
+        _ => {}
     }
     if gitutil::fetch_pr_objects(
         dest,
@@ -555,21 +552,61 @@ async fn push_result_git(
         }
     };
     if let Err(e) = gitutil::push_create_only(dest, url, &commit, branch, bearer).await {
-        let exists = e.to_string().contains("already exists");
-        let reason = if exists { "exists" } else { "push" };
-        let why = if exists {
-            format!("`{branch}` already exists. The bot never overwrites a branch.")
-        } else {
-            format!("could not create `{branch}`.")
-        };
+        if e.to_string().contains("already exists") {
+            return match inspect_push_followup(
+                gitutil::inspect_result_ref(
+                    dest,
+                    url,
+                    branch,
+                    match_id,
+                    &row.pr_head_sha,
+                    &row.pr_base_sha,
+                    bearer,
+                )
+                .await
+                .map_err(|_| ()),
+                true,
+            ) {
+                "done" => Ok(()),
+                "exists" => Err(("exists", exists_skip_body(public, branch, match_id))),
+                _ => Err(("push", inspect_retry_body(public, branch, match_id))),
+            };
+        }
         return Err((
-            reason,
+            "push",
             format!(
-                "git fight: nothing pushed — {why} Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
+                "git fight: nothing pushed — could not create `{branch}`. Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
             ),
         ));
     }
     Ok(())
+}
+
+/// Ours = crash recovery. Foreign = someone else's tip (skip). Unread, or
+/// Missing after the create-only push already saw the ref, is retry.
+fn inspect_push_followup(
+    inspected: Result<ExistingResult, ()>,
+    after_exists: bool,
+) -> &'static str {
+    match inspected {
+        Ok(ExistingResult::Ours) => "done",
+        Ok(ExistingResult::Foreign) => "exists",
+        Ok(ExistingResult::Missing) if after_exists => "retry",
+        Ok(ExistingResult::Missing) => "build",
+        Err(()) => "retry",
+    }
+}
+
+fn exists_skip_body(public: &str, branch: &str, match_id: &str) -> String {
+    format!(
+        "git fight: nothing pushed — `{branch}` already exists. The bot never overwrites a branch. Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
+    )
+}
+
+fn inspect_retry_body(public: &str, branch: &str, match_id: &str) -> String {
+    format!(
+        "git fight: nothing pushed — could not inspect `{branch}`. Comment `/fight` for a rematch.\nreplay: {public}/replay/{match_id}"
+    )
 }
 
 /// Draw / forfeit / outdated / exists / gone PR. Not clone, token, or push I/O.
@@ -840,5 +877,40 @@ mod tests {
         for reason in ["clone", "push", "pull", "token"] {
             assert!(!is_decision_skip(reason), "{reason}");
         }
+    }
+
+    #[test]
+    fn unread_result_ref_retries_instead_of_exists_skip() {
+        assert_eq!(
+            inspect_push_followup(Ok(ExistingResult::Ours), false),
+            "done"
+        );
+        assert_eq!(
+            inspect_push_followup(Ok(ExistingResult::Foreign), false),
+            "exists"
+        );
+        assert_eq!(
+            inspect_push_followup(Ok(ExistingResult::Missing), false),
+            "build"
+        );
+        assert_eq!(
+            inspect_push_followup(Err(()), false),
+            "retry",
+            "an unread advertised tip must not write exists"
+        );
+        assert_eq!(
+            inspect_push_followup(Ok(ExistingResult::Missing), true),
+            "retry",
+            "ls-remote after a create-only race is not a foreign branch"
+        );
+        assert_eq!(
+            inspect_push_followup(Ok(ExistingResult::Ours), true),
+            "done"
+        );
+        assert_eq!(
+            inspect_push_followup(Ok(ExistingResult::Foreign), true),
+            "exists"
+        );
+        assert_eq!(inspect_push_followup(Err(()), true), "retry");
     }
 }

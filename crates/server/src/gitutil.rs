@@ -1139,6 +1139,31 @@ async fn cat_commit(dir: &Path, sha: &str, bearer: Option<&str>) -> Result<Strin
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// Classify a result-ref tip. `Foreign` only after a successful `cat-file`
+/// that is not this match. An advertised ref with no readable commit is
+/// unread (`Err`) so publish retries instead of writing an `exists` skip.
+pub(crate) fn inspect_result_followup(
+    remote: bool,
+    have_sha: bool,
+    cat: Result<&str, ()>,
+    match_id: &str,
+    head: &str,
+    base: &str,
+) -> Result<ExistingResult, ()> {
+    if !have_sha {
+        return if remote {
+            Err(())
+        } else {
+            Ok(ExistingResult::Missing)
+        };
+    }
+    match cat {
+        Ok(raw) if commit_is_match_result(raw, match_id, head, base) => Ok(ExistingResult::Ours),
+        Ok(_) => Ok(ExistingResult::Foreign),
+        Err(()) => Err(()),
+    }
+}
+
 /// After clone: the create-only ref is missing, already this match, or someone else's.
 pub async fn inspect_result_ref(
     dir: &Path,
@@ -1165,16 +1190,16 @@ pub async fn inspect_result_ref(
                 .ok();
         }
     }
-    let Some(sha) = sha else {
-        return Ok(if remote {
-            ExistingResult::Foreign
-        } else {
-            ExistingResult::Missing
-        });
+    let cat = match sha.as_deref() {
+        Some(oid) => match cat_commit(dir, oid, bearer).await {
+            Ok(raw) => Ok(raw),
+            Err(_) => Err(()),
+        },
+        None => Err(()),
     };
-    match cat_commit(dir, &sha, bearer).await {
-        Ok(raw) if commit_is_match_result(&raw, match_id, head, base) => Ok(ExistingResult::Ours),
-        _ => Ok(ExistingResult::Foreign),
+    match inspect_result_followup(remote, sha.is_some(), cat.as_deref(), match_id, head, base) {
+        Ok(kind) => Ok(kind),
+        Err(()) => Err(GitError::Command("could not inspect result ref".into())),
     }
 }
 
@@ -1423,6 +1448,37 @@ mod tests {
             "author alice <alice@example.com>",
         );
         assert!(!commit_is_match_result(&human, "deadbeef", head, base));
+    }
+
+    #[test]
+    fn unread_result_ref_is_not_foreign() {
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let raw = format!(
+            "tree {head}\nparent {head}\nparent {base}\nauthor git-fight <git-fight@users.noreply.github.com> 1 +0000\ncommitter git-fight <git-fight@users.noreply.github.com> 1 +0000\n\ngit fight match deadbeef\n"
+        );
+        assert_eq!(
+            inspect_result_followup(false, false, Err(()), "deadbeef", head, base),
+            Ok(ExistingResult::Missing)
+        );
+        assert_eq!(
+            inspect_result_followup(true, false, Err(()), "deadbeef", head, base),
+            Err(()),
+            "an advertised ref with no SHA must retry, not exists-skip"
+        );
+        assert_eq!(
+            inspect_result_followup(true, true, Err(()), "deadbeef", head, base),
+            Err(()),
+            "a fetch whose commit cannot be read must retry, not exists-skip"
+        );
+        assert_eq!(
+            inspect_result_followup(true, true, Ok(raw.as_str()), "deadbeef", head, base),
+            Ok(ExistingResult::Ours)
+        );
+        assert_eq!(
+            inspect_result_followup(true, true, Ok(raw.as_str()), "otherid", head, base),
+            Ok(ExistingResult::Foreign)
+        );
     }
 
     #[test]
