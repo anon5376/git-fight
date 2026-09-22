@@ -359,12 +359,30 @@ impl AppState {
         }
     }
 
+    /// Dequeue only when the posted id is durable or the match row is
+    /// gone. `Ok(false)` on a still-NULL row must keep retrying.
+    fn pending_comment_id_followup(
+        set: Result<bool, ()>,
+        row: Result<Option<Option<i64>>, ()>,
+    ) -> bool {
+        match row {
+            Ok(None) => true,
+            Ok(Some(Some(id))) if id > 0 => true,
+            Ok(Some(_)) | Err(()) => set == Ok(true),
+        }
+    }
+
     async fn retry_pending_comment_ids(&self) {
         for (id, comment_id) in self.comments.pending_snapshot() {
-            if db::set_challenge_comment_id(&self.pool, &id, comment_id)
+            let set = db::set_challenge_comment_id(&self.pool, &id, comment_id)
                 .await
-                .is_ok()
-            {
+                .map_err(|_| ());
+            let row = match db::get_match(&self.pool, &id).await {
+                Ok(Some(row)) => Ok(Some(row.challenge_comment_id)),
+                Ok(None) => Ok(None),
+                Err(_) => Err(()),
+            };
+            if Self::pending_comment_id_followup(set, row) {
                 self.comments.dequeue_id(&id);
             }
         }
@@ -1398,6 +1416,54 @@ mod tests {
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("outdated"));
         assert!(state.pending_aborts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_comment_id_stays_queued_until_durable() {
+        assert!(AppState::pending_comment_id_followup(Ok(true), Err(())));
+        assert!(AppState::pending_comment_id_followup(
+            Ok(false),
+            Ok(Some(Some(99)))
+        ));
+        assert!(
+            AppState::pending_comment_id_followup(Ok(false), Ok(None)),
+            "a vanished match must drop the pending id"
+        );
+        assert!(
+            !AppState::pending_comment_id_followup(Ok(false), Ok(Some(None))),
+            "Ok(false) on a still-NULL row must not dequeue"
+        );
+        assert!(!AppState::pending_comment_id_followup(
+            Err(()),
+            Ok(Some(None))
+        ));
+        assert!(!AppState::pending_comment_id_followup(Err(()), Err(())));
+    }
+
+    #[tokio::test]
+    async fn retry_pending_comment_ids_stores_after_abort() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "cmt-retry", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(crate::db::abort_open_match(&pool, "cmt-retry", "outdated")
+            .await
+            .unwrap());
+        let state = test_state(pool.clone());
+        state.comments.queue_id("cmt-retry".into(), 77);
+        state.retry_pending_comment_ids().await;
+        assert_eq!(
+            crate::db::get_match(&pool, "cmt-retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .challenge_comment_id,
+            Some(77)
+        );
+        assert!(
+            !state.comments.has_pending("cmt-retry"),
+            "a stored id must leave the expirer queue"
+        );
     }
 
     #[test]

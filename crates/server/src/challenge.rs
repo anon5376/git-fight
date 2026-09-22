@@ -137,21 +137,46 @@ pub(crate) async fn persist_challenge_comment(
     }
 }
 
+/// `done` = id is durable. `retry` = busy SET. `queue` = still NULL.
+pub(crate) fn persist_id_followup(
+    set: Result<bool, ()>,
+    stored: Result<Option<i64>, ()>,
+) -> &'static str {
+    if set == Ok(true) || matches!(stored, Ok(Some(id)) if id > 0) {
+        "done"
+    } else if set.is_err() {
+        "retry"
+    } else {
+        "queue"
+    }
+}
+
 async fn persist_challenge_comment_id(
     pool: &SqlitePool,
     comments: &CommentTrack,
     match_id: &str,
     posted: u64,
 ) {
-    match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
-        Ok(_) => comments.unmark(match_id),
-        Err(_) => match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
-            Ok(_) => comments.unmark(match_id),
-            Err(_) => {
-                comments.queue_id(match_id.to_string(), posted as i64);
-                comments.unmark(match_id);
-            }
-        },
+    let set = match db::set_challenge_comment_id(pool, match_id, posted as i64).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::set_challenge_comment_id(pool, match_id, posted as i64)
+            .await
+            .map_err(|_| ()),
+    };
+    let stored = if set == Ok(true) {
+        Ok(Some(posted as i64))
+    } else {
+        match db::get_match(pool, match_id).await {
+            Ok(Some(row)) => Ok(row.challenge_comment_id),
+            Ok(None) => Ok(None),
+            Err(_) => Err(()),
+        }
+    };
+    if persist_id_followup(set, stored) == "done" {
+        comments.unmark(match_id);
+    } else {
+        comments.queue_id(match_id.to_string(), posted as i64);
+        comments.unmark(match_id);
     }
 }
 
@@ -988,6 +1013,47 @@ mod tests {
 
     fn first_or_retry(first: Result<bool, ()>, retry: Result<bool, ()>) -> Result<bool, ()> {
         first.or(retry)
+    }
+
+    #[test]
+    fn persist_id_queues_until_durable() {
+        assert_eq!(persist_id_followup(Ok(true), Err(())), "done");
+        assert_eq!(persist_id_followup(Ok(false), Ok(Some(99))), "done");
+        assert_eq!(
+            persist_id_followup(Ok(false), Ok(None)),
+            "queue",
+            "a refused SET on a still-NULL row must not drop the posted id"
+        );
+        assert_eq!(persist_id_followup(Err(()), Ok(None)), "retry");
+        assert_eq!(
+            persist_id_followup(Err(()), Ok(Some(99))),
+            "done",
+            "a busy SET after another writer stored the id is done"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_challenge_comment_stores_id_after_abort() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "cmt-abort", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(db::abort_open_match(&pool, "cmt-abort", "outdated")
+            .await
+            .unwrap());
+        let track = CommentTrack::default();
+        track.mark("cmt-abort");
+        persist_challenge_comment(&pool, &track, "cmt-abort", Ok(88)).await;
+        assert_eq!(
+            db::get_match(&pool, "cmt-abort")
+                .await
+                .unwrap()
+                .unwrap()
+                .challenge_comment_id,
+            Some(88)
+        );
+        assert!(!track.is_inflight("cmt-abort"));
+        assert!(!track.has_pending("cmt-abort"));
     }
 
     #[test]

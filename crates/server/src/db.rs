@@ -1445,6 +1445,9 @@ pub async fn get_player_stats(
 }
 
 /// Write-once. A later fight-link id cannot replace the first POST.
+/// A POST that landed before SET must still be recorded after finish
+/// or abort so outcome comments PATCH that comment instead of starting
+/// a second thread.
 pub async fn set_challenge_comment_id(
     pool: &SqlitePool,
     id: &str,
@@ -1455,8 +1458,7 @@ pub async fn set_challenge_comment_id(
     }
     let res = sqlx::query(
         "UPDATE matches SET challenge_comment_id = ?
-         WHERE id = ? AND challenge_comment_id IS NULL
-           AND status IN ('pending', 'in_progress')",
+         WHERE id = ? AND challenge_comment_id IS NULL",
     )
     .bind(comment_id)
     .bind(id)
@@ -1918,18 +1920,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn challenge_comment_id_is_not_set_after_abort() {
+    async fn challenge_comment_id_is_write_once_after_close() {
         let pool = connect("sqlite::memory:").await.unwrap();
         insert_match(&pool, "cmt2", 1, 3, "o", "t", 3600)
             .await
             .unwrap();
         assert!(abort_open_match(&pool, "cmt2", "outdated").await.unwrap());
         assert!(
-            !set_challenge_comment_id(&pool, "cmt2", 99).await.unwrap(),
-            "a closed row must not store a fight-link id"
+            set_challenge_comment_id(&pool, "cmt2", 99).await.unwrap(),
+            "a POST that won the last-ms gate must still store its id after abort"
+        );
+        assert!(
+            !set_challenge_comment_id(&pool, "cmt2", 100).await.unwrap(),
+            "the first fight-link id is write-once after abort"
         );
         let row = get_match(&pool, "cmt2").await.unwrap().unwrap();
-        assert!(row.challenge_comment_id.is_none());
+        assert_eq!(row.challenge_comment_id, Some(99));
+
+        insert_match(&pool, "cmt3", 1, 3, "o", "t", 3600)
+            .await
+            .unwrap();
+        assert!(finish_open_match(&pool, "cmt3", "hash").await.unwrap());
+        assert!(
+            set_challenge_comment_id(&pool, "cmt3", 77).await.unwrap(),
+            "a finished row must still store the posted fight-link id"
+        );
+        assert_eq!(
+            get_match(&pool, "cmt3")
+                .await
+                .unwrap()
+                .unwrap()
+                .challenge_comment_id,
+            Some(77)
+        );
     }
 
     #[tokio::test]
