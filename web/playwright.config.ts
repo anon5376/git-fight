@@ -9,16 +9,36 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:18080",
     trace: "on-first-retry",
   },
-  webServer: {
-    command:
-      "npm run build && cargo run -q --manifest-path ../Cargo.toml -p git-fight-server -- --bind 127.0.0.1:18080 --static dist --db sqlite://../target/playwright.db --instant",
-    url: "http://127.0.0.1:18080/health",
-    reuseExistingServer: !process.env.CI,
-    timeout: 180_000,
-    env: {
-      ...process.env,
-      SESSION_KEY: "session-key-session-key-session!",
+  webServer: [
+    {
+      command:
+        "env -u GITHUB_APP_ID -u GITHUB_APP_PRIVATE_KEY -u GITHUB_CLIENT_ID -u GITHUB_CLIENT_SECRET npm run build && cargo run -q --manifest-path ../Cargo.toml -p git-fight-server -- --bind 127.0.0.1:18080 --static dist --db sqlite://../target/playwright.db --instant",
+      url: "http://127.0.0.1:18080/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+      env: {
+        ...process.env,
+        SESSION_KEY: "session-key-session-key-session!",
+      },
     },
-  },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+    {
+      command: "sh ../scripts/playwright-app-env.sh",
+      url: "http://127.0.0.1:18081/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+    },
+  ],
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+      testIgnore: /github-app\.spec\.ts/,
+    },
+    {
+      name: "github-app",
+      use: { ...devices["Desktop Chrome"], baseURL: "http://127.0.0.1:18081" },
+      testMatch: /github-app\.spec\.ts/,
+    },
+  ],
 });
+
