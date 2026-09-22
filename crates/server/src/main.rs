@@ -105,7 +105,8 @@ async fn main() {
         eprintln!("bind: {e}");
         std::process::exit(1);
     });
-    eprintln!("git-fight-server on http://{}", args.bind);
+    let addr = listener.local_addr().unwrap_or(args.bind);
+    eprintln!("git-fight-server on http://{addr}");
     if let Err(e) = git_fight_server::serve(listener, pool, config).await {
         eprintln!("server: {e}");
         std::process::exit(1);
