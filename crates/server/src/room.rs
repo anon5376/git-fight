@@ -1462,6 +1462,42 @@ async fn drain_shutdown(pool: &SqlitePool, id: &str, conns: &BTreeMap<u64, Conn>
     );
 }
 
+async fn match_row_retry(pool: &SqlitePool, id: &str) -> Result<Option<MatchRow>, ()> {
+    match db::get_match(pool, id).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::get_match(pool, id).await.map_err(|_| ()),
+    }
+}
+
+/// A no-op `expire_open_match` is scored-all (stay) or already closed.
+/// Busy is not vanished and not scored-all.
+fn expire_noop_followup(row: Result<Option<&str>, ()>) -> &'static str {
+    match row {
+        Err(()) => "retry",
+        Ok(Some("expired" | "aborted" | "finished")) | Ok(None) => "close",
+        Ok(Some(_)) => "stay",
+    }
+}
+
+async fn close_expired_room(
+    rooms: &RoomMap,
+    id: &str,
+    conns: &BTreeMap<u64, Conn>,
+    result: Option<&ResultCtx>,
+    row: &MatchRow,
+) {
+    close_live_room(rooms, id).await;
+    let msg = encode(&ServerMsg::Error {
+        message: terminal_ws_error(row),
+    });
+    broadcast_or_spawn(conns, &msg);
+    if row.status == "expired" {
+        if let Some(ctx) = result {
+            ctx.queue_expired(id);
+        }
+    }
+}
+
 async fn expire_now(
     pool: &SqlitePool,
     id: &str,
@@ -1469,26 +1505,32 @@ async fn expire_now(
     result: Option<&ResultCtx>,
     rooms: &RoomMap,
 ) {
-    let row = db::get_match(pool, id).await.ok().flatten();
-    if let Some(row) = row.as_ref() {
+    let first = match_row_retry(pool, id).await;
+    if let Ok(Some(row)) = &first {
         if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
-            close_live_room(rooms, id).await;
-            let msg = encode(&ServerMsg::Error {
-                message: terminal_ws_error(row),
-            });
-            broadcast_or_spawn(conns, &msg);
+            close_expired_room(rooms, id, conns, result, row).await;
             return;
         }
     }
     if !db::expire_open_match(pool, id).await.unwrap_or(false) {
-        let row = db::get_match(pool, id).await.ok().flatten();
-        if let Some(row) = row.as_ref() {
-            if matches!(row.status.as_str(), "expired" | "aborted" | "finished") {
-                close_live_room(rooms, id).await;
-                let msg = encode(&ServerMsg::Error {
-                    message: terminal_ws_error(row),
-                });
-                broadcast_or_spawn(conns, &msg);
+        let looked = match_row_retry(pool, id).await;
+        let status = match &looked {
+            Err(()) => Err(()),
+            Ok(None) => Ok(None),
+            Ok(Some(row)) => Ok(Some(row.status.as_str())),
+        };
+        if expire_noop_followup(status) == "close" {
+            match looked {
+                Ok(Some(row)) => close_expired_room(rooms, id, conns, result, &row).await,
+                _ => {
+                    close_live_room(rooms, id).await;
+                    broadcast_or_spawn(
+                        conns,
+                        &encode(&ServerMsg::Error {
+                            message: "not found".into(),
+                        }),
+                    );
+                }
             }
         }
         return;
@@ -1500,9 +1542,9 @@ async fn expire_now(
         message: "expired".into(),
     });
     broadcast_or_spawn(conns, &msg);
-    let row = match row {
-        Some(r) => Some(r),
-        None => db::get_match(pool, id).await.ok().flatten(),
+    let row = match first {
+        Ok(Some(r)) => Some(r),
+        _ => match_row_retry(pool, id).await.ok().flatten(),
     };
     if let (Some(ctx), Some(row)) = (result, row.as_ref()) {
         let ctx = ctx.clone();
@@ -1946,6 +1988,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expire_noop_busy_is_not_a_scored_all_stay() {
+        assert_eq!(expire_noop_followup(Ok(Some("pending"))), "stay");
+        assert_eq!(expire_noop_followup(Ok(Some("in_progress"))), "stay");
+        assert_eq!(expire_noop_followup(Ok(Some("expired"))), "close");
+        assert_eq!(expire_noop_followup(Ok(Some("finished"))), "close");
+        assert_eq!(expire_noop_followup(Ok(Some("aborted"))), "close");
+        assert_eq!(expire_noop_followup(Ok(None)), "close");
+        assert_eq!(
+            expire_noop_followup(Err(())),
+            "retry",
+            "a busy no-op read must not drop the live room or treat scored-all as closed"
+        );
+    }
+
     #[tokio::test]
     async fn expire_now_closes_live_room_before_comment() {
         let pool = crate::db::connect("sqlite::memory:").await.unwrap();
@@ -1965,6 +2022,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "expired");
+    }
+
+    #[tokio::test]
+    async fn expire_now_closes_an_already_expired_row() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_match(&pool, "expready1", 1, 3, "o", "t", 60)
+            .await
+            .unwrap();
+        assert!(crate::db::expire_open_match(&pool, "expready1")
+            .await
+            .unwrap());
+        let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(8);
+        rooms.lock().await.insert("expready1".into(), tx);
+        expire_now(&pool, "expready1", &BTreeMap::new(), None, &rooms).await;
+        assert!(
+            rooms.lock().await.get("expready1").is_none(),
+            "an already-expired row must drop the live-room sender"
+        );
     }
 
     #[tokio::test]
