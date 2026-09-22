@@ -1145,7 +1145,7 @@ async fn cat_commit(dir: &Path, sha: &str, bearer: Option<&str>) -> Result<Strin
 pub(crate) fn inspect_result_followup(
     remote: bool,
     have_sha: bool,
-    cat: Result<&str, ()>,
+    cat: Option<&str>,
     match_id: &str,
     head: &str,
     base: &str,
@@ -1158,9 +1158,9 @@ pub(crate) fn inspect_result_followup(
         };
     }
     match cat {
-        Ok(raw) if commit_is_match_result(raw, match_id, head, base) => Ok(ExistingResult::Ours),
-        Ok(_) => Ok(ExistingResult::Foreign),
-        Err(()) => Err(()),
+        Some(raw) if commit_is_match_result(raw, match_id, head, base) => Ok(ExistingResult::Ours),
+        Some(_) => Ok(ExistingResult::Foreign),
+        None => Err(()),
     }
 }
 
@@ -1191,11 +1191,8 @@ pub async fn inspect_result_ref(
         }
     }
     let cat = match sha.as_deref() {
-        Some(oid) => match cat_commit(dir, oid, bearer).await {
-            Ok(raw) => Ok(raw),
-            Err(_) => Err(()),
-        },
-        None => Err(()),
+        Some(oid) => cat_commit(dir, oid, bearer).await.ok(),
+        None => None,
     };
     match inspect_result_followup(remote, sha.is_some(), cat.as_deref(), match_id, head, base) {
         Ok(kind) => Ok(kind),
@@ -1458,25 +1455,25 @@ mod tests {
             "tree {head}\nparent {head}\nparent {base}\nauthor git-fight <git-fight@users.noreply.github.com> 1 +0000\ncommitter git-fight <git-fight@users.noreply.github.com> 1 +0000\n\ngit fight match deadbeef\n"
         );
         assert_eq!(
-            inspect_result_followup(false, false, Err(()), "deadbeef", head, base),
+            inspect_result_followup(false, false, None, "deadbeef", head, base),
             Ok(ExistingResult::Missing)
         );
         assert_eq!(
-            inspect_result_followup(true, false, Err(()), "deadbeef", head, base),
+            inspect_result_followup(true, false, None, "deadbeef", head, base),
             Err(()),
             "an advertised ref with no SHA must retry, not exists-skip"
         );
         assert_eq!(
-            inspect_result_followup(true, true, Err(()), "deadbeef", head, base),
+            inspect_result_followup(true, true, None, "deadbeef", head, base),
             Err(()),
             "a fetch whose commit cannot be read must retry, not exists-skip"
         );
         assert_eq!(
-            inspect_result_followup(true, true, Ok(raw.as_str()), "deadbeef", head, base),
+            inspect_result_followup(true, true, Some(raw.as_str()), "deadbeef", head, base),
             Ok(ExistingResult::Ours)
         );
         assert_eq!(
-            inspect_result_followup(true, true, Ok(raw.as_str()), "otherid", head, base),
+            inspect_result_followup(true, true, Some(raw.as_str()), "otherid", head, base),
             Ok(ExistingResult::Foreign)
         );
     }
