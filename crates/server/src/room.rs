@@ -1455,7 +1455,13 @@ fn drain_shutdown_followup(row: Result<Option<(&str, Option<&str>)>, ()>) -> &'s
     match row {
         Err(()) => "preparing",
         Ok(None) => "not found",
-        Ok(Some((status, reason))) => closed_ws_message(status, reason).unwrap_or("outdated"),
+        Ok(Some((status, reason))) => match closed_ws_message(status, reason) {
+            Some("outdated") => "outdated",
+            Some("expired") => "expired",
+            Some("finished") => "finished",
+            Some("aborted") => "aborted",
+            Some(_) | None => "outdated",
+        },
     }
 }
 
