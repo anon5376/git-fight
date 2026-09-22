@@ -201,6 +201,26 @@ async fn github_app_env_only_client_id_exits() {
 }
 
 #[tokio::test]
+async fn github_app_env_evil_api_url_exits() {
+    let dir = git_fight_server::test_tmp_dir("gf-gh-boot-evilapi");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let mut cmd = Command::new(bin());
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    github_env(&mut cmd, &db, PEM);
+    cmd.env("GITHUB_API_URL", "https://evil.example");
+    let status = tokio::time::timeout(Duration::from_secs(15), cmd.status())
+        .await
+        .expect("exit timeout")
+        .expect("status");
+    assert!(
+        !status.success(),
+        "a GitHub App process must not talk to a non-github.com API"
+    );
+}
+
+#[tokio::test]
 async fn missing_app_env_is_local_demo() {
     let dir = git_fight_server::test_tmp_dir("gf-gh-boot-local");
     let db = format!("sqlite://{}/m.db", dir.display());
