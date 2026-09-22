@@ -1270,6 +1270,137 @@ async fn scored_all_without_terminal_sim_does_not_fake_hash() {
 }
 
 #[tokio::test]
+async fn scored_all_multi_round_finishes_without_hello() {
+    use git_fight_server::db::{NewHunk, NewMatch};
+    let dir = git_fight_server::test_tmp_dir("gf-scored-2round");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let pool = git_fight_server::db_connect(&db).await.unwrap();
+    let id = "scoredall2round0000000000000000";
+    git_fight_server::db::insert_full_match(
+        &pool,
+        &NewMatch {
+            id: id.into(),
+            seed: 11,
+            delay: 3,
+            ours_name: "alice".into(),
+            theirs_name: "bob".into(),
+            ours_kind: "github".into(),
+            theirs_kind: "github".into(),
+            ours_login: None,
+            theirs_login: None,
+            ours_token: "ours-token".into(),
+            theirs_token: "theirs-token".into(),
+            expire_secs: 3600,
+            installation_id: None,
+            owner: String::new(),
+            repo: String::new(),
+            pr_number: 0,
+            pr_head_sha: String::new(),
+            pr_base_sha: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::insert_hunks(
+        &pool,
+        &[
+            NewHunk {
+                match_id: id,
+                round: 0,
+                path: "a.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: Some("bob"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+            NewHunk {
+                match_id: id,
+                round: 1,
+                path: "b.rs",
+                hunk_index: 0,
+                ours: b"d",
+                theirs: b"e",
+                base: b"f",
+                theirs_login: None,
+                theirs_name: Some("carol"),
+                ours_stats: FighterStats::default(),
+                theirs_stats: FighterStats::default(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    git_fight_server::db::set_hunk_winner(&pool, id, 0, "forfeit_ours", false)
+        .await
+        .unwrap();
+    git_fight_server::db::set_hunk_winner(&pool, id, 1, "forfeit_theirs", false)
+        .await
+        .unwrap();
+    git_fight_server::db::insert_input(&pool, id, 0, 0, 1, 0)
+        .await
+        .unwrap();
+    git_fight_server::db::set_status(&pool, id, "in_progress", true, false, None, None)
+        .await
+        .unwrap();
+    let before = git_fight_server::db::load_all_inputs(&pool, id)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_pool = pool.clone();
+    tokio::spawn(async move {
+        git_fight_server::serve(
+            listener,
+            serve_pool,
+            Config {
+                instant: true,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut status = String::new();
+    for _ in 0..50 {
+        let row = git_fight_server::db::get_match(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        status = row.status;
+        if status == "finished" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        status, "finished",
+        "a scored-all multi-round fight must finish, not replay from round 0"
+    );
+    let after = git_fight_server::db::load_all_inputs(&pool, id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "finish-only must not append idle ticks on a later conflict"
+    );
+    let url = format!("ws://{addr}/ws?match={id}&token=ours-token");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_, mut stream) = ws.split();
+    let err = wait_type(&mut stream, "error").await;
+    assert_eq!(err["message"].as_str(), Some("finished"), "{err}");
+}
+
+#[tokio::test]
 async fn lag_holds_outbound_hello() {
     let addr = spawn_server(Config {
         lag: Duration::from_millis(80),

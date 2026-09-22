@@ -528,18 +528,23 @@ async fn run_room(
         }
         // A live last-round sim still owes End { match_over }. Do not
         // stop on try_finish_scored_all, which marks finished without
-        // broadcasting to sockets that were in the room.
-        if scored_all && sim.result.is_none() {
-            done = try_finish_scored_all(
-                &pool,
-                &id,
-                seed,
-                &hunks,
-                total_rounds,
-                settings.result.as_ref(),
-            )
-            .await;
-            continue;
+        // broadcasting to sockets that were in the room. An earlier
+        // round whose replay already has a KO must not fall through
+        // to finish() — that would End+Hello the next conflict.
+        match scored_all_followup(scored_all, round + 1 >= total_rounds, sim.result.is_some()) {
+            ScoredAllTick::FinishOnly => {
+                done = try_finish_scored_all(
+                    &pool,
+                    &id,
+                    seed,
+                    &hunks,
+                    total_rounds,
+                    settings.result.as_ref(),
+                )
+                .await;
+                continue;
+            }
+            ScoredAllTick::LiveFinish | ScoredAllTick::Play => {}
         }
         if !replay_ok {
             replay_ok = try_replay_round(
@@ -861,6 +866,25 @@ enum JoinAdmit {
     Unknown,
     ScoredAll,
     Enter,
+}
+
+/// After every hunk already has a winner: finish+publish, do not
+/// replay from round 0. Last-round sockets still owe End { match_over }.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScoredAllTick {
+    Play,
+    FinishOnly,
+    LiveFinish,
+}
+
+fn scored_all_followup(scored_all: bool, last_round: bool, sim_decided: bool) -> ScoredAllTick {
+    if !scored_all {
+        return ScoredAllTick::Play;
+    }
+    if last_round && sim_decided {
+        return ScoredAllTick::LiveFinish;
+    }
+    ScoredAllTick::FinishOnly
 }
 
 /// Local demo (`pr_number == 0`) may have no hunk rows. A GitHub
@@ -2139,6 +2163,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "pending");
+    }
+
+    #[test]
+    fn scored_all_earlier_round_does_not_advance() {
+        assert_eq!(scored_all_followup(false, false, true), ScoredAllTick::Play);
+        assert_eq!(
+            scored_all_followup(true, true, true),
+            ScoredAllTick::LiveFinish,
+            "last-round sockets still owe End {{ match_over }}"
+        );
+        assert_eq!(
+            scored_all_followup(true, true, false),
+            ScoredAllTick::FinishOnly
+        );
+        assert_eq!(
+            scored_all_followup(true, false, true),
+            ScoredAllTick::FinishOnly,
+            "a scored-all earlier round must not End+Hello the next conflict"
+        );
+        assert_eq!(
+            scored_all_followup(true, false, false),
+            ScoredAllTick::FinishOnly
+        );
     }
 
     #[test]
