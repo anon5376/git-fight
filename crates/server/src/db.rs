@@ -1614,6 +1614,34 @@ pub async fn list_stale_preparing_matches(
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
+/// Same predicate as `list_stale_preparing_matches`, one statement.
+/// A late `insert_hunks` must not be aborted as a failed clone.
+pub async fn abort_stale_preparing_matches(
+    pool: &SqlitePool,
+    older_than_secs: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    let cutoff = (Utc::now() - Duration::seconds(older_than_secs)).to_rfc3339();
+    let rows = sqlx::query_as::<_, (String,)>(
+        "UPDATE matches SET status = 'aborted',
+            finished_at = ?,
+            abort_reason = COALESCE(?, abort_reason)
+         WHERE status IN ('pending', 'in_progress')
+           AND pr_number > 0
+           AND created_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM match_hunks h WHERE h.match_id = matches.id
+           )
+         RETURNING id",
+    )
+    .bind(&now)
+    .bind("clone")
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Open GitHub fights that have hunks but never posted a challenge comment.
 pub async fn list_uncommented_open_matches(
     pool: &SqlitePool,
@@ -1845,6 +1873,87 @@ mod tests {
             vec!["prep1".to_string()],
             "local demo and a live clone window must not be aborted"
         );
+        assert_eq!(
+            abort_stale_preparing_matches(&pool, 120).await.unwrap(),
+            vec!["prep1".to_string()],
+            "one UPDATE must keep the hunk-less predicate"
+        );
+        assert_eq!(
+            get_match(&pool, "prep1").await.unwrap().unwrap().status,
+            "aborted"
+        );
+        assert_eq!(
+            get_match(&pool, "local").await.unwrap().unwrap().status,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_stale_preparing_does_not_kill_a_row_with_hunks() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        insert_full_match(
+            &pool,
+            &NewMatch {
+                id: "prep4".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let old = (Utc::now() - Duration::seconds(121)).to_rfc3339();
+        sqlx::query("UPDATE matches SET created_at = ? WHERE id = 'prep4'")
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_hunk(
+            &pool,
+            &NewHunk {
+                match_id: "prep4",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(list_stale_preparing_matches(&pool, 120)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            abort_stale_preparing_matches(&pool, 120)
+                .await
+                .unwrap()
+                .is_empty(),
+            "list-then-abort must not kill a match that grew hunks"
+        );
+        let row = get_match(&pool, "prep4").await.unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(row.abort_reason.is_none());
     }
 
     #[tokio::test]

@@ -403,13 +403,11 @@ impl AppState {
 
     async fn abort_stale_preparing(&self) {
         let older = crate::limits::GIT_JOB_TIMEOUT.as_secs() as i64;
-        let Ok(ids) = db::list_stale_preparing_matches(&self.pool, older).await else {
+        let Ok(ids) = db::abort_stale_preparing_matches(&self.pool, older).await else {
             return;
         };
         for id in ids {
-            if db::abort_open_match(&self.pool, &id, "clone").await.is_ok() {
-                self.close_room(&id).await;
-            }
+            self.close_room(&id).await;
         }
     }
 
@@ -1631,6 +1629,68 @@ mod tests {
         let row = crate::db::get_match(&pool, "prep2").await.unwrap().unwrap();
         assert_eq!(row.status, "aborted");
         assert_eq!(row.abort_reason.as_deref(), Some("clone"));
+    }
+
+    #[tokio::test]
+    async fn abort_stale_preparing_skips_a_match_that_grew_hunks() {
+        let pool = crate::db::connect("sqlite::memory:").await.unwrap();
+        crate::db::insert_full_match(
+            &pool,
+            &crate::db::NewMatch {
+                id: "prep3".into(),
+                seed: 1,
+                delay: 3,
+                ours_name: "a".into(),
+                theirs_name: "b".into(),
+                ours_kind: "github".into(),
+                theirs_kind: "cpu".into(),
+                ours_login: None,
+                theirs_login: None,
+                ours_token: String::new(),
+                theirs_token: String::new(),
+                expire_secs: 3600,
+                installation_id: Some(1),
+                owner: "acme".into(),
+                repo: "box".into(),
+                pr_number: 1,
+                pr_head_sha: "h".into(),
+                pr_base_sha: "b".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(121)).to_rfc3339();
+        sqlx::query("UPDATE matches SET created_at = ? WHERE id = 'prep3'")
+            .bind(&old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::db::insert_hunk(
+            &pool,
+            &crate::db::NewHunk {
+                match_id: "prep3",
+                round: 0,
+                path: "lib.rs",
+                hunk_index: 0,
+                ours: b"a",
+                theirs: b"b",
+                base: b"c",
+                theirs_login: None,
+                theirs_name: None,
+                ours_stats: git_fight_core::FighterStats::default(),
+                theirs_stats: git_fight_core::FighterStats::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let state = test_state(pool.clone());
+        state.abort_stale_preparing().await;
+        let row = crate::db::get_match(&pool, "prep3").await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "pending",
+            "hunks mean the clone finished; do not abort as clone"
+        );
+        assert!(row.abort_reason.is_none());
     }
 
     #[tokio::test]
