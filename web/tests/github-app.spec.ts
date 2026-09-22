@@ -25,7 +25,8 @@ INSERT INTO matches (
   ours_kind, theirs_kind, ours_token, theirs_token, input_delay_ticks,
   created_at, expires_at
 ) VALUES (
-  '${matchId}', 1, 'acme', 'box', 7, '${SHA}', '${BASE}',
+  -- installation_id stays NULL so finish does not call live api.github.com
+  '${matchId}', NULL, 'acme', 'box', 7, '${SHA}', '${BASE}',
   '9', 'pending', 'alice', NULL, 'alice', 'bob',
   'github', 'cpu', '', '', 3,
   '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'
