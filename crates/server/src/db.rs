@@ -2869,7 +2869,7 @@ mod tests {
         assert!(get_match(&pool, "inst-over").await.unwrap().is_none());
 
         assert_eq!(
-            insert_rated_match(&pool, &gh_match("under", 3, 1))
+            insert_rated_match(&pool, &gh_match("under", 3, 2))
                 .await
                 .unwrap(),
             InsertRated::Inserted
