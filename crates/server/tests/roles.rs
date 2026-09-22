@@ -645,7 +645,26 @@ async fn github_oauth_callback_sets_session() {
         .iter()
         .find(|r| r.url.path().ends_with("/access_token"))
         .expect("token exchange");
-    let posted: Value = serde_json::from_slice(&token.body).unwrap();
-    let verifier = posted["code_verifier"].as_str().unwrap_or("");
+    let ct = token
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("application/x-www-form-urlencoded"),
+        "live GitHub token exchange is form, not JSON: {ct}"
+    );
+    let posted = String::from_utf8_lossy(&token.body);
+    assert!(
+        !posted.trim_start().starts_with('{'),
+        "JSON body is not what github.com/login/oauth/access_token reads: {posted}"
+    );
+    let verifier = posted
+        .split("code_verifier=")
+        .nth(1)
+        .unwrap_or("")
+        .split('&')
+        .next()
+        .unwrap_or("");
     assert!(verifier.len() >= 43, "pkce verifier too short: {posted}");
 }

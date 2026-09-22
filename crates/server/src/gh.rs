@@ -573,14 +573,15 @@ impl GitHub {
             .http
             .post(format!("{}/login/oauth/access_token", self.oauth_base))
             .header("Accept", "application/json")
+            .header("Content-Type", "application/x-www-form-urlencoded")
             .header("User-Agent", "git-fight")
-            .json(&serde_json::json!({
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "code_verifier": code_verifier,
-            }))
+            .body(oauth_token_form(
+                &self.client_id,
+                &self.client_secret,
+                code,
+                redirect_uri,
+                code_verifier,
+            ))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -745,6 +746,26 @@ fn is_safe_email(s: &str) -> bool {
         })
 }
 
+/// GitHub's login host is not the REST API. Token exchange is
+/// `application/x-www-form-urlencoded` (RFC 6749 / GitHub App docs).
+/// A JSON body is what wiremock accepted; live github.com does not.
+fn oauth_token_form(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> String {
+    format!(
+        "client_id={}&client_secret={}&code={}&redirect_uri={}&code_verifier={}",
+        urlencoding(client_id),
+        urlencoding(client_secret),
+        urlencoding(code),
+        urlencoding(redirect_uri),
+        urlencoding(code_verifier),
+    )
+}
+
 fn urlencoding(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -904,5 +925,28 @@ mod tests {
         assert!(!is_safe_oauth_code(&"a".repeat(129)));
         assert!(!is_safe_oauth_code("code with space"));
         assert!(!is_safe_oauth_code("x&redirect=https://evil"));
+    }
+
+    #[test]
+    fn oauth_token_exchange_is_form_urlencoded() {
+        let body = oauth_token_form(
+            "cid",
+            "csec",
+            "abc",
+            "http://127.0.0.1:8080/auth/github/callback",
+            "verifier",
+        );
+        assert!(
+            !body.trim_start().starts_with('{'),
+            "live github.com/login/oauth/access_token is not JSON: {body}"
+        );
+        assert!(body.contains("client_id=cid"), "{body}");
+        assert!(body.contains("client_secret=csec"), "{body}");
+        assert!(body.contains("code=abc"), "{body}");
+        assert!(body.contains("code_verifier=verifier"), "{body}");
+        assert!(
+            body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fauth%2Fgithub%2Fcallback"),
+            "{body}"
+        );
     }
 }

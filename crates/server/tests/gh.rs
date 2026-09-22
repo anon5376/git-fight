@@ -704,3 +704,53 @@ async fn installation_token_caps_chunked_json_without_content_length() {
     );
     assert!(gh.installation_token(1).await.is_err());
 }
+
+#[tokio::test]
+async fn oauth_user_posts_form_not_json() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/oauth/access_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "ghu_test"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1,
+            "login": "alice"
+        })))
+        .mount(&mock)
+        .await;
+    let gh = client(&mock);
+    let verifier = "a".repeat(43);
+    let (id, login) = gh
+        .oauth_user(
+            "abc",
+            "http://127.0.0.1:8080/auth/github/callback",
+            &verifier,
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(login, "alice");
+    let rec = mock.received_requests().await.unwrap();
+    let token = rec
+        .iter()
+        .find(|r| r.url.path().ends_with("/access_token"))
+        .expect("token exchange");
+    let ct = token
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("application/x-www-form-urlencoded"), "{ct}");
+    let body = String::from_utf8_lossy(&token.body);
+    assert!(!body.trim_start().starts_with('{'), "{body}");
+    assert!(body.contains("code=abc"), "{body}");
+    assert!(
+        body.contains(&format!("code_verifier={verifier}")),
+        "{body}"
+    );
+}

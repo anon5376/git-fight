@@ -331,7 +331,7 @@ Repository permissions (nothing else):
 
 Subscribe to events: **Issue comment**, **Pull request**.
 
-User authorization is the App's web application flow so the match page knows the GitHub login. No extra account permissions. The user token is not kept.
+User authorization is the App's web application flow so the match page knows the GitHub login. No extra account permissions. The user token is not kept. Token exchange POSTs `application/x-www-form-urlencoded` to `https://github.com/login/oauth/access_token` (RFC 6749). That host is not the REST API; a JSON body is ignored there.
 
 `.github/git-fight.yml`:
 
