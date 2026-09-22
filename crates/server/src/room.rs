@@ -1448,12 +1448,26 @@ async fn drain_late_joins(rx: &mut mpsc::Receiver<RoomEvent>, pool: &SqlitePool,
     }
 }
 
+/// Busy is preparing (canvas reconnects). A still-open row is outdated
+/// because SHA-drift `close_room` can run before abort SQL. Vanished is
+/// not found. The first terminal Error sticks on the canvas.
+fn drain_shutdown_followup(row: Result<Option<(&str, Option<&str>)>, ()>) -> &'static str {
+    match row {
+        Err(()) => "preparing",
+        Ok(None) => "not found",
+        Ok(Some((status, reason))) => closed_ws_message(status, reason).unwrap_or("outdated"),
+    }
+}
+
 async fn drain_shutdown(pool: &SqlitePool, id: &str, conns: &BTreeMap<u64, Conn>) {
-    let row = db::get_match(pool, id).await.ok().flatten();
-    let message = row
-        .as_ref()
-        .and_then(|r| closed_ws_message(&r.status, r.abort_reason.as_deref()))
-        .unwrap_or("outdated");
+    let looked = match_row_retry(pool, id).await;
+    let message = match &looked {
+        Err(()) => drain_shutdown_followup(Err(())),
+        Ok(None) => drain_shutdown_followup(Ok(None)),
+        Ok(Some(row)) => {
+            drain_shutdown_followup(Ok(Some((row.status.as_str(), row.abort_reason.as_deref()))))
+        }
+    };
     broadcast_or_spawn(
         conns,
         &encode(&ServerMsg::Error {
@@ -2473,6 +2487,29 @@ mod tests {
             closed_ws_lookup_followup(Err(())),
             "preparing",
             "a busy closed-room get_match must not lock the canvas on finished"
+        );
+        assert_eq!(
+            drain_shutdown_followup(Ok(Some(("expired", Some("expired"))))),
+            "expired"
+        );
+        assert_eq!(
+            drain_shutdown_followup(Ok(Some(("finished", None)))),
+            "finished"
+        );
+        assert_eq!(
+            drain_shutdown_followup(Ok(Some(("aborted", Some("outdated"))))),
+            "outdated"
+        );
+        assert_eq!(
+            drain_shutdown_followup(Ok(Some(("in_progress", None)))),
+            "outdated",
+            "SHA-drift close_room before abort SQL still means rematch"
+        );
+        assert_eq!(drain_shutdown_followup(Ok(None)), "not found");
+        assert_eq!(
+            drain_shutdown_followup(Err(())),
+            "preparing",
+            "a busy Shutdown drain must not stick rematch text as the first Error"
         );
         assert_eq!(latched_forfeit_followup(false, false, true), "finish");
         assert_eq!(
