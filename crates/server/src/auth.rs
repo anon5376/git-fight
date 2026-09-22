@@ -63,14 +63,24 @@ pub fn verify_signed(key: &[u8], cookie: &str) -> Option<String> {
     }
 }
 
+/// Missing/invalid cookie or expired sid is `Ok(None)` (spectator).
+/// A busy sessions read is `Err` so `GET /ws` can send preparing
+/// instead of a ghost spectator Hello that starts no slot clock.
 pub async fn login_from_headers(
     pool: &SqlitePool,
     key: &[u8],
     headers: &HeaderMap,
-) -> Option<String> {
-    let raw = parse_cookie(headers, COOKIE)?;
-    let id = verify_signed(key, raw)?;
-    db::session_login(pool, &id).await.ok().flatten()
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(raw) = parse_cookie(headers, COOKIE) else {
+        return Ok(None);
+    };
+    let Some(id) = verify_signed(key, raw) else {
+        return Ok(None);
+    };
+    match db::session_login(pool, &id).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::session_login(pool, &id).await,
+    }
 }
 
 #[derive(Deserialize)]
@@ -230,8 +240,9 @@ fn pkce_challenge(verifier: &str) -> String {
 
 pub async fn me(State(state): State<crate::app::AppState>, headers: HeaderMap) -> Response {
     match login_from_headers(&state.pool, &state.auth.session_key, &headers).await {
-        Some(login) => axum::Json(serde_json::json!({ "login": login })).into_response(),
-        None => StatusCode::UNAUTHORIZED.into_response(),
+        Ok(Some(login)) => axum::Json(serde_json::json!({ "login": login })).into_response(),
+        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -270,6 +281,24 @@ mod tests {
         assert!(https.contains("SameSite=Lax"), "{https}");
         let http = cookie_attrs("http://127.0.0.1:8080", 60);
         assert!(!http.contains("Secure"), "{http}");
+    }
+
+    #[test]
+    fn session_lookup_followup_keeps_busy_off_spectator() {
+        assert_eq!(session_lookup_followup(Ok(Some(()))), "admit");
+        assert_eq!(session_lookup_followup(Ok(None)), "admit");
+        assert_eq!(
+            session_lookup_followup(Err(())),
+            "preparing",
+            "a busy sessions read is not an expired cookie"
+        );
+    }
+
+    fn session_lookup_followup(login: Result<Option<()>, ()>) -> &'static str {
+        match login {
+            Ok(_) => "admit",
+            Err(()) => "preparing",
+        }
     }
 
     #[test]

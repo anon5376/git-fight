@@ -413,8 +413,9 @@ impl AppState {
     }
 
     async fn room_tx(&self, row: &MatchRow) -> Result<mpsc::Sender<RoomEvent>, String> {
-        let Some(fresh) = db::get_match(&self.pool, &row.id).await.ok().flatten() else {
-            return Err("not found".into());
+        let fresh = match match_row_for_ws(&self.pool, &row.id).await {
+            Ok(fresh) => fresh,
+            Err(message) => return Err(message.into()),
         };
         if let Some(message) = closed_ws_message(&fresh.status, fresh.abort_reason.as_deref()) {
             self.unmark_closing(&fresh.id);
@@ -795,14 +796,58 @@ async fn reject_socket(mut socket: WebSocket, message: &str) {
     let _ = socket.send(Message::Text(body.into())).await;
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, q: WsQuery, login: Option<String>) {
+/// Busy SQLite is preparing (canvas reconnects). Only a real miss is
+/// the terminal `not found`.
+fn ws_row_lookup_followup(row: Result<Option<()>, ()>) -> &'static str {
+    match row {
+        Ok(Some(())) => "enter",
+        Ok(None) => "not found",
+        Err(()) => "preparing",
+    }
+}
+
+fn session_ws_followup(login: Result<Option<()>, ()>) -> &'static str {
+    match login {
+        Ok(_) => "admit",
+        Err(()) => "preparing",
+    }
+}
+
+async fn match_row_for_ws(pool: &SqlitePool, id: &str) -> Result<db::MatchRow, &'static str> {
+    let looked = match db::get_match(pool, id).await {
+        Ok(v) => Ok(v),
+        Err(_) => db::get_match(pool, id).await,
+    };
+    match looked {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(ws_row_lookup_followup(Ok(None))),
+        Err(_) => Err(ws_row_lookup_followup(Err(()))),
+    }
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    q: WsQuery,
+    login: Result<Option<String>, sqlx::Error>,
+) {
     if !is_match_id(&q.match_id) {
         reject_socket(socket, "not found").await;
         return;
     }
-    let Ok(Some(row)) = db::get_match(&state.pool, &q.match_id).await else {
-        reject_socket(socket, "not found").await;
-        return;
+    let row = match match_row_for_ws(&state.pool, &q.match_id).await {
+        Ok(row) => row,
+        Err(message) => {
+            reject_socket(socket, message).await;
+            return;
+        }
+    };
+    let login = match login {
+        Ok(login) => login,
+        Err(_) => {
+            reject_socket(socket, session_ws_followup(Err(()))).await;
+            return;
+        }
     };
     if let Some(message) = closed_ws_message(&row.status, row.abort_reason.as_deref()) {
         reject_socket(socket, message).await;
@@ -1132,6 +1177,28 @@ mod tests {
             join_miss_followup(None),
             "preparing",
             "a still-open row must Error so the canvas reconnects"
+        );
+    }
+
+    #[test]
+    fn busy_match_row_is_preparing_not_not_found() {
+        assert_eq!(ws_row_lookup_followup(Ok(Some(()))), "enter");
+        assert_eq!(ws_row_lookup_followup(Ok(None)), "not found");
+        assert_eq!(
+            ws_row_lookup_followup(Err(())),
+            "preparing",
+            "a SQLite blip must not lock the canvas on terminal not found"
+        );
+    }
+
+    #[test]
+    fn busy_session_is_preparing_not_spectator() {
+        assert_eq!(session_ws_followup(Ok(Some(()))), "admit");
+        assert_eq!(session_ws_followup(Ok(None)), "admit");
+        assert_eq!(
+            session_ws_followup(Err(())),
+            "preparing",
+            "a busy cookie lookup must not Hello as a ghost spectator"
         );
     }
 
