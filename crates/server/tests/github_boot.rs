@@ -153,3 +153,96 @@ async fn github_app_env_without_session_key_exits() {
         "a GitHub App process without SESSION_KEY must not listen"
     );
 }
+
+#[tokio::test]
+async fn github_app_env_junk_app_id_exits() {
+    let dir = git_fight_server::test_tmp_dir("gf-gh-boot-junkid");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let mut cmd = Command::new(bin());
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    github_env(&mut cmd, &db, PEM);
+    cmd.env("GITHUB_APP_ID", "not-a-number");
+    let status = tokio::time::timeout(Duration::from_secs(15), cmd.status())
+        .await
+        .expect("exit timeout")
+        .expect("status");
+    assert!(
+        !status.success(),
+        "a non-numeric GITHUB_APP_ID must not start as a local demo"
+    );
+}
+
+#[tokio::test]
+async fn github_app_env_only_client_id_exits() {
+    let dir = git_fight_server::test_tmp_dir("gf-gh-boot-partial");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let mut cmd = Command::new(bin());
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd.args(["--bind", "127.0.0.1:0", "--db", &db])
+        .env("GITHUB_CLIENT_ID", "Iv1.testclient")
+        .env_remove("GITHUB_APP_ID")
+        .env_remove("GITHUB_APP_PRIVATE_KEY")
+        .env_remove("GITHUB_CLIENT_SECRET")
+        .env_remove("GITHUB_WEBHOOK_SECRET")
+        .env_remove("SESSION_KEY")
+        .env_remove("GIT_FIGHT_PUBLIC_URL");
+    let status = tokio::time::timeout(Duration::from_secs(15), cmd.status())
+        .await
+        .expect("exit timeout")
+        .expect("status");
+    assert!(
+        !status.success(),
+        "a partial GitHub App env must not start as a local demo"
+    );
+}
+
+#[tokio::test]
+async fn missing_app_env_is_local_demo() {
+    let dir = git_fight_server::test_tmp_dir("gf-gh-boot-local");
+    let db = format!("sqlite://{}/m.db", dir.display());
+    let mut cmd = Command::new(bin());
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    cmd.args(["--bind", "127.0.0.1:0", "--db", &db])
+        .env_remove("GITHUB_APP_ID")
+        .env_remove("GITHUB_APP_PRIVATE_KEY")
+        .env_remove("GITHUB_CLIENT_ID")
+        .env_remove("GITHUB_CLIENT_SECRET")
+        .env_remove("GITHUB_WEBHOOK_SECRET")
+        .env_remove("SESSION_KEY")
+        .env_remove("GIT_FIGHT_PUBLIC_URL")
+        .env_remove("GITHUB_API_URL")
+        .env_remove("GITHUB_OAUTH_URL");
+    let mut child = cmd.spawn().unwrap();
+    let stderr = child.stderr.take().expect("stderr");
+    let addr = tokio::time::timeout(Duration::from_secs(15), read_listen_addr(stderr))
+        .await
+        .expect("server listen timeout")
+        .expect("listen addr");
+    let mut ready = false;
+    for _ in 0..80 {
+        if TcpStream::connect(addr).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(ready, "local demo process never accepted {addr}");
+    let (create, body, _) = http(
+        addr,
+        "POST",
+        "/api/matches",
+        &[("Content-Type", "application/json")],
+        b"{}",
+    )
+    .await;
+    assert_eq!(create, 200, "absent App env must still mint local tokens");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("ours_token"), "{text}");
+    assert!(text.contains("theirs_token"), "{text}");
+}

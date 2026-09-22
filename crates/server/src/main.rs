@@ -1,5 +1,4 @@
 use clap::Parser;
-use git_fight_server::gh::GitHub;
 use git_fight_server::Config;
 use std::env;
 use std::net::SocketAddr;
@@ -79,23 +78,12 @@ async fn main() {
     config.webhook_secret = env::var("GITHUB_WEBHOOK_SECRET")
         .ok()
         .map(|s| s.into_bytes());
-    config.github = match (
-        env::var("GITHUB_APP_ID"),
-        env::var("GITHUB_APP_PRIVATE_KEY"),
-        env::var("GITHUB_CLIENT_ID"),
-        env::var("GITHUB_CLIENT_SECRET"),
-    ) {
-        (Ok(id), Ok(pem), Ok(cid), Ok(csec)) => id.parse().ok().map(|app_id| {
-            GitHub::new(
-                env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
-                env::var("GITHUB_OAUTH_URL").unwrap_or_else(|_| "https://github.com".into()),
-                app_id,
-                pem.replace("\\n", "\n"),
-                cid,
-                csec,
-            )
-        }),
-        _ => None,
+    config.github = match git_fight_server::github_from_env() {
+        Ok(gh) => gh,
+        Err(name) => {
+            eprintln!("{name} is required when GitHub App credentials are set");
+            std::process::exit(1);
+        }
     };
     if let Err(name) = config.require_live_github_secrets() {
         eprintln!("{name} is required when GitHub App credentials are set");

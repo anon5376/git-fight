@@ -161,6 +161,8 @@ No `.env` in git. Export these in the shell, your process manager, or the contai
 | `GIT_FIGHT_PUBLIC_URL` | Required when GitHub App credentials are set. Local `http://127.0.0.1:8080` or `https://<your-host>` (OAuth `redirect_uri` and match links). Wildcard binds (`0.0.0.0`) are rejected — the Docker image binds `0.0.0.0:8080` and must set this to the public host. |
 | `DATABASE_URL` | Example: `sqlite://data/git-fight.db` |
 
+If any of the four App credentials is set, all four plus webhook secret, session key, and public URL are required or the process exits. It does not fall back to a local demo.
+
 Optional later: `--lag-ms` on the server binary (not a secret).
 
 Check git is **2.38+** (`git merge-tree --write-tree` exists):

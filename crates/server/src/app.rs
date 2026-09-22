@@ -81,6 +81,75 @@ impl Config {
     }
 }
 
+/// Parsed GitHub App credentials from process env.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubFromEnv {
+    pub app_id: u64,
+    pub pem: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+/// `Ok(None)` is local demo (all four App vars absent). `Err` is a
+/// partial or unparseable set — do not start as a local demo.
+pub fn github_from_env_followup(
+    app_id: Option<&str>,
+    pem: Option<&str>,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> Result<Option<GithubFromEnv>, &'static str> {
+    if app_id.is_none() && pem.is_none() && client_id.is_none() && client_secret.is_none() {
+        return Ok(None);
+    }
+    let app_id = nonempty(app_id).ok_or("GITHUB_APP_ID")?;
+    let pem = nonempty(pem).ok_or("GITHUB_APP_PRIVATE_KEY")?;
+    let client_id = nonempty(client_id).ok_or("GITHUB_CLIENT_ID")?;
+    let client_secret = nonempty(client_secret).ok_or("GITHUB_CLIENT_SECRET")?;
+    let app_id = app_id.parse().map_err(|_| "GITHUB_APP_ID")?;
+    Ok(Some(GithubFromEnv {
+        app_id,
+        pem: pem.to_string(),
+        client_id: client_id.to_string(),
+        client_secret: client_secret.to_string(),
+    }))
+}
+
+fn nonempty(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Live App client, or `None` for local demo. Exits the caller on a
+/// partial / invalid App env (see `github_from_env_followup`).
+pub fn github_from_env() -> Result<Option<GitHub>, &'static str> {
+    fn opt(key: &'static str) -> Result<Option<String>, &'static str> {
+        match std::env::var(key) {
+            Ok(v) => Ok(Some(v)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(key),
+        }
+    }
+    let app_id = opt("GITHUB_APP_ID")?;
+    let pem = opt("GITHUB_APP_PRIVATE_KEY")?;
+    let client_id = opt("GITHUB_CLIENT_ID")?;
+    let client_secret = opt("GITHUB_CLIENT_SECRET")?;
+    Ok(github_from_env_followup(
+        app_id.as_deref(),
+        pem.as_deref(),
+        client_id.as_deref(),
+        client_secret.as_deref(),
+    )?
+    .map(|c| {
+        GitHub::new(
+            std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()),
+            std::env::var("GITHUB_OAUTH_URL").unwrap_or_else(|_| "https://github.com".into()),
+            c.app_id,
+            c.pem.replace("\\n", "\n"),
+            c.client_id,
+            c.client_secret,
+        )
+    }))
+}
+
 /// Match links and OAuth redirect_uri. Reject wildcard binds (`0.0.0.0`).
 fn is_live_public_url(s: &str) -> bool {
     let s = s.trim();
@@ -1143,6 +1212,55 @@ mod tests {
     #[test]
     fn local_demo_needs_no_secrets() {
         assert!(Config::default().require_live_github_secrets().is_ok());
+    }
+
+    #[test]
+    fn github_from_env_absent_is_local_demo() {
+        assert_eq!(
+            crate::github_from_env_followup(None, None, None, None),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn github_from_env_junk_app_id_is_rejected() {
+        assert_eq!(
+            crate::github_from_env_followup(
+                Some("not-a-number"),
+                Some("pem"),
+                Some("cid"),
+                Some("csec")
+            ),
+            Err("GITHUB_APP_ID")
+        );
+    }
+
+    #[test]
+    fn github_from_env_partial_client_id_is_rejected() {
+        assert_eq!(
+            crate::github_from_env_followup(None, None, Some("Iv1.only"), None),
+            Err("GITHUB_APP_ID")
+        );
+    }
+
+    #[test]
+    fn github_from_env_empty_app_id_with_others_is_rejected() {
+        assert_eq!(
+            crate::github_from_env_followup(Some("  "), Some("pem"), Some("cid"), Some("csec")),
+            Err("GITHUB_APP_ID")
+        );
+    }
+
+    #[test]
+    fn github_from_env_complete_parses() {
+        let got =
+            crate::github_from_env_followup(Some(" 42 "), Some("pem"), Some("cid"), Some("csec"))
+                .expect("ok")
+                .expect("live");
+        assert_eq!(got.app_id, 42);
+        assert_eq!(got.pem, "pem");
+        assert_eq!(got.client_id, "cid");
+        assert_eq!(got.client_secret, "csec");
     }
 
     #[test]

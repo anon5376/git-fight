@@ -11,7 +11,7 @@ This document is the Milestone 0 plan. Later milestones implement it. Hard rules
 - Never run code from a user's repo. Server-side git is plumbing only: clone, fetch, merge-tree, cat-file, hash-object, commit-tree, push. Every git invocation sets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and `-c core.hooksPath=/dev/null`.
 - Verify every webhook's `X-Hub-Signature-256` with a constant-time comparison **before** parsing the body.
 - Least privilege: the app asks only for the permissions in [GitHub App](#github-app).
-- Secrets (app private key, webhook secret, OAuth client secret, session key) come from environment variables. Never commit them, log them, or store them in the database.
+- Secrets (app private key, webhook secret, OAuth client secret, session key) come from environment variables. Never commit them, log them, or store them in the database. If any of `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_CLIENT_ID`, or `GITHUB_CLIENT_SECRET` is set, all four must be present and App ID must parse as an integer or the process exits. A partial or unparseable set does not start as a local demo that can mint share tokens.
 - Create installation tokens when needed and cache them in memory until they expire. Never write them to disk.
 - Limits so one repo cannot hog the server: 60-second clone timeout; skip repos whose GitHub `size` is over 1 GB; at most 15 fightsable conflicts per match. Over the conflict limit, the bot says it is too many conflicts for one fight and stops.
 

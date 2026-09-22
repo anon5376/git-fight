@@ -12,7 +12,7 @@ pub mod sig;
 mod stats;
 mod webhook;
 
-pub use app::{router, serve, AppState, Config};
+pub use app::{github_from_env, github_from_env_followup, router, serve, AppState, Config};
 pub use auth::{sign as sign_session, Auth};
 pub use db::connect as db_connect;
 pub use gh::GitHub;
