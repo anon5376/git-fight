@@ -14,6 +14,20 @@ const GLYPHS: Record<string, readonly number[]> = {
   " ": [0, 0, 0, 0, 0, 0, 0],
 };
 
+/** 5×7 damage digits. Same bit order as the title glyphs. */
+const DIGITS: Record<string, readonly number[]> = {
+  "0": [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+  "1": [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+  "2": [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
+  "3": [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+  "4": [0b10010, 0b10010, 0b10010, 0b11111, 0b00010, 0b00010, 0b00010],
+  "5": [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+  "6": [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+  "7": [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+  "8": [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+  "9": [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+};
+
 export function drawDotTitle(canvas: HTMLCanvasElement, text: string): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) {
@@ -44,6 +58,9 @@ export function drawDotTitle(canvas: HTMLCanvasElement, text: string): void {
   }
 }
 
+/** Matches `git_fight_core::ARENA_W`. One unit is one sprite column. */
+export const ARENA_UNITS = 72;
+
 export type Frame = {
   oursName: string;
   theirsName: string;
@@ -59,6 +76,101 @@ export type Frame = {
   roundLabel: string;
 };
 
+export type Playfield = {
+  scale: number;
+  originX: number;
+  fieldW: number;
+};
+
+type Floater = { text: string; x: number; y: number; life: number; color: string };
+
+let floaters: Floater[] = [];
+let floaterKey = "";
+let prevOursHp = -1;
+let prevTheirsHp = -1;
+
+function noteHits(frame: Frame, field: Playfield, originY: number): string {
+  const key = `${frame.roundLabel}|${frame.oursName}|${frame.theirsName}|${frame.oursMax}|${frame.theirsMax}`;
+  if (key !== floaterKey || frame.oursHp > prevOursHp || frame.theirsHp > prevTheirsHp) {
+    floaters = [];
+    floaterKey = key;
+    prevOursHp = frame.oursHp;
+    prevTheirsHp = frame.theirsHp;
+    return "";
+  }
+  const notes: string[] = [];
+  if (frame.oursHp < prevOursHp) {
+    const dmg = prevOursHp - frame.oursHp;
+    floaters.push({
+      text: String(dmg),
+      x: field.originX + frame.oursX * field.scale + 4 * field.scale,
+      y: originY - 6,
+      life: 24,
+      color: THEIRS,
+    });
+    notes.push(`${frame.oursName} hit ${dmg}`);
+  }
+  if (frame.theirsHp < prevTheirsHp) {
+    const dmg = prevTheirsHp - frame.theirsHp;
+    floaters.push({
+      text: String(dmg),
+      x: field.originX + frame.theirsX * field.scale + 4 * field.scale,
+      y: originY - 6,
+      life: 24,
+      color: OURS,
+    });
+    notes.push(`${frame.theirsName} hit ${dmg}`);
+  }
+  prevOursHp = frame.oursHp;
+  prevTheirsHp = frame.theirsHp;
+  return notes.join(", ");
+}
+
+function drawPixelDigits(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color: string): void {
+  const scale = 2;
+  const glyphW = 5 * scale + 2;
+  const total = text.length * glyphW - 2;
+  let left = Math.round(x - total / 2);
+  ctx.fillStyle = color;
+  for (const ch of text) {
+    const bits = DIGITS[ch];
+    if (bits) {
+      for (let r = 0; r < 7; r += 1) {
+        for (let c = 0; c < 5; c += 1) {
+          if (bits[r] & (1 << (4 - c))) {
+            ctx.fillRect(left + c * scale, y + r * scale, scale, scale);
+          }
+        }
+      }
+    }
+    left += glyphW;
+  }
+}
+
+function drawFloaters(ctx: CanvasRenderingContext2D): void {
+  const keep: Floater[] = [];
+  for (const floater of floaters) {
+    drawPixelDigits(ctx, floater.text, floater.x, floater.y - 14, floater.color);
+    floater.y -= 1;
+    floater.life -= 1;
+    if (floater.life > 0) {
+      keep.push(floater);
+    }
+  }
+  floaters = keep;
+}
+
+/** Fit the whole arena on the canvas. Fighters were drawn at 8px per unit, so on the
+ *  880px stage they never reached the right health bar. */
+export function layoutPlayfield(canvasWidth: number, arenaUnits = ARENA_UNITS): Playfield {
+  const units = arenaUnits > 0 ? arenaUnits : ARENA_UNITS;
+  const pad = 24;
+  const scale = Math.max(4, Math.floor((canvasWidth - pad * 2) / units));
+  const fieldW = units * scale;
+  const originX = Math.floor((canvasWidth - fieldW) / 2);
+  return { scale, originX, fieldW };
+}
+
 export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) {
@@ -66,35 +178,65 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   }
   const w = canvas.width;
   const h = canvas.height;
+  ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
   ctx.font = '18px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
   ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+
+  const barW = Math.min(280, Math.max(80, Math.floor((w - 160) / 2)));
+  const rightBar = w - 24 - barW;
 
   ctx.fillStyle = OURS;
   ctx.fillText("GIT FIGHT", 24, 16);
-  ctx.fillText(frame.roundLabel, 360, 16);
-  ctx.fillText(frame.timer, w - 64, 16);
+  ctx.textAlign = "center";
+  ctx.fillText(frame.roundLabel, Math.floor(w / 2), 16);
+  ctx.textAlign = "right";
+  ctx.fillText(frame.timer, w - 24, 16);
+  ctx.textAlign = "left";
+  ctx.fillText(clipName(frame.oursName, 12), 24, 48);
+  ctx.textAlign = "right";
+  ctx.fillText(clipName(frame.theirsName, 12), w - 24, 48);
+  ctx.textAlign = "left";
 
-  ctx.fillText(padName(frame.oursName, 12), 24, 48);
-  ctx.fillText(padName(frame.theirsName, 12).trimEnd(), w - 24 - 12 * 11, 48);
-  drawBar(ctx, 24, 72, 280, frame.oursHp, frame.oursMax, OURS);
-  drawBar(ctx, w - 304, 72, 280, frame.theirsHp, frame.theirsMax, THEIRS);
+  drawBar(ctx, 24, 72, barW, frame.oursHp, frame.oursMax, OURS, "left");
+  drawBar(ctx, rightBar, 72, barW, frame.theirsHp, frame.theirsMax, THEIRS, "right");
   ctx.fillStyle = OURS;
-  ctx.fillText(String(frame.oursHp).padStart(3, " "), 310, 70);
+  ctx.fillText(String(frame.oursHp).padStart(3, " "), 24 + barW + 8, 70);
   ctx.fillStyle = THEIRS;
-  ctx.fillText(String(frame.theirsHp).padStart(3, " "), w - 348, 70);
+  ctx.textAlign = "right";
+  ctx.fillText(String(frame.theirsHp).padStart(3, " "), rightBar - 8, 70);
+  ctx.textAlign = "left";
 
-  const cell = 14;
-  const originY = 140;
-  drawSprite(ctx, frame.oursSprite, 24 + frame.oursX * 8, originY, OURS, cell);
-  drawSprite(ctx, frame.theirsSprite, 24 + frame.theirsX * 8, originY, THEIRS, cell);
-
-  ctx.fillStyle = "#333";
-  ctx.fillRect(24, originY + cell * 5 + 8, w - 48, 2);
+  const field = layoutPlayfield(w);
+  // Standing feet are sprite row 3. Row 4 is blank padding, except the KO pose.
+  const footRows = 4;
+  const bodyH = footRows * field.scale;
+  const top = 108;
+  const bottom = Math.max(top + bodyH + 16, h - 28);
+  const originY = top + Math.floor((bottom - top - bodyH) / 2);
+  const groundY = originY + bodyH;
+  const hitNote = noteHits(frame, field, originY);
+  const floorH = 14;
+  ctx.fillStyle = "#141416";
+  ctx.fillRect(field.originX, groundY, field.fieldW, floorH);
+  ctx.fillStyle = "#3a3a3e";
+  ctx.fillRect(field.originX, groundY, field.fieldW, 2);
+  drawSprite(ctx, frame.oursSprite, field.originX + frame.oursX * field.scale, originY, OURS, field.scale);
+  drawSprite(ctx, frame.theirsSprite, field.originX + frame.theirsX * field.scale, originY, THEIRS, field.scale);
+  drawFloaters(ctx);
+  canvas.dataset.hit = hitNote;
   ctx.fillStyle = OURS;
   ctx.font = '14px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
-  ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, originY + cell * 5 + 24);
+  ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + floorH + 8);
+  const status = document.getElementById("fight-status");
+  if (status) {
+    const text = `${frame.oursName} ${frame.oursHp}  ${frame.theirsName} ${frame.theirsHp}${hitNote ? `, ${hitNote}` : ""}`;
+    if (status.textContent !== text) {
+      status.textContent = text;
+    }
+  }
 }
 
 function drawSprite(
@@ -105,11 +247,69 @@ function drawSprite(
   color: string,
   cell: number,
 ): void {
-  ctx.fillStyle = color;
-  ctx.font = `${cell}px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace`;
-  for (let i = 0; i < rows.length; i += 1) {
-    ctx.fillText(rows[i] ?? "", x, y + i * cell);
+  for (let r = 0; r < rows.length; r += 1) {
+    const line = rows[r] ?? "";
+    for (let c = 0; c < line.length; c += 1) {
+      const ch = line[c];
+      if (!ch || ch === " ") {
+        continue;
+      }
+      drawCell(ctx, ch, x + c * cell, y + r * cell, cell, color);
+    }
   }
+}
+
+/** ASCII cells drawn as pixels. A glyph font never filled the arena unit, so the
+ *  body was smaller than the space it occupies and the punch arm barely showed. */
+function drawCell(
+  ctx: CanvasRenderingContext2D,
+  ch: string,
+  x: number,
+  y: number,
+  cell: number,
+  color: string,
+): void {
+  const gap = Math.max(1, Math.floor(cell / 10));
+  const inset = cell - gap * 2;
+  ctx.fillStyle = color;
+  if (ch === "o" || ch === "O" || ch === "0") {
+    ctx.fillRect(x + gap, y + gap, inset, inset);
+    const hole = Math.max(2, Math.floor(cell * 0.36));
+    ctx.fillStyle = BG;
+    ctx.fillRect(x + Math.floor((cell - hole) / 2), y + Math.floor((cell - hole) / 2), hole, hole);
+    return;
+  }
+  if (ch === "x" || ch === "X") {
+    const arm = Math.max(2, Math.floor(cell * 0.28));
+    ctx.fillRect(x + gap, y + gap, inset, arm);
+    ctx.fillRect(x + gap, y + cell - gap - arm, inset, arm);
+    ctx.fillRect(x + gap, y + gap, arm, inset);
+    ctx.fillRect(x + cell - gap - arm, y + gap, arm, inset);
+    return;
+  }
+  if (ch === "-" || ch === "=" || ch === "_") {
+    const arm = Math.max(2, Math.floor(cell * 0.28));
+    ctx.fillRect(x + gap, y + Math.floor((cell - arm) / 2), inset, arm);
+    return;
+  }
+  if (ch === "|" || ch === "!") {
+    const arm = Math.max(2, Math.floor(cell * 0.28));
+    ctx.fillRect(x + Math.floor((cell - arm) / 2), y + gap, arm, inset);
+    return;
+  }
+  if (ch === "/" || ch === "\\") {
+    const steps = 3;
+    for (let i = 0; i < steps; i += 1) {
+      const y0 = y + Math.floor((i * cell) / steps);
+      const y1 = y + Math.floor(((i + 1) * cell) / steps);
+      const col = ch === "/" ? steps - 1 - i : i;
+      const x0 = x + Math.floor((col * cell) / steps);
+      const x1 = x + Math.floor(((col + 1) * cell) / steps);
+      ctx.fillRect(x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0));
+    }
+    return;
+  }
+  ctx.fillRect(x + gap, y + gap, inset, inset);
 }
 
 function drawBar(
@@ -120,17 +320,19 @@ function drawBar(
   hp: number,
   max: number,
   color: string,
+  side: "left" | "right",
 ): void {
   ctx.fillStyle = "#222";
   ctx.fillRect(x, y, width, 16);
   const safe = hp < 0 ? 0 : hp;
   const filled = max <= 0 ? 0 : ((safe * width) / max) | 0;
   ctx.fillStyle = color;
-  ctx.fillRect(x, y, filled, 16);
+  const fillX = side === "right" ? x + width - filled : x;
+  ctx.fillRect(fillX, y, filled, 16);
 }
 
-function padName(name: string, n: number): string {
-  return name.length >= n ? name.slice(0, n) : name.padEnd(n, " ");
+function clipName(name: string, n: number): string {
+  return name.length >= n ? name.slice(0, n) : name;
 }
 
 export { BG, OURS, THEIRS };

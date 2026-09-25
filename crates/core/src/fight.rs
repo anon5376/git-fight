@@ -147,18 +147,19 @@ impl Fighter {
     pub fn pose(&self) -> Pose {
         match self.anim {
             Anim::Idle => Pose::Idle,
-            Anim::Attack {
-                kind: AttackKind::Punch,
-                ..
-            } => Pose::Punch,
-            Anim::Attack {
-                kind: AttackKind::Kick,
-                ..
-            } => Pose::Kick,
-            Anim::Attack {
-                kind: AttackKind::Special,
-                ..
-            } => Pose::Special,
+            Anim::Attack { kind, frame } => {
+                let (startup, active, _) = frames(kind);
+                // Recovery still has the attack anim, but the hitbox is off.
+                // Keep drawing the strike through startup and active, then drop it.
+                if frame >= startup + active {
+                    return Pose::Idle;
+                }
+                match kind {
+                    AttackKind::Punch => Pose::Punch,
+                    AttackKind::Kick => Pose::Kick,
+                    AttackKind::Special => Pose::Special,
+                }
+            }
             Anim::Block => Pose::Block,
             Anim::Hit => Pose::Hit,
             Anim::Ko => Pose::Ko,
@@ -251,17 +252,28 @@ impl FightState {
             Side::Theirs => &self.ours,
         };
         let dist = (self.theirs.x - self.ours.x).unsigned_abs();
-        let foe_attacking = matches!(foe.anim, Anim::Attack { .. });
+        // Recovery is still Anim::Attack, but the hitbox is already off.
+        // Blocking through it gives the attacker a free extra turn.
+        let foe_live = match foe.anim {
+            Anim::Attack { kind, frame } => {
+                let (startup, active, _) = frames(kind);
+                frame < startup + active && dist <= range(kind) as u32
+            }
+            _ => false,
+        };
         let roll = self.rng.next_bounded(10);
-        if foe_attacking && dist < 20 && roll < 6 {
+        if foe_live && roll < 6 {
             return Input::Block;
         }
-        if me.special && roll == 0 {
+        let in_punch = dist <= PUNCH_RANGE as u32;
+        let in_kick = dist <= KICK_RANGE as u32;
+        let in_special = dist <= SPECIAL_RANGE as u32;
+        if me.special && roll == 0 && in_special {
             return Input::Special;
         }
         match roll {
-            1..=3 => Input::Punch,
-            4..=6 => Input::Kick,
+            1..=3 if in_punch => Input::Punch,
+            4..=6 if in_kick => Input::Kick,
             7 => Input::Block,
             _ => Input::None,
         }
@@ -278,9 +290,8 @@ impl FightState {
         apply_input(&mut self.ours, ours_in);
         apply_input(&mut self.theirs, theirs_in);
 
-        advance_anim(&mut self.ours);
-        advance_anim(&mut self.theirs);
-
+        // Hit-check the frame that just started. Advancing first skipped frame 0,
+        // so a punch landed one tick before PUNCH_STARTUP.
         let ours_hit = active_hit(&self.ours, &self.theirs, true);
         let theirs_hit = active_hit(&self.theirs, &self.ours, false);
         if let Some(kind) = ours_hit {
@@ -291,6 +302,9 @@ impl FightState {
             self.theirs.hit_connected = true;
             apply_hit(&mut self.ours, kind, -1);
         }
+
+        advance_anim(&mut self.ours);
+        advance_anim(&mut self.theirs);
 
         apply_physics(&mut self.ours, &mut self.theirs);
         maybe_nudge(&mut self.ours, &mut self.theirs);
@@ -467,7 +481,16 @@ fn apply_hit(defender: &mut Fighter, kind: AttackKind, knockback_dir: i32) {
     }
     let blocking = defender.guard_ticks > 0 || defender.anim == Anim::Block;
     if blocking {
+        let mut chip = (damage(kind) / 5).max(1);
+        if defender.armor {
+            chip = (chip * 9 / 10).max(1);
+        }
+        defender.hp -= chip;
+        if defender.hp < 0 {
+            defender.hp = 0;
+        }
         defender.stun_ticks = BLOCKSTUN;
+        defender.vel_x += knockback_dir;
         defender.anim = Anim::Block;
         return;
     }
@@ -494,24 +517,44 @@ fn apply_physics(ours: &mut Fighter, theirs: &mut Fighter) {
     if ours.x + FIGHTER_W > theirs.x {
         let overlap = ours.x + FIGHTER_W - theirs.x;
         let push = (overlap + 1) / 2;
-        ours.x -= push;
-        theirs.x += push;
-        ours.x = ours.x.clamp(0, ARENA_W - FIGHTER_W);
-        theirs.x = theirs.x.clamp(0, ARENA_W - FIGHTER_W);
+        let max_x = ARENA_W - FIGHTER_W;
+        ours.x = (ours.x - push).clamp(0, max_x);
+        theirs.x = (theirs.x + push).clamp(0, max_x);
+        // A wall eats one side of the split. Give the leftover push to the side that can move.
+        if ours.x + FIGHTER_W > theirs.x {
+            let still = ours.x + FIGHTER_W - theirs.x;
+            if ours.x == 0 {
+                theirs.x = (theirs.x + still).min(max_x);
+            } else {
+                ours.x = (ours.x - still).max(0);
+            }
+        }
     }
 }
 
+/// Idle fighters step back into punch range on their own.
+///
+/// The old rule only moved when both were idle, and it stopped closing at 22.
+/// Knockback leaves them around 17–22, punch reaches 16, and kick reaches 20,
+/// so after one exchange a fighter with no special stood there punching air
+/// until the clock ran out.
 fn maybe_nudge(ours: &mut Fighter, theirs: &mut Fighter) {
-    if !matches!(ours.anim, Anim::Idle) || !matches!(theirs.anim, Anim::Idle) {
-        return;
-    }
     let dist = theirs.x - ours.x;
-    if dist > 22 {
-        ours.x += 1;
-        theirs.x -= 1;
-    } else if dist < 12 {
-        ours.x -= 1;
-        theirs.x += 1;
+    let too_far = dist > PUNCH_RANGE;
+    let too_close = dist < 12;
+    if ours.anim == Anim::Idle {
+        if too_far {
+            ours.x += 1;
+        } else if too_close {
+            ours.x -= 1;
+        }
+    }
+    if theirs.anim == Anim::Idle {
+        if too_far {
+            theirs.x -= 1;
+        } else if too_close {
+            theirs.x += 1;
+        }
     }
     ours.x = ours.x.clamp(0, ARENA_W - FIGHTER_W);
     theirs.x = theirs.x.clamp(0, ARENA_W - FIGHTER_W);
@@ -531,6 +574,24 @@ mod tests {
     }
 
     #[test]
+    fn punch_does_not_hit_during_startup() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.theirs.x = f.ours.x + 8;
+        f.step(Input::Punch, Input::None);
+        let hp = f.theirs.hp;
+        for _ in 0..(PUNCH_STARTUP - 1) {
+            f.step(Input::None, Input::None);
+            assert_eq!(
+                f.theirs.hp, hp,
+                "connected during startup at tick {}",
+                f.tick
+            );
+        }
+        f.step(Input::None, Input::None);
+        assert!(f.theirs.hp < hp, "startup ended without a hit");
+    }
+
+    #[test]
     fn punch_deals_damage() {
         let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
         f.step(Input::Punch, Input::None);
@@ -542,13 +603,15 @@ mod tests {
     }
 
     #[test]
-    fn block_prevents_damage() {
+    fn block_takes_chip_not_the_full_hit() {
         let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
         f.step(Input::Punch, Input::Block);
         for _ in 0..20 {
             f.step(Input::None, Input::Block);
         }
-        assert_eq!(f.theirs.hp, f.theirs.max_hp);
+        let lost = f.theirs.max_hp - f.theirs.hp;
+        assert_eq!(lost, (PUNCH_DAMAGE / 5).max(1));
+        assert!(lost < PUNCH_DAMAGE);
     }
 
     #[test]
@@ -665,6 +728,117 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn cpu_blocks_a_live_attack_and_punishes_recovery() {
+        let mut f = FightState::new(9, FighterStats::default(), FighterStats::default());
+        f.theirs.x = f.ours.x + 10;
+        f.ours.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: PUNCH_STARTUP,
+        };
+        let mut live_blocks = 0;
+        for _ in 0..50 {
+            if f.cpu_input(Side::Theirs) == Input::Block {
+                live_blocks += 1;
+            }
+        }
+        assert!(
+            live_blocks > 20,
+            "did not respect a live punch, blocks={live_blocks}"
+        );
+
+        f.ours.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: PUNCH_STARTUP + PUNCH_ACTIVE,
+        };
+        let mut recovery_blocks = 0;
+        let mut recovery_swings = 0;
+        for _ in 0..50 {
+            match f.cpu_input(Side::Theirs) {
+                Input::Block => recovery_blocks += 1,
+                Input::Punch | Input::Kick => recovery_swings += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            recovery_swings > recovery_blocks,
+            "recovery blocks={recovery_blocks} swings={recovery_swings}"
+        );
+    }
+
+    #[test]
+    fn cpu_does_not_swing_out_of_range() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.ours.x = 0;
+        f.theirs.x = 40;
+        for _ in 0..40 {
+            let input = f.cpu_input(Side::Theirs);
+            assert!(
+                matches!(input, Input::Block | Input::None),
+                "swung {input:?} from 40 away"
+            );
+        }
+    }
+
+    #[test]
+    fn wall_pin_separates_without_a_nudge() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.ours.x = 0;
+        f.theirs.x = 5;
+        f.ours.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: 1,
+        };
+        f.theirs.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: 1,
+        };
+        f.step(Input::None, Input::None);
+        assert!(
+            f.ours.x + FIGHTER_W <= f.theirs.x,
+            "still overlapping at {} and {}",
+            f.ours.x,
+            f.theirs.x
+        );
+    }
+
+    #[test]
+    fn recovery_drops_the_strike_pose() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.step(Input::Punch, Input::None);
+        assert_eq!(f.ours.pose(), Pose::Punch);
+        for _ in 0..3 {
+            f.step(Input::None, Input::None);
+        }
+        assert_eq!(f.ours.pose(), Pose::Punch);
+        for _ in 0..2 {
+            f.step(Input::None, Input::None);
+        }
+        assert!(matches!(f.ours.anim, Anim::Attack { .. }));
+        assert_eq!(f.ours.pose(), Pose::Idle);
+    }
+
+    #[test]
+    fn punch_lands_again_after_knockback() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.step(Input::Punch, Input::None);
+        for _ in 0..40 {
+            f.step(Input::None, Input::None);
+        }
+        assert_eq!(f.theirs.max_hp - f.theirs.hp, PUNCH_DAMAGE);
+        assert!(f.ours.can_act() && f.theirs.can_act());
+        let dist = f.theirs.x - f.ours.x;
+        assert!(
+            (12..=PUNCH_RANGE).contains(&dist),
+            "stuck at {dist}, punch range is {PUNCH_RANGE}"
+        );
+        f.step(Input::Punch, Input::None);
+        for _ in 0..20 {
+            f.step(Input::None, Input::None);
+        }
+        assert_eq!(f.theirs.max_hp - f.theirs.hp, PUNCH_DAMAGE * 2);
     }
 
     #[test]

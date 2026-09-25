@@ -8,7 +8,8 @@ use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegrou
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use git_fight_core::{
-    sprite, ConflictFile, FightState, Input, Pick, RoundResult, Side, SPRITE_ROWS, TICKS_PER_SECOND,
+    sprite, ConflictFile, FightState, Input, Pick, RoundResult, Side, ARENA_W, SPRITE_COLS,
+    SPRITE_ROWS, TICKS_PER_SECOND,
 };
 
 use crate::stats::NamedFighter;
@@ -144,7 +145,8 @@ fn play_round(
 
         draw_fight(path, round, total, ours, theirs, &fight)?;
         if let Some(result) = fight.result {
-            draw_ko(result)?;
+            let decision = fight.ours.hp > 0 && fight.theirs.hp > 0;
+            draw_ko(result, decision)?;
             wait_key_or(Duration::from_millis(1400))?;
             let pick = match result {
                 RoundResult::Ours => Pick::Ours,
@@ -310,10 +312,10 @@ fn draw_fight(
         SetForegroundColor(OURS),
         Print(format!("{:<16}", trunc(&ours.name, 16))),
         Print(' '),
-        Print(hp_bar(fight.ours.hp, fight.ours.max_hp, 16)),
+        Print(hp_bar(fight.ours.hp, fight.ours.max_hp, 16, false)),
         Print(format!(" {:>3}   {:<3} ", fight.ours.hp, fight.theirs.hp)),
         SetForegroundColor(THEIRS),
-        Print(hp_bar(fight.theirs.hp, fight.theirs.max_hp, 16)),
+        Print(hp_bar(fight.theirs.hp, fight.theirs.max_hp, 16, true)),
         Print(' '),
         Print(format!("{:>16}", trunc(&theirs.name, 16))),
     )
@@ -343,8 +345,9 @@ fn draw_sprites(out: &mut impl Write, fight: &FightState) -> Result<(), String> 
     let theirs_pose = fight.theirs.pose();
     let left = sprite(Side::Ours, ours_pose);
     let right = sprite(Side::Theirs, theirs_pose);
-    let lx = fight.ours.x.clamp(0, 60) as u16;
-    let rx = fight.theirs.x.clamp(0, 60) as u16;
+    let max_x = ARENA_W.saturating_sub(SPRITE_COLS as i32).max(0);
+    let lx = fight.ours.x.clamp(0, max_x) as u16;
+    let rx = fight.theirs.x.clamp(0, max_x) as u16;
     for row in 0..SPRITE_ROWS {
         queue!(
             out,
@@ -360,8 +363,10 @@ fn draw_sprites(out: &mut impl Write, fight: &FightState) -> Result<(), String> 
     Ok(())
 }
 
-fn draw_ko(result: RoundResult) -> Result<(), String> {
+fn draw_ko(result: RoundResult, decision: bool) -> Result<(), String> {
     let (msg, color) = match result {
+        RoundResult::Ours if decision => ("TIME — OURS", OURS),
+        RoundResult::Theirs if decision => ("TIME — THEIRS", THEIRS),
         RoundResult::Ours => ("KO — OURS", OURS),
         RoundResult::Theirs => ("KO — THEIRS", THEIRS),
         RoundResult::Draw => ("DRAW", OURS),
@@ -385,13 +390,19 @@ fn format_timer(fight: &FightState) -> String {
     format!("{secs:>2}")
 }
 
-fn hp_bar(hp: i32, max: i32, width: usize) -> String {
+fn hp_bar(hp: i32, max: i32, width: usize, from_right: bool) -> String {
     if max <= 0 {
         return " ".repeat(width);
     }
     let filled = ((hp.max(0) as usize) * width) / (max as usize);
     let filled = filled.min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    let full = "█".repeat(filled);
+    let empty = "░".repeat(width - filled);
+    if from_right {
+        format!("{empty}{full}")
+    } else {
+        format!("{full}{empty}")
+    }
 }
 
 fn trunc(s: &str, n: usize) -> String {

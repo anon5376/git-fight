@@ -180,6 +180,8 @@ async fn get_match(
 struct ReplayOut {
     id: String,
     seed: String,
+    ours: String,
+    theirs: String,
     ticks: Vec<[u8; 2]>,
     final_hash: Option<String>,
     status: String,
@@ -202,6 +204,8 @@ async fn get_replay(
     Ok(Json(ReplayOut {
         id: row.id,
         seed: row.seed,
+        ours: row.ours_name,
+        theirs: row.theirs_name,
         ticks: inputs.into_iter().map(|(_, o, t)| [o, t]).collect(),
         final_hash: row.final_hash,
         status: row.status,

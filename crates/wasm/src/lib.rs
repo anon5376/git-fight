@@ -104,6 +104,11 @@ impl WasmFight {
             .step(Input::from_u8(ours), Input::from_u8(theirs));
     }
 
+    /// The disconnected side loses. `0` is ours, `1` is theirs.
+    pub fn forfeit(&mut self, side: u8) {
+        self.state.forfeit(Side::from_u8(side));
+    }
+
     pub fn cpu_input(&mut self, side: u8) -> u8 {
         self.state.cpu_input(Side::from_u8(side)).as_u8()
     }
