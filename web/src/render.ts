@@ -118,19 +118,20 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   ctx.textAlign = "left";
 
   const field = layoutPlayfield(w);
-  const spriteH = 5 * field.scale;
+  // Standing feet are sprite row 3. Row 4 is blank padding, except the KO pose.
+  const footRows = 4;
+  const bodyH = footRows * field.scale;
   const top = 108;
-  const bottom = Math.max(top + spriteH + 16, h - 28);
-  const originY = top + Math.floor((bottom - top - spriteH) / 2);
-  drawSprite(ctx, frame.oursSprite, field.originX + frame.oursX * field.scale, originY, OURS, field.scale);
-  drawSprite(ctx, frame.theirsSprite, field.originX + frame.theirsX * field.scale, originY, THEIRS, field.scale);
-
-  const groundY = originY + spriteH + 6;
+  const bottom = Math.max(top + bodyH + 16, h - 28);
+  const originY = top + Math.floor((bottom - top - bodyH) / 2);
+  const groundY = originY + bodyH;
   const floorH = 14;
   ctx.fillStyle = "#141416";
   ctx.fillRect(field.originX, groundY, field.fieldW, floorH);
   ctx.fillStyle = "#3a3a3e";
   ctx.fillRect(field.originX, groundY, field.fieldW, 2);
+  drawSprite(ctx, frame.oursSprite, field.originX + frame.oursX * field.scale, originY, OURS, field.scale);
+  drawSprite(ctx, frame.theirsSprite, field.originX + frame.theirsX * field.scale, originY, THEIRS, field.scale);
   ctx.fillStyle = OURS;
   ctx.font = '14px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
   ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + floorH + 8);
@@ -195,10 +196,14 @@ function drawCell(
     return;
   }
   if (ch === "/" || ch === "\\") {
-    const step = Math.max(2, Math.floor(cell / 3));
-    for (let i = 0; i < 3; i += 1) {
-      const col = ch === "/" ? 2 - i : i;
-      ctx.fillRect(x + col * step, y + i * step, step, step);
+    const steps = 3;
+    for (let i = 0; i < steps; i += 1) {
+      const y0 = y + Math.floor((i * cell) / steps);
+      const y1 = y + Math.floor(((i + 1) * cell) / steps);
+      const col = ch === "/" ? steps - 1 - i : i;
+      const x0 = x + Math.floor((col * cell) / steps);
+      const x1 = x + Math.floor(((col + 1) * cell) / steps);
+      ctx.fillRect(x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0));
     }
     return;
   }

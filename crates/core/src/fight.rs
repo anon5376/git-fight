@@ -147,18 +147,19 @@ impl Fighter {
     pub fn pose(&self) -> Pose {
         match self.anim {
             Anim::Idle => Pose::Idle,
-            Anim::Attack {
-                kind: AttackKind::Punch,
-                ..
-            } => Pose::Punch,
-            Anim::Attack {
-                kind: AttackKind::Kick,
-                ..
-            } => Pose::Kick,
-            Anim::Attack {
-                kind: AttackKind::Special,
-                ..
-            } => Pose::Special,
+            Anim::Attack { kind, frame } => {
+                let (startup, active, _) = frames(kind);
+                // Recovery still has the attack anim, but the hitbox is off.
+                // Keep drawing the strike through startup and active, then drop it.
+                if frame >= startup + active {
+                    return Pose::Idle;
+                }
+                match kind {
+                    AttackKind::Punch => Pose::Punch,
+                    AttackKind::Kick => Pose::Kick,
+                    AttackKind::Special => Pose::Special,
+                }
+            }
             Anim::Block => Pose::Block,
             Anim::Hit => Pose::Hit,
             Anim::Ko => Pose::Ko,
@@ -677,6 +678,22 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn recovery_drops_the_strike_pose() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.step(Input::Punch, Input::None);
+        assert_eq!(f.ours.pose(), Pose::Punch);
+        for _ in 0..3 {
+            f.step(Input::None, Input::None);
+        }
+        assert_eq!(f.ours.pose(), Pose::Punch);
+        for _ in 0..2 {
+            f.step(Input::None, Input::None);
+        }
+        assert!(matches!(f.ours.anim, Anim::Attack { .. }));
+        assert_eq!(f.ours.pose(), Pose::Idle);
     }
 
     #[test]
