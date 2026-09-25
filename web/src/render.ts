@@ -118,16 +118,22 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   ctx.textAlign = "left";
 
   const field = layoutPlayfield(w);
-  const originY = Math.max(120, Math.floor(h * 0.33));
+  const spriteH = 5 * field.scale;
+  const top = 108;
+  const bottom = Math.max(top + spriteH + 16, h - 28);
+  const originY = top + Math.floor((bottom - top - spriteH) / 2);
   drawSprite(ctx, frame.oursSprite, field.originX + frame.oursX * field.scale, originY, OURS, field.scale);
   drawSprite(ctx, frame.theirsSprite, field.originX + frame.theirsX * field.scale, originY, THEIRS, field.scale);
 
-  const groundY = originY + 5 * field.scale + 8;
-  ctx.fillStyle = "#333";
+  const groundY = originY + spriteH + 6;
+  const floorH = 14;
+  ctx.fillStyle = "#141416";
+  ctx.fillRect(field.originX, groundY, field.fieldW, floorH);
+  ctx.fillStyle = "#3a3a3e";
   ctx.fillRect(field.originX, groundY, field.fieldW, 2);
   ctx.fillStyle = OURS;
   ctx.font = '14px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
-  ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + 16);
+  ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + floorH + 8);
 }
 
 function drawSprite(
@@ -138,22 +144,65 @@ function drawSprite(
   color: string,
   cell: number,
 ): void {
-  ctx.fillStyle = color;
-  ctx.font = `${cell}px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
   for (let r = 0; r < rows.length; r += 1) {
     const line = rows[r] ?? "";
     for (let c = 0; c < line.length; c += 1) {
       const ch = line[c];
-      if (ch === " ") {
+      if (!ch || ch === " ") {
         continue;
       }
-      ctx.fillText(ch, x + c * cell + cell / 2, y + r * cell + cell / 2);
+      drawCell(ctx, ch, x + c * cell, y + r * cell, cell, color);
     }
   }
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
+}
+
+/** ASCII cells drawn as pixels. A glyph font never filled the arena unit, so the
+ *  body was smaller than the space it occupies and the punch arm barely showed. */
+function drawCell(
+  ctx: CanvasRenderingContext2D,
+  ch: string,
+  x: number,
+  y: number,
+  cell: number,
+  color: string,
+): void {
+  const gap = Math.max(1, Math.floor(cell / 10));
+  const inset = cell - gap * 2;
+  ctx.fillStyle = color;
+  if (ch === "o" || ch === "O" || ch === "0") {
+    ctx.fillRect(x + gap, y + gap, inset, inset);
+    const hole = Math.max(2, Math.floor(cell * 0.36));
+    ctx.fillStyle = BG;
+    ctx.fillRect(x + Math.floor((cell - hole) / 2), y + Math.floor((cell - hole) / 2), hole, hole);
+    return;
+  }
+  if (ch === "x" || ch === "X") {
+    const arm = Math.max(2, Math.floor(cell * 0.28));
+    ctx.fillRect(x + gap, y + gap, inset, arm);
+    ctx.fillRect(x + gap, y + cell - gap - arm, inset, arm);
+    ctx.fillRect(x + gap, y + gap, arm, inset);
+    ctx.fillRect(x + cell - gap - arm, y + gap, arm, inset);
+    return;
+  }
+  if (ch === "-" || ch === "=" || ch === "_") {
+    const arm = Math.max(2, Math.floor(cell * 0.28));
+    ctx.fillRect(x + gap, y + Math.floor((cell - arm) / 2), inset, arm);
+    return;
+  }
+  if (ch === "|" || ch === "!") {
+    const arm = Math.max(2, Math.floor(cell * 0.28));
+    ctx.fillRect(x + Math.floor((cell - arm) / 2), y + gap, arm, inset);
+    return;
+  }
+  if (ch === "/" || ch === "\\") {
+    const step = Math.max(2, Math.floor(cell / 3));
+    for (let i = 0; i < 3; i += 1) {
+      const col = ch === "/" ? 2 - i : i;
+      ctx.fillRect(x + col * step, y + i * step, step, step);
+    }
+    return;
+  }
+  ctx.fillRect(x + gap, y + gap, inset, inset);
 }
 
 function drawBar(

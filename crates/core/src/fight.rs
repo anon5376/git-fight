@@ -501,17 +501,29 @@ fn apply_physics(ours: &mut Fighter, theirs: &mut Fighter) {
     }
 }
 
+/// Idle fighters step back into punch range on their own.
+///
+/// The old rule only moved when both were idle, and it stopped closing at 22.
+/// Knockback leaves them around 17–22, punch reaches 16, and kick reaches 20,
+/// so after one exchange a fighter with no special stood there punching air
+/// until the clock ran out.
 fn maybe_nudge(ours: &mut Fighter, theirs: &mut Fighter) {
-    if !matches!(ours.anim, Anim::Idle) || !matches!(theirs.anim, Anim::Idle) {
-        return;
-    }
     let dist = theirs.x - ours.x;
-    if dist > 22 {
-        ours.x += 1;
-        theirs.x -= 1;
-    } else if dist < 12 {
-        ours.x -= 1;
-        theirs.x += 1;
+    let too_far = dist > PUNCH_RANGE;
+    let too_close = dist < 12;
+    if ours.anim == Anim::Idle {
+        if too_far {
+            ours.x += 1;
+        } else if too_close {
+            ours.x -= 1;
+        }
+    }
+    if theirs.anim == Anim::Idle {
+        if too_far {
+            theirs.x -= 1;
+        } else if too_close {
+            theirs.x += 1;
+        }
     }
     ours.x = ours.x.clamp(0, ARENA_W - FIGHTER_W);
     theirs.x = theirs.x.clamp(0, ARENA_W - FIGHTER_W);
@@ -665,6 +677,27 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn punch_lands_again_after_knockback() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.step(Input::Punch, Input::None);
+        for _ in 0..40 {
+            f.step(Input::None, Input::None);
+        }
+        assert_eq!(f.theirs.max_hp - f.theirs.hp, PUNCH_DAMAGE);
+        assert!(f.ours.can_act() && f.theirs.can_act());
+        let dist = f.theirs.x - f.ours.x;
+        assert!(
+            (12..=PUNCH_RANGE).contains(&dist),
+            "stuck at {dist}, punch range is {PUNCH_RANGE}"
+        );
+        f.step(Input::Punch, Input::None);
+        for _ in 0..20 {
+            f.step(Input::None, Input::None);
+        }
+        assert_eq!(f.theirs.max_hp - f.theirs.hp, PUNCH_DAMAGE * 2);
     }
 
     #[test]
