@@ -252,9 +252,17 @@ impl FightState {
             Side::Theirs => &self.ours,
         };
         let dist = (self.theirs.x - self.ours.x).unsigned_abs();
-        let foe_attacking = matches!(foe.anim, Anim::Attack { .. });
+        // Recovery is still Anim::Attack, but the hitbox is already off.
+        // Blocking through it gives the attacker a free extra turn.
+        let foe_live = match foe.anim {
+            Anim::Attack { kind, frame } => {
+                let (startup, active, _) = frames(kind);
+                frame < startup + active && dist <= range(kind) as u32
+            }
+            _ => false,
+        };
         let roll = self.rng.next_bounded(10);
-        if foe_attacking && dist < 20 && roll < 6 {
+        if foe_live && roll < 6 {
             return Input::Block;
         }
         let in_punch = dist <= PUNCH_RANGE as u32;
@@ -709,6 +717,44 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn cpu_blocks_a_live_attack_and_punishes_recovery() {
+        let mut f = FightState::new(9, FighterStats::default(), FighterStats::default());
+        f.theirs.x = f.ours.x + 10;
+        f.ours.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: PUNCH_STARTUP,
+        };
+        let mut live_blocks = 0;
+        for _ in 0..50 {
+            if f.cpu_input(Side::Theirs) == Input::Block {
+                live_blocks += 1;
+            }
+        }
+        assert!(
+            live_blocks > 20,
+            "did not respect a live punch, blocks={live_blocks}"
+        );
+
+        f.ours.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: PUNCH_STARTUP + PUNCH_ACTIVE,
+        };
+        let mut recovery_blocks = 0;
+        let mut recovery_swings = 0;
+        for _ in 0..50 {
+            match f.cpu_input(Side::Theirs) {
+                Input::Block => recovery_blocks += 1,
+                Input::Punch | Input::Kick => recovery_swings += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            recovery_swings > recovery_blocks,
+            "recovery blocks={recovery_blocks} swings={recovery_swings}"
+        );
     }
 
     #[test]
