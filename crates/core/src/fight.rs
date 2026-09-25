@@ -257,12 +257,15 @@ impl FightState {
         if foe_attacking && dist < 20 && roll < 6 {
             return Input::Block;
         }
-        if me.special && roll == 0 {
+        let in_punch = dist <= PUNCH_RANGE as u32;
+        let in_kick = dist <= KICK_RANGE as u32;
+        let in_special = dist <= SPECIAL_RANGE as u32;
+        if me.special && roll == 0 && in_special {
             return Input::Special;
         }
         match roll {
-            1..=3 => Input::Punch,
-            4..=6 => Input::Kick,
+            1..=3 if in_punch => Input::Punch,
+            4..=6 if in_kick => Input::Kick,
             7 => Input::Block,
             _ => Input::None,
         }
@@ -495,10 +498,18 @@ fn apply_physics(ours: &mut Fighter, theirs: &mut Fighter) {
     if ours.x + FIGHTER_W > theirs.x {
         let overlap = ours.x + FIGHTER_W - theirs.x;
         let push = (overlap + 1) / 2;
-        ours.x -= push;
-        theirs.x += push;
-        ours.x = ours.x.clamp(0, ARENA_W - FIGHTER_W);
-        theirs.x = theirs.x.clamp(0, ARENA_W - FIGHTER_W);
+        let max_x = ARENA_W - FIGHTER_W;
+        ours.x = (ours.x - push).clamp(0, max_x);
+        theirs.x = (theirs.x + push).clamp(0, max_x);
+        // A wall eats one side of the split. Give the leftover push to the side that can move.
+        if ours.x + FIGHTER_W > theirs.x {
+            let still = ours.x + FIGHTER_W - theirs.x;
+            if ours.x == 0 {
+                theirs.x = (theirs.x + still).min(max_x);
+            } else {
+                ours.x = (ours.x - still).max(0);
+            }
+        }
     }
 }
 
@@ -678,6 +689,42 @@ mod tests {
             b.step(Input::Punch, ib);
         }
         assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn cpu_does_not_swing_out_of_range() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.ours.x = 0;
+        f.theirs.x = 40;
+        for _ in 0..40 {
+            let input = f.cpu_input(Side::Theirs);
+            assert!(
+                matches!(input, Input::Block | Input::None),
+                "swung {input:?} from 40 away"
+            );
+        }
+    }
+
+    #[test]
+    fn wall_pin_separates_without_a_nudge() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.ours.x = 0;
+        f.theirs.x = 5;
+        f.ours.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: 1,
+        };
+        f.theirs.anim = Anim::Attack {
+            kind: AttackKind::Punch,
+            frame: 1,
+        };
+        f.step(Input::None, Input::None);
+        assert!(
+            f.ours.x + FIGHTER_W <= f.theirs.x,
+            "still overlapping at {} and {}",
+            f.ours.x,
+            f.theirs.x
+        );
     }
 
     #[test]

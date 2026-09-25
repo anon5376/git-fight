@@ -104,24 +104,31 @@ function startFight(mode: Mode, fromDemo: boolean): void {
     }
   };
 
+  const oursName = fromDemo ? "0.2.0" : "ours";
+  const theirsName = fromDemo ? "0.1.0" : "theirs";
   const loop = (now: number) => {
     if (stopped) {
       return;
     }
     leftover += now - last;
     last = now;
-    while (leftover >= tickMs) {
+    let steps = 0;
+    while (leftover >= tickMs && steps < 3) {
       leftover -= tickMs;
       stepOnce();
+      steps += 1;
     }
-    paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
+    if (leftover > tickMs) {
+      leftover = 0;
+    }
+    paintFight(stage, fight, oursName, theirsName, fromDemo ? "demo  1/1" : "round 1/1");
     if (fight.result() !== -1) {
       finish();
     }
     requestAnimationFrame(loop);
   };
 
-  paintFight(stage, fight, "ours", "theirs", fromDemo ? "demo  1/1" : "round 1/1");
+  paintFight(stage, fight, oursName, theirsName, fromDemo ? "demo  1/1" : "round 1/1");
   requestAnimationFrame(loop);
   running = {
     stop: () => {

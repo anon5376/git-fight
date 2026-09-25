@@ -45,9 +45,12 @@
 
       <section id="arena" class="hidden" data-testid="arena">
         <p id="share" class="keys hidden" data-testid="share"></p>
-        <canvas id="stage" data-testid="stage" width="880" height="420"></canvas>
-        <div id="wait" class="hidden" data-testid="wait">waiting</div>
-        <div id="ko" class="hidden" data-testid="ko">KO</div>
+        <div class="stage-wrap">
+          <canvas id="stage" data-testid="stage" width="880" height="420"></canvas>
+          <div id="wait" class="hidden" data-testid="wait">waiting</div>
+          <div id="ko" class="hidden" data-testid="ko">KO</div>
+        </div>
+        <p id="fight-status" class="sr-only" aria-live="polite"></p>
         <p class="keys" id="resolved" data-testid="resolved"></p>
       </section>
     </main>

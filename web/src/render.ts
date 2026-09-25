@@ -108,8 +108,8 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   ctx.fillText(clipName(frame.theirsName, 12), w - 24, 48);
   ctx.textAlign = "left";
 
-  drawBar(ctx, 24, 72, barW, frame.oursHp, frame.oursMax, OURS);
-  drawBar(ctx, rightBar, 72, barW, frame.theirsHp, frame.theirsMax, THEIRS);
+  drawBar(ctx, 24, 72, barW, frame.oursHp, frame.oursMax, OURS, "left");
+  drawBar(ctx, rightBar, 72, barW, frame.theirsHp, frame.theirsMax, THEIRS, "right");
   ctx.fillStyle = OURS;
   ctx.fillText(String(frame.oursHp).padStart(3, " "), 24 + barW + 8, 70);
   ctx.fillStyle = THEIRS;
@@ -135,6 +135,13 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   ctx.fillStyle = OURS;
   ctx.font = '14px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
   ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + floorH + 8);
+  const status = document.getElementById("fight-status");
+  if (status) {
+    const text = `${frame.oursName} ${frame.oursHp}  ${frame.theirsName} ${frame.theirsHp}`;
+    if (status.textContent !== text) {
+      status.textContent = text;
+    }
+  }
 }
 
 function drawSprite(
@@ -218,13 +225,15 @@ function drawBar(
   hp: number,
   max: number,
   color: string,
+  side: "left" | "right",
 ): void {
   ctx.fillStyle = "#222";
   ctx.fillRect(x, y, width, 16);
   const safe = hp < 0 ? 0 : hp;
   const filled = max <= 0 ? 0 : ((safe * width) / max) | 0;
   ctx.fillStyle = color;
-  ctx.fillRect(x, y, filled, 16);
+  const fillX = side === "right" ? x + width - filled : x;
+  ctx.fillRect(fillX, y, filled, 16);
 }
 
 function clipName(name: string, n: number): string {

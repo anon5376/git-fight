@@ -4,6 +4,9 @@ export function bindKeys(onQuit: () => void): { poll: () => Queued; unbind: () =
   let ours = 0;
   let theirs = 0;
   const down = (ev: KeyboardEvent) => {
+    if (ev.repeat) {
+      return;
+    }
     if (ev.key === "q" || ev.key === "Q") {
       ev.preventDefault();
       onQuit();

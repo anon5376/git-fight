@@ -311,10 +311,10 @@ fn draw_fight(
         SetForegroundColor(OURS),
         Print(format!("{:<16}", trunc(&ours.name, 16))),
         Print(' '),
-        Print(hp_bar(fight.ours.hp, fight.ours.max_hp, 16)),
+        Print(hp_bar(fight.ours.hp, fight.ours.max_hp, 16, false)),
         Print(format!(" {:>3}   {:<3} ", fight.ours.hp, fight.theirs.hp)),
         SetForegroundColor(THEIRS),
-        Print(hp_bar(fight.theirs.hp, fight.theirs.max_hp, 16)),
+        Print(hp_bar(fight.theirs.hp, fight.theirs.max_hp, 16, true)),
         Print(' '),
         Print(format!("{:>16}", trunc(&theirs.name, 16))),
     )
@@ -387,13 +387,19 @@ fn format_timer(fight: &FightState) -> String {
     format!("{secs:>2}")
 }
 
-fn hp_bar(hp: i32, max: i32, width: usize) -> String {
+fn hp_bar(hp: i32, max: i32, width: usize, from_right: bool) -> String {
     if max <= 0 {
         return " ".repeat(width);
     }
     let filled = ((hp.max(0) as usize) * width) / (max as usize);
     let filled = filled.min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    let full = "█".repeat(filled);
+    let empty = "░".repeat(width - filled);
+    if from_right {
+        format!("{empty}{full}")
+    } else {
+        format!("{full}{empty}")
+    }
 }
 
 fn trunc(s: &str, n: usize) -> String {

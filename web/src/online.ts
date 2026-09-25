@@ -111,6 +111,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
   let held = 0;
   let oursName = "ours";
   let theirsName = "theirs";
+  let roundLabel = "online 1/1";
   let finished = false;
   const tps = ticks_per_second();
   const tickMs = 1000 / tps;
@@ -170,6 +171,7 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       confirmed = hello.confirmed_tick;
       oursName = hello.ours;
       theirsName = hello.theirs;
+      roundLabel = `online ${hello.round + 1}/1`;
       fight = WasmFight.from_seed(hello.seed_lo, hello.seed_hi);
       if (role === "spectator") {
         ui.wait.textContent = "spectating";
@@ -188,6 +190,13 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
       const end = msg as EndMsg;
       finished = true;
       ui.wait.classList.add("hidden");
+      if (fight && fight.result() === -1) {
+        if (end.result === 0) {
+          fight.forfeit(1);
+        } else if (end.result === 1) {
+          fight.forfeit(0);
+        }
+      }
       showKo(ui.ko, end.result);
       ui.resolved.textContent = `replay /replay/${matchId}`;
     } else if (msg.type === "error") {
@@ -203,8 +212,10 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
     }
     leftover += now - last;
     last = now;
-    while (leftover >= tickMs) {
+    let steps = 0;
+    while (leftover >= tickMs && steps < 3) {
       leftover -= tickMs;
+      steps += 1;
       const queued = keys.poll();
       const latest = buttonsForRole(role, queued) || held;
       if (role !== "spectator") {
@@ -217,8 +228,11 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
         }
       }
     }
+    if (leftover > tickMs) {
+      leftover = 0;
+    }
     if (fight) {
-      paintFight(ui.stage, fight, oursName, theirsName, "online 1/1");
+      paintFight(ui.stage, fight, oursName, theirsName, roundLabel);
     }
     requestAnimationFrame(loop);
   };
@@ -247,6 +261,8 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
   }
   const data = (await res.json()) as {
     seed: string;
+    ours?: string;
+    theirs?: string;
     ticks: number[][];
     final_hash?: string;
   };
@@ -275,8 +291,10 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
     }
     leftover += now - last;
     last = now;
-    while (leftover >= tickMs) {
+    let steps = 0;
+    while (leftover >= tickMs && steps < 3) {
       leftover -= tickMs;
+      steps += 1;
       if (i < ticks.length) {
         const pair = ticks[i] ?? [0, 0];
         fight.step(pair[0] ?? 0, pair[1] ?? 0);
@@ -290,7 +308,10 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
         ui.resolved.textContent = data.final_hash ? `hash ${data.final_hash}` : "";
       }
     }
-    paintFight(ui.stage, fight, "ours", "theirs", "replay 1/1");
+    if (leftover > tickMs) {
+      leftover = 0;
+    }
+    paintFight(ui.stage, fight, data.ours || "ours", data.theirs || "theirs", "replay 1/1");
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
