@@ -14,6 +14,20 @@ const GLYPHS: Record<string, readonly number[]> = {
   " ": [0, 0, 0, 0, 0, 0, 0],
 };
 
+/** 5×7 damage digits. Same bit order as the title glyphs. */
+const DIGITS: Record<string, readonly number[]> = {
+  "0": [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+  "1": [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+  "2": [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
+  "3": [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+  "4": [0b10010, 0b10010, 0b10010, 0b11111, 0b00010, 0b00010, 0b00010],
+  "5": [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+  "6": [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+  "7": [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+  "8": [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+  "9": [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+};
+
 export function drawDotTitle(canvas: HTMLCanvasElement, text: string): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) {
@@ -112,14 +126,31 @@ function noteHits(frame: Frame, field: Playfield, originY: number): string {
   return notes.join(", ");
 }
 
+function drawPixelDigits(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color: string): void {
+  const scale = 2;
+  const glyphW = 5 * scale + 2;
+  const total = text.length * glyphW - 2;
+  let left = Math.round(x - total / 2);
+  ctx.fillStyle = color;
+  for (const ch of text) {
+    const bits = DIGITS[ch];
+    if (bits) {
+      for (let r = 0; r < 7; r += 1) {
+        for (let c = 0; c < 5; c += 1) {
+          if (bits[r] & (1 << (4 - c))) {
+            ctx.fillRect(left + c * scale, y + r * scale, scale, scale);
+          }
+        }
+      }
+    }
+    left += glyphW;
+  }
+}
+
 function drawFloaters(ctx: CanvasRenderingContext2D): void {
-  ctx.font = '20px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
-  ctx.textAlign = "center";
-  ctx.textBaseline = "bottom";
   const keep: Floater[] = [];
   for (const floater of floaters) {
-    ctx.fillStyle = floater.color;
-    ctx.fillText(floater.text, floater.x, floater.y);
+    drawPixelDigits(ctx, floater.text, floater.x, floater.y - 14, floater.color);
     floater.y -= 1;
     floater.life -= 1;
     if (floater.life > 0) {
@@ -127,8 +158,6 @@ function drawFloaters(ctx: CanvasRenderingContext2D): void {
     }
   }
   floaters = keep;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
 }
 
 /** Fit the whole arena on the canvas. Fighters were drawn at 8px per unit, so on the
