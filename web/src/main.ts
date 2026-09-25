@@ -92,7 +92,8 @@ function startFight(mode: Mode, fromDemo: boolean): void {
     }
     finished = true;
     const result = fight.result();
-    showKo(ko, result);
+    const decision = fight.ours_hp() > 0 && fight.theirs_hp() > 0;
+    showKo(ko, result, decision);
     if (fromDemo) {
       if (result === 0) {
         $("resolved").textContent = demo_resolve(0);

@@ -282,9 +282,8 @@ impl FightState {
         apply_input(&mut self.ours, ours_in);
         apply_input(&mut self.theirs, theirs_in);
 
-        advance_anim(&mut self.ours);
-        advance_anim(&mut self.theirs);
-
+        // Hit-check the frame that just started. Advancing first skipped frame 0,
+        // so a punch landed one tick before PUNCH_STARTUP.
         let ours_hit = active_hit(&self.ours, &self.theirs, true);
         let theirs_hit = active_hit(&self.theirs, &self.ours, false);
         if let Some(kind) = ours_hit {
@@ -295,6 +294,9 @@ impl FightState {
             self.theirs.hit_connected = true;
             apply_hit(&mut self.ours, kind, -1);
         }
+
+        advance_anim(&mut self.ours);
+        advance_anim(&mut self.theirs);
 
         apply_physics(&mut self.ours, &mut self.theirs);
         maybe_nudge(&mut self.ours, &mut self.theirs);
@@ -552,6 +554,24 @@ mod tests {
             }
             f.step(Input::None, Input::None);
         }
+    }
+
+    #[test]
+    fn punch_does_not_hit_during_startup() {
+        let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
+        f.theirs.x = f.ours.x + 8;
+        f.step(Input::Punch, Input::None);
+        let hp = f.theirs.hp;
+        for _ in 0..(PUNCH_STARTUP - 1) {
+            f.step(Input::None, Input::None);
+            assert_eq!(
+                f.theirs.hp, hp,
+                "connected during startup at tick {}",
+                f.tick
+            );
+        }
+        f.step(Input::None, Input::None);
+        assert!(f.theirs.hp < hp, "startup ended without a hit");
     }
 
     #[test]

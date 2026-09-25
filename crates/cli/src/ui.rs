@@ -145,7 +145,8 @@ fn play_round(
 
         draw_fight(path, round, total, ours, theirs, &fight)?;
         if let Some(result) = fight.result {
-            draw_ko(result)?;
+            let decision = fight.ours.hp > 0 && fight.theirs.hp > 0;
+            draw_ko(result, decision)?;
             wait_key_or(Duration::from_millis(1400))?;
             let pick = match result {
                 RoundResult::Ours => Pick::Ours,
@@ -362,8 +363,10 @@ fn draw_sprites(out: &mut impl Write, fight: &FightState) -> Result<(), String> 
     Ok(())
 }
 
-fn draw_ko(result: RoundResult) -> Result<(), String> {
+fn draw_ko(result: RoundResult, decision: bool) -> Result<(), String> {
     let (msg, color) = match result {
+        RoundResult::Ours if decision => ("TIME — OURS", OURS),
+        RoundResult::Theirs if decision => ("TIME — THEIRS", THEIRS),
         RoundResult::Ours => ("KO — OURS", OURS),
         RoundResult::Theirs => ("KO — THEIRS", THEIRS),
         RoundResult::Draw => ("DRAW", OURS),

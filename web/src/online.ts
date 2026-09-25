@@ -79,15 +79,19 @@ export function paintFight(
   stage.dataset.theirsHp = String(fight.theirs_hp());
 }
 
-export function showKo(ko: HTMLElement, result: number): void {
+export function showKo(ko: HTMLElement, result: number, decision = false): void {
   ko.classList.remove("hidden", "ours");
-  if (result === 0) {
-    ko.textContent = "KO";
-    ko.classList.add("ours");
-  } else if (result === 1) {
-    ko.textContent = "KO";
-  } else {
+  if (result === 2) {
     ko.textContent = "DRAW";
+    return;
+  }
+  if (decision) {
+    ko.textContent = "TIME";
+  } else {
+    ko.textContent = "KO";
+  }
+  if (result === 0) {
+    ko.classList.add("ours");
   }
 }
 
@@ -197,7 +201,8 @@ export function startOnline(matchId: string, token: string | null, ui: OnlineUi)
           fight.forfeit(0);
         }
       }
-      showKo(ui.ko, end.result);
+      const decision = fight ? fight.ours_hp() > 0 && fight.theirs_hp() > 0 : false;
+      showKo(ui.ko, end.result, decision);
       ui.resolved.textContent = `replay /replay/${matchId}`;
     } else if (msg.type === "error") {
       const err = msg as ErrMsg;
@@ -303,7 +308,8 @@ export async function startReplay(matchId: string, ui: OnlineUi): Promise<{ stop
         finished = true;
         const result = fight.result();
         if (result !== -1) {
-          showKo(ui.ko, result);
+          const decision = fight.ours_hp() > 0 && fight.theirs_hp() > 0;
+          showKo(ui.ko, result, decision);
         }
         ui.resolved.textContent = data.final_hash ? `hash ${data.final_hash}` : "";
       }

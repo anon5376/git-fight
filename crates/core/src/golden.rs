@@ -5,7 +5,7 @@ use crate::fight::{FightState, FighterStats, Input, ROUND_TICKS};
 pub const GOLDEN_SEED: u64 = 0xD1CE_CA5E_F00D_0001;
 
 /// Update this only when the sim itself changes, and update both test targets together.
-pub const GOLDEN_HASH: u64 = 0xE38B_F2CF_EB98_56F8;
+pub const GOLDEN_HASH: u64 = 0xA153_9B85_F3A0_4F2F;
 
 #[derive(Clone, Copy)]
 pub struct InputSpan {
