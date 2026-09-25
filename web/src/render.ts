@@ -68,6 +68,69 @@ export type Playfield = {
   fieldW: number;
 };
 
+type Floater = { text: string; x: number; y: number; life: number; color: string };
+
+let floaters: Floater[] = [];
+let floaterKey = "";
+let prevOursHp = -1;
+let prevTheirsHp = -1;
+
+function noteHits(frame: Frame, field: Playfield, originY: number): string {
+  const key = `${frame.roundLabel}|${frame.oursName}|${frame.theirsName}|${frame.oursMax}|${frame.theirsMax}`;
+  if (key !== floaterKey || frame.oursHp > prevOursHp || frame.theirsHp > prevTheirsHp) {
+    floaters = [];
+    floaterKey = key;
+    prevOursHp = frame.oursHp;
+    prevTheirsHp = frame.theirsHp;
+    return "";
+  }
+  const notes: string[] = [];
+  if (frame.oursHp < prevOursHp) {
+    const dmg = prevOursHp - frame.oursHp;
+    floaters.push({
+      text: String(dmg),
+      x: field.originX + frame.oursX * field.scale + 4 * field.scale,
+      y: originY - 6,
+      life: 24,
+      color: THEIRS,
+    });
+    notes.push(`${frame.oursName} hit ${dmg}`);
+  }
+  if (frame.theirsHp < prevTheirsHp) {
+    const dmg = prevTheirsHp - frame.theirsHp;
+    floaters.push({
+      text: String(dmg),
+      x: field.originX + frame.theirsX * field.scale + 4 * field.scale,
+      y: originY - 6,
+      life: 24,
+      color: OURS,
+    });
+    notes.push(`${frame.theirsName} hit ${dmg}`);
+  }
+  prevOursHp = frame.oursHp;
+  prevTheirsHp = frame.theirsHp;
+  return notes.join(", ");
+}
+
+function drawFloaters(ctx: CanvasRenderingContext2D): void {
+  ctx.font = '20px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  const keep: Floater[] = [];
+  for (const floater of floaters) {
+    ctx.fillStyle = floater.color;
+    ctx.fillText(floater.text, floater.x, floater.y);
+    floater.y -= 1;
+    floater.life -= 1;
+    if (floater.life > 0) {
+      keep.push(floater);
+    }
+  }
+  floaters = keep;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+}
+
 /** Fit the whole arena on the canvas. Fighters were drawn at 8px per unit, so on the
  *  880px stage they never reached the right health bar. */
 export function layoutPlayfield(canvasWidth: number, arenaUnits = ARENA_UNITS): Playfield {
@@ -125,6 +188,7 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   const bottom = Math.max(top + bodyH + 16, h - 28);
   const originY = top + Math.floor((bottom - top - bodyH) / 2);
   const groundY = originY + bodyH;
+  const hitNote = noteHits(frame, field, originY);
   const floorH = 14;
   ctx.fillStyle = "#141416";
   ctx.fillRect(field.originX, groundY, field.fieldW, floorH);
@@ -132,12 +196,14 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   ctx.fillRect(field.originX, groundY, field.fieldW, 2);
   drawSprite(ctx, frame.oursSprite, field.originX + frame.oursX * field.scale, originY, OURS, field.scale);
   drawSprite(ctx, frame.theirsSprite, field.originX + frame.theirsX * field.scale, originY, THEIRS, field.scale);
+  drawFloaters(ctx);
+  canvas.dataset.hit = hitNote;
   ctx.fillStyle = OURS;
   ctx.font = '14px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
   ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + floorH + 8);
   const status = document.getElementById("fight-status");
   if (status) {
-    const text = `${frame.oursName} ${frame.oursHp}  ${frame.theirsName} ${frame.theirsHp}`;
+    const text = `${frame.oursName} ${frame.oursHp}  ${frame.theirsName} ${frame.theirsHp}${hitNote ? `, ${hitNote}` : ""}`;
     if (status.textContent !== text) {
       status.textContent = text;
     }
