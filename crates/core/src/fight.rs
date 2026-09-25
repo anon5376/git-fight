@@ -481,7 +481,16 @@ fn apply_hit(defender: &mut Fighter, kind: AttackKind, knockback_dir: i32) {
     }
     let blocking = defender.guard_ticks > 0 || defender.anim == Anim::Block;
     if blocking {
+        let mut chip = (damage(kind) / 5).max(1);
+        if defender.armor {
+            chip = (chip * 9 / 10).max(1);
+        }
+        defender.hp -= chip;
+        if defender.hp < 0 {
+            defender.hp = 0;
+        }
         defender.stun_ticks = BLOCKSTUN;
+        defender.vel_x += knockback_dir;
         defender.anim = Anim::Block;
         return;
     }
@@ -594,13 +603,15 @@ mod tests {
     }
 
     #[test]
-    fn block_prevents_damage() {
+    fn block_takes_chip_not_the_full_hit() {
         let mut f = FightState::new(1, FighterStats::default(), FighterStats::default());
         f.step(Input::Punch, Input::Block);
         for _ in 0..20 {
             f.step(Input::None, Input::Block);
         }
-        assert_eq!(f.theirs.hp, f.theirs.max_hp);
+        let lost = f.theirs.max_hp - f.theirs.hp;
+        assert_eq!(lost, (PUNCH_DAMAGE / 5).max(1));
+        assert!(lost < PUNCH_DAMAGE);
     }
 
     #[test]
