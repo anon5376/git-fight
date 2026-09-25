@@ -8,7 +8,8 @@ use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegrou
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use git_fight_core::{
-    sprite, ConflictFile, FightState, Input, Pick, RoundResult, Side, SPRITE_ROWS, TICKS_PER_SECOND,
+    sprite, ConflictFile, FightState, Input, Pick, RoundResult, Side, ARENA_W, SPRITE_COLS,
+    SPRITE_ROWS, TICKS_PER_SECOND,
 };
 
 use crate::stats::NamedFighter;
@@ -343,8 +344,9 @@ fn draw_sprites(out: &mut impl Write, fight: &FightState) -> Result<(), String> 
     let theirs_pose = fight.theirs.pose();
     let left = sprite(Side::Ours, ours_pose);
     let right = sprite(Side::Theirs, theirs_pose);
-    let lx = fight.ours.x.clamp(0, 60) as u16;
-    let rx = fight.theirs.x.clamp(0, 60) as u16;
+    let max_x = ARENA_W.saturating_sub(SPRITE_COLS as i32).max(0);
+    let lx = fight.ours.x.clamp(0, max_x) as u16;
+    let rx = fight.theirs.x.clamp(0, max_x) as u16;
     for row in 0..SPRITE_ROWS {
         queue!(
             out,

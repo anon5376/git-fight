@@ -44,6 +44,9 @@ export function drawDotTitle(canvas: HTMLCanvasElement, text: string): void {
   }
 }
 
+/** Matches `git_fight_core::ARENA_W`. One unit is one sprite column. */
+export const ARENA_UNITS = 72;
+
 export type Frame = {
   oursName: string;
   theirsName: string;
@@ -59,6 +62,23 @@ export type Frame = {
   roundLabel: string;
 };
 
+export type Playfield = {
+  scale: number;
+  originX: number;
+  fieldW: number;
+};
+
+/** Fit the whole arena on the canvas. Fighters were drawn at 8px per unit, so on the
+ *  880px stage they never reached the right health bar. */
+export function layoutPlayfield(canvasWidth: number, arenaUnits = ARENA_UNITS): Playfield {
+  const units = arenaUnits > 0 ? arenaUnits : ARENA_UNITS;
+  const pad = 24;
+  const scale = Math.max(4, Math.floor((canvasWidth - pad * 2) / units));
+  const fieldW = units * scale;
+  const originX = Math.floor((canvasWidth - fieldW) / 2);
+  return { scale, originX, fieldW };
+}
+
 export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) {
@@ -66,35 +86,48 @@ export function drawFrame(canvas: HTMLCanvasElement, frame: Frame): void {
   }
   const w = canvas.width;
   const h = canvas.height;
+  ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, w, h);
   ctx.font = '18px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
   ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+
+  const barW = Math.min(280, Math.max(80, Math.floor((w - 160) / 2)));
+  const rightBar = w - 24 - barW;
 
   ctx.fillStyle = OURS;
   ctx.fillText("GIT FIGHT", 24, 16);
-  ctx.fillText(frame.roundLabel, 360, 16);
-  ctx.fillText(frame.timer, w - 64, 16);
+  ctx.textAlign = "center";
+  ctx.fillText(frame.roundLabel, Math.floor(w / 2), 16);
+  ctx.textAlign = "right";
+  ctx.fillText(frame.timer, w - 24, 16);
+  ctx.textAlign = "left";
+  ctx.fillText(clipName(frame.oursName, 12), 24, 48);
+  ctx.textAlign = "right";
+  ctx.fillText(clipName(frame.theirsName, 12), w - 24, 48);
+  ctx.textAlign = "left";
 
-  ctx.fillText(padName(frame.oursName, 12), 24, 48);
-  ctx.fillText(padName(frame.theirsName, 12).trimEnd(), w - 24 - 12 * 11, 48);
-  drawBar(ctx, 24, 72, 280, frame.oursHp, frame.oursMax, OURS);
-  drawBar(ctx, w - 304, 72, 280, frame.theirsHp, frame.theirsMax, THEIRS);
+  drawBar(ctx, 24, 72, barW, frame.oursHp, frame.oursMax, OURS);
+  drawBar(ctx, rightBar, 72, barW, frame.theirsHp, frame.theirsMax, THEIRS);
   ctx.fillStyle = OURS;
-  ctx.fillText(String(frame.oursHp).padStart(3, " "), 310, 70);
+  ctx.fillText(String(frame.oursHp).padStart(3, " "), 24 + barW + 8, 70);
   ctx.fillStyle = THEIRS;
-  ctx.fillText(String(frame.theirsHp).padStart(3, " "), w - 348, 70);
+  ctx.textAlign = "right";
+  ctx.fillText(String(frame.theirsHp).padStart(3, " "), rightBar - 8, 70);
+  ctx.textAlign = "left";
 
-  const cell = 14;
-  const originY = 140;
-  drawSprite(ctx, frame.oursSprite, 24 + frame.oursX * 8, originY, OURS, cell);
-  drawSprite(ctx, frame.theirsSprite, 24 + frame.theirsX * 8, originY, THEIRS, cell);
+  const field = layoutPlayfield(w);
+  const originY = Math.max(120, Math.floor(h * 0.33));
+  drawSprite(ctx, frame.oursSprite, field.originX + frame.oursX * field.scale, originY, OURS, field.scale);
+  drawSprite(ctx, frame.theirsSprite, field.originX + frame.theirsX * field.scale, originY, THEIRS, field.scale);
 
+  const groundY = originY + 5 * field.scale + 8;
   ctx.fillStyle = "#333";
-  ctx.fillRect(24, originY + cell * 5 + 8, w - 48, 2);
+  ctx.fillRect(field.originX, groundY, field.fieldW, 2);
   ctx.fillStyle = OURS;
   ctx.font = '14px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace';
-  ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, originY + cell * 5 + 24);
+  ctx.fillText("a punch  s kick  d block  f special     j k l ;     q menu", 24, groundY + 16);
 }
 
 function drawSprite(
@@ -107,9 +140,20 @@ function drawSprite(
 ): void {
   ctx.fillStyle = color;
   ctx.font = `${cell}px ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace`;
-  for (let i = 0; i < rows.length; i += 1) {
-    ctx.fillText(rows[i] ?? "", x, y + i * cell);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (let r = 0; r < rows.length; r += 1) {
+    const line = rows[r] ?? "";
+    for (let c = 0; c < line.length; c += 1) {
+      const ch = line[c];
+      if (ch === " ") {
+        continue;
+      }
+      ctx.fillText(ch, x + c * cell + cell / 2, y + r * cell + cell / 2);
+    }
   }
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
 }
 
 function drawBar(
@@ -129,8 +173,8 @@ function drawBar(
   ctx.fillRect(x, y, filled, 16);
 }
 
-function padName(name: string, n: number): string {
-  return name.length >= n ? name.slice(0, n) : name.padEnd(n, " ");
+function clipName(name: string, n: number): string {
+  return name.length >= n ? name.slice(0, n) : name;
 }
 
 export { BG, OURS, THEIRS };
